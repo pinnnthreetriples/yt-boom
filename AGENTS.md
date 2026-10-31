@@ -33,8 +33,9 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/secret_store.py` — Windows DPAPI credential encryption layer for local SQLite storage
 - `modules/fingerprint_manager.py` — stable hardware fingerprint manager per browser session directory
 - `modules/session_heartbeat.py` — lightweight HTTP session token keep-alive & validity verifier (`curl_cffi` reading `cookies.sqlite`)
-- `modules/account_warmer.py` — behavioral account warm-up runner (natural video viewing, mouse movement, comments scroll)
-- `tests/` — comprehensive automated test suite (410 unit and integration tests)
+- `modules/account_warmer.py` — organic warm-up runner (home-feed video discovery, player telemetry, comments reading, rare likes)
+- `modules/lifecycle_engine.py` — 4-day account ageing state machine (quarantine → aging → probation → mature) with daily quota, cooldown and circuit breaker
+- `tests/` — comprehensive automated test suite (441 unit and integration tests)
 - `run_tests.py` — test discovery and test suite runner
 - `test_sessions/` — local browser session storage directories
 

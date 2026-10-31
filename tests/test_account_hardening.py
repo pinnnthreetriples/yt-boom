@@ -403,9 +403,10 @@ class TestAuthenticateAccount(_DbCase):
             runner = MagicMock(start=AsyncMock(), close=AsyncMock(), context=MagicMock())
             authenticator = MagicMock()
             authenticator.return_value.authenticate = AsyncMock(side_effect=authenticate_effect)
-            with patch("youtube_bot.YouTubeRunner", return_value=runner), patch("youtube_bot.GoogleAuthenticator", authenticator):
+            with patch("youtube_bot.YouTubeRunner", return_value=runner), patch("youtube_bot.GoogleAuthenticator", authenticator),                  patch("youtube_bot._intro_warm_up", AsyncMock()) as intro:
                 result = await youtube_bot._authenticate_account(db, cfg, account)
             stored = (await db.get_account("bob")).auth_status
+            self.intro_warm_up = intro
         return result, stored, authenticator.return_value.authenticate, runner, session
 
     async def test_success_marks_authenticated_and_remembers_the_owner(self):
@@ -415,12 +416,19 @@ class TestAuthenticateAccount(_DbCase):
         self.assertEqual(read_session_owner(session), "bob@gmail.com")
         self.assertFalse(authenticate.await_args.kwargs["force_relogin"])
         runner.close.assert_awaited_once()
+        self.intro_warm_up.assert_awaited_once()
+        async with Database(self.root / "metrics.db") as db:
+            account = await db.get_account("bob")
+        self.assertEqual(account.lifecycle_stage, "quarantine")
+        self.assertIsNotNone(account.authenticated_at)
+        self.assertIsNotNone(account.quarantine_until)
 
     async def test_google_refusal_is_failed(self):
         result, stored, _, runner, _ = await self._run(GoogleAuthError("неверный пароль"))
         self.assertFalse(result)
         self.assertEqual(stored, "failed")
         runner.close.assert_awaited_once()
+        self.intro_warm_up.assert_not_awaited()
 
     async def test_infrastructure_error_leaves_the_status_alone(self):
         for error in (RuntimeError("profile is locked"), OSError("proxy refused")):
@@ -518,7 +526,7 @@ class TestInteractiveLogin(_DbCase):
     async def test_uses_runner_options_and_marks_the_account_authenticated(self):
         options, account = await self._login(login_info=True)
         self.assertEqual(options["fingerprint"], {"pinned": True})
-        self.assertIs(options["firefox_user_prefs"]["security.webauth.webauthn"], False)
+        self.assertNotIn("security.webauth.webauthn", options["firefox_user_prefs"])
         self.assertFalse(options["headless"])
         self.assertEqual(account.auth_status, "authenticated")
 

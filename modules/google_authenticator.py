@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -391,7 +392,7 @@ class GoogleAuthenticator:
         path_before = _screen_path(page.url)
         await self._simulator.human_pause(0.6, 1.4)
         await self._simulator.click_locator(page, field_locator)
-        await self._clear_field(field_locator)
+        await self._clear_field(page, field_locator)
         await self._simulator.type_text(page, value, allow_typos=False)
         await self._simulator.human_pause(0.4, 0.9)
         next_button = await self._first_visible(page, NEXT_BUTTONS, timeout_seconds=1.5)
@@ -402,11 +403,18 @@ class GoogleAuthenticator:
         return await self._wait_after_submit(page, selectors, path_before)
 
     @staticmethod
-    async def _clear_field(field_locator: Any) -> None:
-        """A rejected value stays in the input: never append to it."""
+    async def _clear_field(page: Any, field_locator: Any) -> None:
+        """A rejected value stays in the input: never append to it.
+
+        Select-all + Backspace instead of `fill("")`: a direct DOM write has no keydown/keyup and a 0 ms delta.
+        """
         try:
             if await field_locator.input_value():
-                await field_locator.fill("")
+                await field_locator.click()
+                await page.keyboard.press("Control+A")
+                await asyncio.sleep(random.uniform(0.1, 0.25))
+                await page.keyboard.press("Backspace")
+                await asyncio.sleep(random.uniform(0.15, 0.3))
         except PlaywrightError as exc:
             logger.debug("Не удалось очистить поле: {}", exc)
 

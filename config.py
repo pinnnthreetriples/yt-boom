@@ -333,7 +333,7 @@ class BrowserSettings(BaseModel):
     render_max_seconds: float = Field(default=90.0, gt=0)
     firefox_user_prefs: dict[str, Any] = Field(
         default_factory=lambda: {
-            "media.peerconnection.enabled": False,
+            "media.peerconnection.enabled": True,
             "network.http.http3.enable": False,
         }
     )

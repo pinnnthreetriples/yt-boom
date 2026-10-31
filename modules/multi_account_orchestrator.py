@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import random
 import time
@@ -16,7 +17,9 @@ from database import (
     Database,
     VideoPoolItem,
 )
+from modules.account_warmer import AccountWarmer
 from modules.interaction_simulator import InteractionSimulator
+from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.pool_manager import PoolManager
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.ui_test_runner import SubmissionResult
@@ -44,6 +47,7 @@ class MultiAccountOrchestrator:
         collector: YouTubeCollector | None = None,
         processor: DeepSeekProcessor | None = None,
         runner_factory: Callable[[AccountRecord], Any] | None = None,
+        warmer: AccountWarmer | None = None,
     ) -> None:
         if isinstance(config_or_path, AppConfig):
             self._cfg = config_or_path
@@ -94,6 +98,10 @@ class MultiAccountOrchestrator:
         # Comments taken in this run: parallel accounts must not pick the same one before its payload exists.
         self._claimed: set[str] = set()
         self._skipped_logged: set[int] = set()
+        self._lifecycle_logged: set[tuple[int, str]] = set()
+        self._warmer = warmer or AccountWarmer(self._cfg.browser, simulator=self._simulator, rng=self._rng)
+        self._warmup_tasks: dict[int, asyncio.Task[Any]] = {}
+        self._warmup_slot = asyncio.Semaphore(1)  # one warm-up browser at a time
 
     @property
     def db(self) -> Database:
@@ -199,12 +207,68 @@ class MultiAccountOrchestrator:
             return False
         return True
 
+    WARMUP_INTERVAL = timedelta(hours=4)
+
+    async def _passes_lifecycle_gate(self, acc: AccountRecord) -> bool:
+        """Age, daily quota, cooldown and circuit breaker of a signed-in account.
+
+        Accounts that were never signed in through the bot (`default`, manual `--login` without a stamp, still
+        `pending`) have no lifecycle clock and are left to `_is_usable`.
+        """
+        if acc.auth_status != "authenticated":
+            return True
+        verdict = await AccountLifecycleEngine.evaluate_eligibility(acc, db=self._db)
+        if verdict.can_comment:
+            return True
+        if (acc.id, verdict.reason) not in self._lifecycle_logged:
+            self._lifecycle_logged.add((acc.id, verdict.reason))
+            logger.warning("[LIFECYCLE] Account {} skipped: {}", acc.name, verdict.reason)
+        if verdict.suggested_action == "warm_up":
+            self._schedule_warmup(acc)
+        return False
+
+    def _schedule_warmup(self, acc: AccountRecord) -> None:
+        """Start a background warm-up unless one runs already, the last one is under 4 h old, or this is a dry run."""
+        if self._dry_run or acc.id in self._warmup_tasks:
+            return
+        if acc.last_warmup_at:
+            try:
+                last = datetime.fromisoformat(acc.last_warmup_at.replace("Z", "+00:00"))
+            except ValueError:
+                last = None
+            if last is not None:
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - last <= self.WARMUP_INTERVAL:
+                    return
+        self._warmup_tasks[acc.id] = asyncio.create_task(self._run_warmup(acc))
+
+    async def _run_warmup(self, acc: AccountRecord) -> None:
+        try:
+            async with self._warmup_slot:
+                await self._warmer.warm_up(acc, db=self._db)
+        except Exception as exc:
+            logger.error("[LIFECYCLE] Warm-up of account {} failed: {}", acc.name, exc)
+        finally:
+            self._warmup_tasks.pop(acc.id, None)
+
+    async def _finish_warmups(self) -> None:
+        tasks = list(self._warmup_tasks.values())
+        if tasks:
+            logger.info("[LIFECYCLE] Waiting for {} warm-up session(s) to finish", len(tasks))
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _may_comment_now(self, acc: AccountRecord) -> bool:
+        """Re-check an account that was picked earlier (mode "each") against its current counters in the database."""
+        fresh = await self._db.get_account(acc.id)
+        return fresh is None or await self._passes_lifecycle_gate(fresh)
+
     async def _usable_accounts(self) -> list[AccountRecord]:
-        """Active accounts that can post: sign-in not failed, and not waiting for a first sign-in."""
+        """Active accounts that can post: sign-in not failed, not waiting for a first sign-in, allowed by their age."""
         accounts = await self._db.list_active_accounts()
         if not accounts:
             accounts = await self.sync_accounts_from_config()
-        usable = [acc for acc in accounts if self._is_usable(acc)]
+        usable = [acc for acc in accounts if self._is_usable(acc) and await self._passes_lifecycle_gate(acc)]
         for acc in accounts:
             if acc not in usable and acc.id not in self._skipped_logged:
                 self._skipped_logged.add(acc.id)
@@ -227,6 +291,15 @@ class MultiAccountOrchestrator:
         rotated = accounts[start:] + accounts[:start]
         rotated.sort(key=lambda a: a.total_replies + self._in_flight[a.id])
         return rotated[0]
+
+    async def _record_error(self, acc: AccountRecord) -> None:
+        """A failed live submission counts toward the account's circuit breaker (3 in a row restrict it)."""
+        if self._dry_run:
+            return
+        try:
+            await self._db.record_account_error(acc.id)
+        except Exception as exc:
+            logger.debug("Не удалось записать ошибку аккаунта {}: {}", acc.name, exc)
 
     async def _process_video(
         self,
@@ -292,6 +365,9 @@ class MultiAccountOrchestrator:
                     continue
 
                 acc = account or await self._pick_account()
+                if acc is not None and account is not None and not await self._may_comment_now(acc):
+                    self._claimed.discard(it.external_id)
+                    break
                 if acc is None:
                     self._claimed.discard(it.external_id)
                     logger.warning("ИНФО | Нет доступных аккаунтов для комментария")
@@ -355,6 +431,7 @@ class MultiAccountOrchestrator:
                             )
                         except Exception as exc:
                             await self._drop_runner(acc.id)  # next comment starts a fresh browser
+                            await self._record_error(acc)
                             logger.error(
                                 "ОШИБКА | Сбой браузера/раннера для аккаунта {!r}: {}",
                                 acc.name,
@@ -424,7 +501,10 @@ class MultiAccountOrchestrator:
                             comments_added=1,
                             completed=is_video_complete,
                         )
-                        await self._db.increment_account_stats(acc.id, replies=1)
+                        if self._dry_run:
+                            await self._db.increment_account_stats(acc.id, replies=1)
+                        else:
+                            await self._db.record_account_comment_success(acc.id)
                         logger.success(
                             "УСПЕХ | Аккаунт {!r} успешно ответил на комментарий {} к видео {}",
                             acc.name,
@@ -434,6 +514,7 @@ class MultiAccountOrchestrator:
                         video_comments_done += 1
                         posted = True
                     else:
+                        await self._record_error(acc)
                         logger.error(
                             "ОШИБКА | Не удалось отправить ответ аккаунтом {!r} к видео {}: {}",
                             acc.name,
@@ -444,6 +525,10 @@ class MultiAccountOrchestrator:
                     self._in_flight[acc.id] -= 1
                     if not posted:  # a failed comment stays free for another account
                         self._claimed.discard(it.external_id)
+                if posted and video_comments_done < needed and not self._dry_run:
+                    await asyncio.sleep(
+                        self._rng.uniform(self._cfg.limits.pause_min_seconds, self._cfg.limits.pause_max_seconds)
+                    )
 
         except Exception as exc:
             logger.error(
@@ -455,6 +540,17 @@ class MultiAccountOrchestrator:
         return video_comments_done
 
     async def execute_video_pool(
+        self,
+        max_comments_per_video: int | None = None,
+        comments_target_per_video: int = 2,
+    ) -> int:
+        """Run the video pool, then wait for the warm-up sessions the lifecycle gate started."""
+        try:
+            return await self._execute_video_pool(max_comments_per_video, comments_target_per_video)
+        finally:
+            await self._finish_warmups()
+
+    async def _execute_video_pool(
         self,
         max_comments_per_video: int | None = None,
         comments_target_per_video: int = 2,
@@ -539,6 +635,9 @@ class MultiAccountOrchestrator:
 
     async def close(self) -> None:
         """Close account browsers, collector and database connections."""
+        for task in list(self._warmup_tasks.values()):
+            task.cancel()
+        await asyncio.gather(*self._warmup_tasks.values(), return_exceptions=True)
         await self._close_runners()
         if hasattr(self._collector, "close"):
             try:

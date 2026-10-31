@@ -44,9 +44,8 @@ class FakeLocator:
     async def input_value(self):
         return self.page.field_text
 
-    async def fill(self, value):
-        self.page.fills += 1
-        self.page.field_text = value
+    async def click(self, *args, **kwargs):
+        pass
 
     async def inner_text(self):
         return self.page.screen.error or ""
@@ -81,6 +80,9 @@ class FakePage:
         return self.screen.url
 
     async def _press(self, key):
+        if key == "Backspace":  # after Control+A: the whole value is removed by a keystroke, never by fill("")
+            self.fills += 1
+            self.field_text = ""
         if key == "Enter":
             base = time.monotonic()
             self.timeline = [(base + delay, name) for delay, name in (self.screen.on_enter or [])]

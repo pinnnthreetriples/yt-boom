@@ -1,7 +1,7 @@
 ---
 name: agents
 description: Always-loaded project anchor. Read this first. Contains project identity, non-negotiables, commands, and pointer to ROUTER.md for full context.
-last_updated: 2026-10-31
+last_updated: 2026-11-01
 ---
 
 # YouTube Comment Replier & Telemetry Pipeline
@@ -14,7 +14,7 @@ An automated Python 3.11+ web testing and telemetry pipeline driving persistent 
 - Never store raw passwords or TOTP secrets in SQLite — all credentials must be encrypted via Windows DPAPI (`secret_store.protect_secret()`).
 - Never force single-process Gecko (`dom.ipc.processCount: 1`) or disable Fission in Camoufox — multi-process is strictly required for YouTube Polymer rendering.
 - Always use asynchronous APIs (`aiosqlite`, `AsyncCamoufox`, `asyncio`) — blocking calls in the main event loop are prohibited.
-- Always verify all 400 project unit and integration tests pass (`python run_tests.py`) before completing tasks.
+- Always verify all 441 project unit and integration tests pass (`python run_tests.py`) before completing tasks.
 
 ## Commands
 - Run all tests: `python run_tests.py`

@@ -221,7 +221,7 @@ class TestFingerprintManager(unittest.TestCase):
             with patch("modules.youtube_runner.get_or_create_fingerprint", return_value={"pinned": True}):
                 options = runner._launch_options()
             self.assertEqual(options["fingerprint"], {"pinned": True})
-            self.assertIs(options["firefox_user_prefs"]["security.webauth.webauthn"], False)
+            self.assertNotIn("security.webauth.webauthn", options["firefox_user_prefs"])
 
 
 class TestIsSessionAuthenticated(unittest.IsolatedAsyncioTestCase):

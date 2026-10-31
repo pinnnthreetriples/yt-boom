@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 import re
 import time
 from collections.abc import AsyncIterator
@@ -140,6 +141,22 @@ _ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
     ("geo_country", "TEXT"),
 )
 
+_ACCOUNT_LIFECYCLE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("lifecycle_stage", "TEXT NOT NULL DEFAULT 'quarantine'"),
+    ("authenticated_at", "TEXT"),
+    ("quarantine_until", "TEXT"),
+    ("daily_comments_done", "INTEGER NOT NULL DEFAULT 0"),
+    ("daily_comments_limit", "INTEGER NOT NULL DEFAULT 0"),
+    ("daily_limit_reset_at", "TEXT"),
+    ("last_comment_at", "TEXT"),
+    ("warmup_sessions_done", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_warmup_at", "TEXT"),
+    ("consecutive_errors", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+QUARANTINE_HOURS = 24
+DAILY_RESET_HOUR_UTC = 4
+
 _ERROR_LIMIT = 2000
 _SCHEMA_ATTEMPTS = 6
 
@@ -266,6 +283,16 @@ class AccountRecord(BaseModel):
     auth_status: str = "pending"
     fingerprint_data: str | None = None
     geo_country: str | None = None
+    lifecycle_stage: str = "quarantine"
+    authenticated_at: str | None = None
+    quarantine_until: str | None = None
+    daily_comments_done: int = 0
+    daily_comments_limit: int = 0
+    daily_limit_reset_at: str | None = None
+    last_comment_at: str | None = None
+    warmup_sessions_done: int = 0
+    last_warmup_at: str | None = None
+    consecutive_errors: int = 0
 
 
 class AccountCreate(BaseModel):
@@ -278,6 +305,16 @@ class AccountCreate(BaseModel):
     totp_secret: str | None = Field(default=None, repr=False, exclude=True)
     recovery_email: str | None = None
     geo_country: str | None = None
+    lifecycle_stage: str = "quarantine"
+    authenticated_at: str | None = None
+    quarantine_until: str | None = None
+    daily_comments_done: int = 0
+    daily_comments_limit: int = 0
+    daily_limit_reset_at: str | None = None
+    last_comment_at: str | None = None
+    warmup_sessions_done: int = 0
+    last_warmup_at: str | None = None
+    consecutive_errors: int = 0
 
 
 class VideoPoolItem(BaseModel):
@@ -416,7 +453,7 @@ class Database:
         cursor = await conn.execute("PRAGMA table_info(accounts)")
         existing = {str(row[1]) for row in await cursor.fetchall()}
         await cursor.close()
-        for column, ddl in _ACCOUNT_AUTH_COLUMNS:
+        for column, ddl in (*_ACCOUNT_AUTH_COLUMNS, *_ACCOUNT_LIFECYCLE_COLUMNS):
             if column not in existing:
                 try:
                     await conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
@@ -1319,6 +1356,146 @@ class Database:
             cursor = await conn.execute("UPDATE accounts SET geo_country = ? WHERE id = ?", (geo_country, account_id))
             if cursor.rowcount == 0:
                 raise RecordNotFoundError(f"account id={account_id} not found")
+
+    @staticmethod
+    def next_daily_reset(now: datetime) -> datetime:
+        """The next 04:00 UTC strictly after `now`: the moment the per-account daily comment counter restarts."""
+        now = now.astimezone(timezone.utc)
+        reset = now.replace(hour=DAILY_RESET_HOUR_UTC, minute=0, second=0, microsecond=0)
+        return reset if reset > now else reset + timedelta(days=1)
+
+    async def mark_account_authenticated(self, account_id: int) -> None:
+        """Successful sign-in: `authenticated`, and the account enters (or keeps) the 24 h quarantine.
+
+        The clock starts at the first sign-in: re-authenticating an account that is already authenticated
+        (an expired session refreshed) does not send a mature account back to quarantine.
+        """
+        now = datetime.now(timezone.utc)
+        async with self._transaction() as conn:
+            row = await (
+                await conn.execute("SELECT auth_status, authenticated_at FROM accounts WHERE id = ?", (account_id,))
+            ).fetchone()
+            if row is None:
+                raise RecordNotFoundError(f"account id={account_id} not found")
+            if row["auth_status"] == "authenticated" and row["authenticated_at"]:
+                await conn.execute("UPDATE accounts SET consecutive_errors = 0 WHERE id = ?", (account_id,))
+                return
+            await conn.execute(
+                """
+                UPDATE accounts
+                SET auth_status = 'authenticated',
+                    authenticated_at = ?,
+                    quarantine_until = ?,
+                    lifecycle_stage = 'quarantine',
+                    daily_comments_done = 0,
+                    daily_comments_limit = 0,
+                    daily_limit_reset_at = ?,
+                    consecutive_errors = 0
+                WHERE id = ?
+                """,
+                (
+                    now.isoformat(),
+                    (now + timedelta(hours=QUARANTINE_HOURS)).isoformat(),
+                    self.next_daily_reset(now).isoformat(),
+                    account_id,
+                ),
+            )
+
+    async def update_account_lifecycle(
+        self,
+        account_id: int,
+        *,
+        lifecycle_stage: str | None = None,
+        daily_comments_limit: int | None = None,
+        daily_comments_done: int | None = None,
+        daily_limit_reset_at: str | None = None,
+    ) -> None:
+        """Persist what the lifecycle engine derived (stage, daily limit, a restarted daily counter)."""
+        fields = {
+            "lifecycle_stage": lifecycle_stage,
+            "daily_comments_limit": daily_comments_limit,
+            "daily_comments_done": daily_comments_done,
+            "daily_limit_reset_at": daily_limit_reset_at,
+        }
+        fields = {column: value for column, value in fields.items() if value is not None}
+        if not fields:
+            return
+        assignments = ", ".join(f"{column} = ?" for column in fields)
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                f"UPDATE accounts SET {assignments} WHERE id = ?", (*fields.values(), account_id)
+            )
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account id={account_id} not found")
+
+    async def record_account_comment_success(self, account_id: int) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE accounts
+                SET total_replies = total_replies + 1,
+                    daily_comments_done = daily_comments_done + 1,
+                    last_comment_at = ?,
+                    last_used_at = ?,
+                    consecutive_errors = 0
+                WHERE id = ?
+                """,
+                (now, now, account_id),
+            )
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account {account_id} not found")
+
+    async def record_account_warmup_success(self, account_id: int) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE accounts
+                SET warmup_sessions_done = warmup_sessions_done + 1,
+                    last_warmup_at = ?,
+                    last_used_at = ?
+                WHERE id = ?
+                """,
+                (now, now, account_id),
+            )
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account {account_id} not found")
+
+    async def record_account_error(self, account_id: int) -> None:
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE accounts SET consecutive_errors = consecutive_errors + 1 WHERE id = ?", (account_id,)
+            )
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account {account_id} not found")
+
+    async def sync_account_fingerprint(self, account_id: int, session_dir: Path) -> None:
+        """Keep `accounts.fingerprint_data` (SQLite) and `fingerprint.json` (disk) identical.
+
+        The file is what the browser reads, so it wins when both exist; a missing side is filled from the other.
+        A pinned fingerprint is never replaced by an empty or unreadable one.
+        """
+        path = Path(session_dir) / "fingerprint.json"
+        account = await self.get_account(account_id)
+        if account is None:
+            raise RecordNotFoundError(f"account id={account_id} not found")
+        on_disk = await asyncio.to_thread(path.read_text, "utf-8") if path.is_file() else None
+        if on_disk is not None:
+            try:
+                valid = bool(json.loads(on_disk))
+            except ValueError:
+                valid = False
+            if not valid:
+                logger.warning("Аккаунт {!r}: файл отпечатка {} повреждён, синхронизация пропущена", account.name, path)
+                on_disk = None
+        stored = account.fingerprint_data
+        if on_disk is not None and on_disk != stored:
+            async with self._transaction() as conn:
+                await conn.execute("UPDATE accounts SET fingerprint_data = ? WHERE id = ?", (on_disk, account_id))
+        elif on_disk is None and stored:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(path.write_text, stored, "utf-8")
 
     async def increment_account_stats(
         self,

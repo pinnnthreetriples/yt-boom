@@ -13,6 +13,24 @@ from loguru import logger
 
 from config import resolve_account_proxy
 from database import AccountRecord
+from modules.fingerprint_manager import read_pinned_user_agent
+
+FALLBACK_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+_TLS_PROFILE = "firefox135"  # the account's browser is Firefox (Camoufox): the TLS handshake must say so too
+
+
+def build_heartbeat_headers(session_dir: str | Path) -> dict[str, str]:
+    """Navigation headers of a Firefox top-level page load, with the User-Agent pinned to the account's fingerprint."""
+    return {
+        "User-Agent": read_pinned_user_agent(Path(session_dir)) or FALLBACK_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
 
 
 @dataclass(frozen=True)
@@ -104,16 +122,10 @@ async def check_session_heartbeat(
 
     try:
         async with AsyncSession(
-            impersonate="chrome124",
+            impersonate=_TLS_PROFILE,
             proxy=proxy,
             timeout=timeout,
-            headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-            },
+            headers=build_heartbeat_headers(session_dir),
         ) as session:
             resp = await session.get("https://www.youtube.com/?hl=en", cookies=cookies)
             if resp.status_code != 200:

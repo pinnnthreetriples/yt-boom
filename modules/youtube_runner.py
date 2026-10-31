@@ -109,8 +109,6 @@ class YouTubeRunner:
         prefs.setdefault("network.proxy.socks_remote_dns", True)
         prefs.setdefault("network.http.http3.enable", False)
         prefs.setdefault("media.volume_scale", "0.0")
-        # No native Windows Hello / passkey prompt during Google sign-in
-        prefs.setdefault("security.webauth.webauthn", False)
 
         options: dict[str, Any] = {
             "headless": self._cfg.headless,

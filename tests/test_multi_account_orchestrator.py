@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import random
 import tempfile
@@ -546,6 +547,102 @@ class TestMultiAccountOrchestrator(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(exit_code, 0)
             mock_pipe.assert_awaited_once_with(videos_file=str(vid_file))
+
+
+class TestLifecyclePacing(unittest.IsolatedAsyncioTestCase):
+    """Lifecycle gate, error counting and pauses inside `_process_video` (mode "each", live)."""
+
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+        self.config = _make_test_config(self.base_dir)
+        self.db = Database(self.base_dir / "test.db")
+        await self.db.connect()
+        await self.db.init_schema()
+        self.video = await self.db.add_video_to_pool("https://www.youtube.com/watch?v=lifevid1111", comments_target=3)
+
+    async def asyncTearDown(self) -> None:
+        await self.db.close()
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
+
+    async def _account(self, name: str, hours_since_sign_in: float | None):
+        account = await self.db.upsert_account(name, str(self.base_dir / name))
+        if hours_since_sign_in is not None:
+            await self.db.mark_account_authenticated(account.id)
+            stamped = (datetime.now(timezone.utc) - timedelta(hours=hours_since_sign_in)).isoformat()
+            async with self.db._transaction() as conn:
+                await conn.execute("UPDATE accounts SET authenticated_at = ? WHERE id = ?", (stamped, account.id))
+        return await self.db.get_account(account.id)
+
+    def _orchestrator(self, run) -> tuple[MultiAccountOrchestrator, MagicMock]:
+        runner = MagicMock(run=AsyncMock(side_effect=run), close=AsyncMock())
+        collector = MagicMock(close=AsyncMock())
+        items = [
+            CollectedItem(
+                endpoint="youtube:lifevid1111",
+                external_id=f"lifevid1111#root#c_{n}",
+                text=f"Comment {n}",
+                language="en",
+                confidence=0.9,
+                source_url="https://www.youtube.com/watch?v=lifevid1111",
+                author=f"user_{n}",
+                video_id="lifevid1111",
+                like_count=1,
+            )
+            for n in range(6)
+        ]
+        collector.fetch_popular_comments = AsyncMock(return_value=items)
+        orchestrator = MultiAccountOrchestrator(
+            self.config,
+            db=self.db,
+            account_mode="each",
+            collector=collector,
+            runner_factory=lambda acc: runner,
+            rng=random.Random(7),
+        )
+        return orchestrator, runner
+
+    async def test_probation_account_posts_one_comment_then_stops(self) -> None:
+        account = await self._account("probation_acc", 50)
+        orchestrator, runner = self._orchestrator(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="r", duration_seconds=0.1)
+        )
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            done = await orchestrator._process_video(self.video, 3, account)
+        self.assertEqual(done, 1)
+        stored = await self.db.get_account(account.id)
+        self.assertEqual((stored.daily_comments_done, stored.total_replies), (1, 1))
+        self.assertIsNotNone(stored.last_comment_at)
+        self.assertEqual(stored.lifecycle_stage, "probation")
+
+    async def test_failed_submissions_trip_the_circuit_breaker(self) -> None:
+        account = await self._account("mature_acc", 100)
+        orchestrator, runner = self._orchestrator(
+            lambda *a, **k: SubmissionResult(success=False, error="submit failed", duration_seconds=0.1)
+        )
+        done = await orchestrator._process_video(self.video, 5, account)
+        self.assertEqual(done, 0)
+        self.assertEqual(runner.run.await_count, 3)
+        stored = await self.db.get_account(account.id)
+        self.assertEqual(stored.consecutive_errors, 3)
+        self.assertEqual(stored.lifecycle_stage, "restricted")
+
+    async def test_pause_between_comments_comes_from_the_limits_config(self) -> None:
+        account = await self._account("manual_acc", None)  # never signed in by the bot: no lifecycle gate
+        orchestrator, _ = self._orchestrator(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="r", duration_seconds=0.1)
+        )
+        sleep = AsyncMock()
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", sleep):
+            done = await orchestrator._process_video(self.video, 3, account)
+        self.assertEqual(done, 3)
+        pauses = [call.args[0] for call in sleep.await_args_list]
+        self.assertEqual(len(pauses), 2)  # between the comments, not after the last one
+        limits = self.config.limits
+        self.assertTrue(all(limits.pause_min_seconds <= p <= limits.pause_max_seconds for p in pauses))
 
 
 if __name__ == "__main__":

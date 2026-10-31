@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import random
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from modules.account_parser import looks_like_credentials, parse_account_line
 from modules.account_warmer import AccountWarmer, WarmUpResult
 from modules.google_authenticator import GoogleAuthenticator, GoogleAuthError, read_session_owner, write_session_owner
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
+from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.session_heartbeat import check_account_heartbeat, HeartbeatStatus
@@ -108,7 +110,7 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
             upsert_args["proxy_url"] = proxy_url  # an existing account keeps its proxy and active flag
         saved = await db.upsert_account(**upsert_args)
         if logged_in:
-            await db.set_account_auth_status(saved.id, "authenticated")
+            await db.mark_account_authenticated(saved.id)
             if saved.email:
                 write_session_owner(session_dir, saved.email)
             logger.info("Аккаунт {!r}: вход подтверждён (LOGIN_INFO), статус authenticated", saved.name)
@@ -260,11 +262,31 @@ async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRe
             await runner.close()
         except Exception as exc:
             logger.debug("Ошибка при закрытии браузера аккаунта {!r}: {}", account.name, exc)
-    if new_status is not None:
+    if new_status == "authenticated":
+        await db.mark_account_authenticated(account.id)
+    elif new_status is not None:
         await db.set_account_auth_status(account.id, new_status)
     if authenticated:
         write_session_owner(account.session_path, account.email)
+        try:
+            await db.sync_account_fingerprint(account.id, Path(account.session_path))
+        except Exception as exc:
+            logger.debug("Не удалось синхронизировать отпечаток аккаунта {!r}: {}", account.name, exc)
+        await _intro_warm_up(db, cfg, account)
     return authenticated
+
+
+INTRO_WARM_UP_SECONDS = 60.0
+
+
+async def _intro_warm_up(db: Database, cfg: AppConfig, account: AccountRecord) -> None:
+    """A minute of organic browsing right after sign-in; an account past quarantine and ageing needs none."""
+    fresh = await db.get_account(account.id)
+    if fresh is None or AccountLifecycleEngine.calculate_stage(fresh)[0] not in ("quarantine", "aging"):
+        return
+    res = await AccountWarmer(cfg.browser).warm_up(fresh, duration_seconds=INTRO_WARM_UP_SECONDS, db=db)
+    if not res.success:
+        logger.warning("Вводный прогрев аккаунта {!r} не удался: {}", account.name, res.details)
 
 
 async def _find_account(db: Database, identifier: str) -> AccountRecord | None:
@@ -397,6 +419,75 @@ async def warm_up_cli(
         res = await warmer.warm_up(account, duration_seconds=duration, target_video_url=target_video, db=db)
         print(f"[{'OK' if res.success else 'FAILED'}] {res.account_name}: {res.details}")
         return res.success
+
+
+async def warm_quarantined_cli(
+    config_path: str = "config.yaml", duration: float = 45.0, headless: bool | None = None
+) -> bool:
+    """`--warm-quarantined`: organic warm-up, one account after another, for every account in quarantine or ageing."""
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    async with Database(cfg.app.db_path) as db:
+        targets = [
+            a
+            for a in await db.list_active_accounts()
+            if a.auth_status == "authenticated"
+            and AccountLifecycleEngine.calculate_stage(a)[0] in ("quarantine", "aging")
+        ]
+        if not targets:
+            print("[INFO] No authenticated accounts in quarantine or aging.")
+            return True
+        warmer = AccountWarmer(cfg.browser)
+        failed = 0
+        for index, account in enumerate(targets):
+            if index:
+                await asyncio.sleep(_pause_between_accounts(account))
+            res = await warmer.warm_up(account, duration_seconds=duration, db=db)
+            failed += not res.success
+            print(f"[{'OK' if res.success else 'FAILED'}] {res.account_name}: {res.details}")
+        return not failed
+
+
+def _quota_today(account: AccountRecord, limit: int, now: datetime) -> int:
+    """Comments counted for today: the stored counter restarts once the daily reset moment has passed."""
+    reset_at = AccountLifecycleEngine.parse_utc(account.daily_limit_reset_at)
+    return 0 if reset_at is None or now >= reset_at else account.daily_comments_done
+
+
+async def lifecycle_cli(config_path: str = "config.yaml") -> None:
+    """`--lifecycle`: account ages, stages, quarantine hours left and today's comment quota."""
+    cfg = load_config(config_path)
+    async with Database(cfg.app.db_path) as db:
+        accounts = await db.list_accounts()
+        now = datetime.now(timezone.utc)
+        width = 100
+        print("\n" + "=" * width)
+        print("                                 ACCOUNT LIFECYCLE")
+        print("=" * width)
+        if not accounts:
+            print("  No accounts found in database.")
+        else:
+            print(
+                f"{'Account':<16} | {'Auth':<13} | {'Age':>7} | {'Stage':<11} | {'Quarantine':>10} | "
+                f"{'Today':>7} | {'Errors':>6} | {'Warm-ups':>8}"
+            )
+            print("-" * width)
+            for acc in accounts:
+                if acc.auth_status != "authenticated":
+                    age, stage, left, quota = "-", "-", "-", "-"
+                else:
+                    stage, limit = AccountLifecycleEngine.calculate_stage(acc, now)
+                    if acc.consecutive_errors >= 3:
+                        stage = "restricted"
+                    age = f"{AccountLifecycleEngine.age_hours(acc, now):.1f}h"
+                    left = f"{AccountLifecycleEngine.quarantine_hours_left(acc, now):.1f}h"
+                    quota = f"{_quota_today(acc, limit, now)}/{limit}"
+                print(
+                    f"{acc.name:<16} | {acc.auth_status:<13} | {age:>7} | {stage:<11} | {left:>10} | "
+                    f"{quota:>7} | {acc.consecutive_errors:>6} | {acc.warmup_sessions_done:>8}"
+                )
+        print("=" * width + "\n")
 
 
 async def print_accounts_table(config_path: str = "config.yaml") -> None:
@@ -1307,6 +1398,8 @@ def main() -> None:
     parser.add_argument("--heartbeat", "--check-session", dest="heartbeat", nargs="?", const="ALL", default=None, metavar="NAME_OR_ALL", help="Verify session validity and LOGIN_INFO via lightweight HTTP (default: all active accounts)")
     parser.add_argument("--warm-up", type=str, default=None, metavar="NAME_OR_EMAIL", help="Run humanized browser warm-up for an account (natural watch, mouse movement, comments scroll)")
     parser.add_argument("--warm-up-duration", type=float, default=45.0, help="Duration in seconds for warm-up viewing (default: 45.0)")
+    parser.add_argument("--lifecycle", action="store_true", help="Show account ages, lifecycle stages, quarantine hours left and daily comment quota")
+    parser.add_argument("--warm-quarantined", action="store_true", help="Run organic warm-up, one account after another, for every account in quarantine or aging (uses --warm-up-duration)")
     parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
     parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt)")
     parser.add_argument("--concurrency", "-j", type=int, default=None, help="Accounts working at the same time (default: limits.max_concurrent_sessions)")
@@ -1334,6 +1427,16 @@ def main() -> None:
                 target_video=args.video,
                 headless=args.headless or None,
             )
+        )
+        sys.exit(0 if ok else 1)
+
+    if args.lifecycle:
+        asyncio.run(lifecycle_cli(args.config))
+        return
+
+    if args.warm_quarantined:
+        ok = asyncio.run(
+            warm_quarantined_cli(args.config, duration=args.warm_up_duration, headless=args.headless or None)
         )
         sys.exit(0 if ok else 1)
 

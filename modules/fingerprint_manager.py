@@ -82,6 +82,15 @@ def get_or_create_fingerprint(session_dir: Path, target_os: str = "windows", *, 
     return fingerprint
 
 
+def read_pinned_user_agent(session_dir: Path) -> str | None:
+    """User agent of the account's pinned fingerprint; None when the file is missing, damaged or has none."""
+    saved = _read_saved(Path(session_dir) / FINGERPRINT_FILE)
+    if saved is None:
+        return None
+    user_agent = (saved[0].get("navigator") or {}).get("userAgent")
+    return str(user_agent) if user_agent else None
+
+
 def is_compatible(fingerprint: dict[str, Any]) -> bool:
     """True when the installed Camoufox can turn this fingerprint into a browser config (format drift after updates)."""
     try:
@@ -94,4 +103,10 @@ def is_compatible(fingerprint: dict[str, Any]) -> bool:
     return True
 
 
-__all__ = ["FINGERPRINT_FILE", "FORMAT_VERSION", "get_or_create_fingerprint", "is_compatible"]
+__all__ = [
+    "FINGERPRINT_FILE",
+    "FORMAT_VERSION",
+    "get_or_create_fingerprint",
+    "is_compatible",
+    "read_pinned_user_agent",
+]
