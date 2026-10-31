@@ -33,6 +33,18 @@ def _buttons(*labels: str) -> tuple[str, ...]:
 
 
 SIGN_IN_LINK = 'ytd-masthead #buttons a[href*="ServiceLogin"]'
+NEXT_BUTTONS = (
+    'button#passwordNext',
+    'button#identifierNext',
+    'button#totpNext',
+    '#passwordNext button',
+    '#identifierNext button',
+    '#totpNext button',
+    'button:has-text("Next")',
+    'button:has-text("Далее")',
+    '[role="button"]:has-text("Next")',
+    '[role="button"]:has-text("Далее")',
+)
 CONSENT_REJECT = (
     'button[aria-label*="Reject all"]',
     'button:has-text("Reject all")',
@@ -41,13 +53,13 @@ CONSENT_REJECT = (
     'button:has-text("Accept all")',
     'button:has-text("Принять все")',
 )
-EMAIL_INPUT = ('input#identifierId', 'input[type="email"]')
+EMAIL_INPUT = ('input#identifierId', 'input[name="identifier"]', 'input[type="email"]:not([name*="recovery"]):not([id*="recovery"])')
 PASSWORD_INPUT = ('input[type="password"]', 'input[name="Passwd"]')
 TOTP_INPUT = ('input#totpPin',)
 TOTP_TRUST_CHECKBOX = ('input#trustDevice', 'input[name="TrustDevice"]', 'input[type="checkbox"]')
 KPE_INPUT = ('input#knowledge-preregistered-email-response',)
 CAPTCHA_MARKERS = ('img#captchaimg', 'iframe[src*="recaptcha"]')
-ERROR_BLOCKS = ('[role="alert"]', '[aria-live="assertive"]', 'div[jsname="B34EJ"]')
+ERROR_BLOCKS = ('[role="alert"]', 'div[jsname="B34EJ"]', '[aria-live="assertive"] [jsname="B34EJ"]')
 TRY_ANOTHER_WAY = _buttons("Try another way", "Другой способ")
 AUTHENTICATOR_OPTION = (
     'div[data-challengetype="6"]',
@@ -61,7 +73,7 @@ USE_ANOTHER_ACCOUNT = (
     'li:has-text("Использовать другой аккаунт")',
 )
 # Only refusals: "Continue" on the passkey screen would open the native Windows Hello prompt.
-DECLINE_BUTTONS = _buttons("Not now", "Не сейчас", "Skip", "Пропустить", "No thanks", "Нет, спасибо")
+DECLINE_BUTTONS = _buttons("Not now", "Не сейчас", "Skip", "Пропустить", "No thanks", "Нет, спасибо", "Cancel", "Отмена")
 WAS_IT_YOU_BUTTONS = _buttons("Yes, it was me", "Да, это я")
 ACKNOWLEDGE_BUTTONS = _buttons("I understand", "Я понимаю") + ('input[type="submit"][value="I understand"]',)
 CREATE_CHANNEL_BUTTON = '#create-channel-button button'
@@ -199,6 +211,14 @@ class GoogleAuthenticator:
                 raise GoogleAuthError("после создания канала кука LOGIN_INFO пропала")
             logger.success("Авторизация в YouTube завершена")
             return True
+        except Exception as exc:
+            try:
+                screen_path = "auth_failure.png"
+                await page.screenshot(path=screen_path)
+                logger.info("Скриншот экрана ошибки сохранён в {}", screen_path)
+            except Exception:
+                pass
+            raise
         finally:
             try:
                 await page.close()
@@ -290,6 +310,14 @@ class GoogleAuthenticator:
 
     async def _handle_screen(self, page: Any, state: _FormState) -> str | None:
         """Act on the first recognised element of the current screen; returns the screen name, None when nothing matches."""
+        # Speedbumps and security confirmation interstitials: decline or acknowledge them first
+        if await self._click_first(page, DECLINE_BUTTONS):
+            return "decline"
+        if await self._click_first(page, WAS_IT_YOU_BUTTONS):
+            return "was_it_you"
+        if await self._click_first(page, ACKNOWLEDGE_BUTTONS):
+            return "acknowledge"
+
         if await self._submit_field(page, PASSWORD_INPUT, state.password, "password", "неверный пароль"):
             return "password"
         if await self._submit_totp(page, state):
@@ -306,12 +334,6 @@ class GoogleAuthenticator:
             return "account_chooser"
         if await self._pick_authenticator(page, state):
             return "challenge"
-        if await self._click_first(page, DECLINE_BUTTONS):
-            return "decline"
-        if await self._click_first(page, WAS_IT_YOU_BUTTONS):
-            return "was_it_you"
-        if await self._click_first(page, ACKNOWLEDGE_BUTTONS):
-            return "acknowledge"
         return None
 
     async def _settle(self, page: Any) -> None:
@@ -321,15 +343,30 @@ class GoogleAuthenticator:
         except PlaywrightError as exc:
             logger.debug("YouTube не дождался события load: {}", exc)
 
+    _NON_ERROR_STRINGS = frozenset({
+        "welcome", "добро пожаловать", "sign in", "вход",
+        "choose an account", "выберите аккаунт", "next", "далее",
+        "enter your password", "введите пароль", "to continue to youtube",
+        "show password", "показать пароль", "forgot password?", "забыли пароль?",
+        "2-step verification", "2-этапная аутентификация",
+        "to help keep your account safe", "чтобы защитить аккаунт",
+        "make sure you can always sign in", "добавьте резервный номер телефона",
+        "add a recovery", "recovery email", "enter recovery email",
+    })
+
     async def _enter_value(self, page: Any, field_locator: Any, value: str, selectors: tuple[str, ...]) -> str:
-        """Type `value` into the field, press Enter and wait for Google's answer; returns changed / error / timeout."""
+        """Type `value` into the field, click Next or press Enter and wait for Google's answer; returns changed / error / timeout."""
         path_before = _screen_path(page.url)
         await self._simulator.human_pause(0.6, 1.4)
         await self._simulator.click_locator(page, field_locator)
         await self._clear_field(field_locator)
         await self._simulator.type_text(page, value, allow_typos=False)
-        await self._simulator.human_pause(0.3, 0.8)
-        await page.keyboard.press("Enter")
+        await self._simulator.human_pause(0.4, 0.9)
+        next_button = await self._first_visible(page, NEXT_BUTTONS, timeout_seconds=1.5)
+        if next_button is not None:
+            await self._simulator.click_locator(page, next_button)
+        else:
+            await page.keyboard.press("Enter")
         return await self._wait_after_submit(page, selectors, path_before)
 
     @staticmethod
@@ -350,8 +387,8 @@ class GoogleAuthenticator:
                 return _CHANGED
             error = await self._visible_error_text(page)
             if error:
-                logger.debug("Google ответил ошибкой на экране {}: {}", path_before, error[:160])
-                return _ERROR
+                logger.warning("Google ответил ошибкой на экране {}: {}", path_before, error[:200])
+                return f"{_ERROR}: {error}"
             if time.monotonic() >= deadline:
                 return _TIMEOUT
             await asyncio.sleep(FIELD_POLL_SECONDS)
@@ -363,9 +400,20 @@ class GoogleAuthenticator:
                 for index in range(min(await matches.count(), 5)):
                     candidate = matches.nth(index)
                     if await candidate.is_visible():
+                        tag = ""
+                        try:
+                            tag = ((await candidate.evaluate("e => e.tagName")) or "").lower()
+                        except Exception:
+                            pass
+                        if tag in {"h1", "h2", "h3"}:
+                            continue
                         text = (await candidate.inner_text()).strip()
-                        if text:
-                            return text
+                        if not text:
+                            continue
+                        clean = text.lower()
+                        if any(s in clean for s in self._NON_ERROR_STRINGS) or "@" in text:
+                            continue
+                        return text
             except PlaywrightError:
                 continue
         return None
@@ -377,10 +425,11 @@ class GoogleAuthenticator:
         if field_locator is None:
             return False
         outcome = await self._enter_value(page, field_locator, value, selectors)
-        logger.debug("Экран {} заполнен (результат: {})", key, outcome)
+        logger.info("Экран {} заполнен (результат: {})", key, outcome)
         if outcome != _CHANGED:
-            # an explicit error block, or the field is still there after the timeout: Google did not accept the value
-            raise GoogleAuthError(failure)
+            detail = outcome.split(": ", 1)[1] if ": " in outcome else None
+            msg = f"{failure}: {detail}" if detail else failure
+            raise GoogleAuthError(msg)
         return True
 
     async def _submit_totp(self, page: Any, state: _FormState) -> bool:
