@@ -1,0 +1,27 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+
+# SQLite databases & temp WAL files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Test sessions and browser profiles
+test_sessions/
+_artifacts/
+logs/
+*.log
+
+# Windows / OS files
+Thumbs.db
+desktop.ini

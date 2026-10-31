@@ -1,0 +1,7 @@
+# Пул видеороликов для комментирования (YouTube Video Pool)
+# Укажите ссылки на видеоролики или их ID (по одному на строке).
+# Строки, начинающиеся с #, игнорируются.
+# Примеры:
+# https://www.youtube.com/watch?v=dQw4w9WgXcQ
+# https://youtu.be/dQw4w9WgXcQ
+# https://www.youtube.com/shorts/s_video_id
