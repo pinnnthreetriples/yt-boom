@@ -14,6 +14,7 @@ from playwright.async_api import Error as PlaywrightError
 from pydantic import BaseModel, ConfigDict
 
 from config import BrowserSettings, TargetSettings, parse_proxy
+from modules.fingerprint_manager import get_or_create_fingerprint
 from modules.interaction_simulator import InteractionError, InteractionSimulator
 from modules.ui_test_runner import NavigationError, SubmissionError, SubmissionResult
 
@@ -79,6 +80,10 @@ class YouTubeRunner:
         return self._proxy
 
     @property
+    def context(self) -> Any | None:
+        return self._context
+
+    @property
     def is_running(self) -> bool:
         return self._page is not None and not getattr(self._page, "is_closed", lambda: True)()
 
@@ -104,6 +109,8 @@ class YouTubeRunner:
         prefs.setdefault("dom.ipc.processCount.webIsolated", 1)
         prefs.setdefault("media.volume_scale", "0.0")
         prefs.setdefault("browser.cache.memory.enable", False)
+        # No native Windows Hello / passkey prompt during Google sign-in
+        prefs.setdefault("security.webauth.webauthn", False)
 
         options: dict[str, Any] = {
             "headless": self._cfg.headless,
@@ -118,6 +125,10 @@ class YouTubeRunner:
         proxy_dict = parse_proxy(self._proxy)
         if proxy_dict is not None:
             options["proxy"] = proxy_dict
+        try:
+            options["fingerprint"] = get_or_create_fingerprint(self._session_dir, self._cfg.os)
+        except Exception as exc:
+            logger.warning("Не удалось получить сохранённый отпечаток, Camoufox сгенерирует случайный: {}", exc)
         return options
 
     async def start(self) -> Any:

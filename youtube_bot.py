@@ -5,13 +5,16 @@ import asyncio
 import random
 import sys
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
 from config import load_config
 from database import ActivityLogCreate, Database
 from modules.collector import CollectorError
-from modules.interaction_simulator import InteractionSimulator
+from modules.account_parser import looks_like_credentials, parse_account_line
+from modules.google_authenticator import GoogleAuthenticator, GoogleAuthError
+from modules.interaction_simulator import InteractionConfig, InteractionSimulator
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.youtube_collector import YouTubeCollector, extract_video_id
@@ -126,6 +129,153 @@ async def add_account_cli(
         )
     finally:
         await db.close()
+
+
+def _resolve_youtube_target(cfg: Any) -> Any:
+    for target in cfg.browser.targets:
+        if target.name == "youtube" or "youtube.com" in target.base_url:
+            return target
+    from config import TargetSettings
+    return TargetSettings(
+        name="youtube",
+        base_url="https://www.youtube.com",
+        item_url_template="https://www.youtube.com/watch?v={external_id}",
+        submit_input_selector="#reply-dialog #contenteditable-root",
+        submit_button_selector="#reply-dialog #submit-button button",
+        confirmation_selector="ytd-comment-view-model",
+    )
+
+
+async def _register_credentials_account(
+    db: Database,
+    cfg: Any,
+    spec: str,
+    name: str | None = None,
+    session_path: str | None = None,
+    proxy_url: str | None = None,
+) -> Any:
+    parsed = parse_account_line(spec, proxy=proxy_url)
+    account_name = (name or parsed.default_name).strip()
+    return await db.upsert_account(
+        name=account_name,
+        session_path=session_path or str(cfg.browser.session_root / account_name),
+        proxy_url=parsed.proxy,
+        is_active=True,
+        email=parsed.email,
+        password=parsed.password,
+        totp_secret=parsed.totp_secret,
+        recovery_email=parsed.recovery_email,
+    )
+
+
+async def add_credentials_account_cli(
+    spec: str,
+    name: str | None = None,
+    session_path: str | None = None,
+    proxy_url: str | None = None,
+    config_path: str = "config.yaml",
+) -> bool:
+    """`--add-account email:password:totp_secret[:recovery_email]`: register the account with status `pending`."""
+    cfg = load_config(config_path)
+    async with Database(cfg.app.db_path) as db:
+        try:
+            account = await _register_credentials_account(db, cfg, spec, name, session_path, proxy_url)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return False
+        print(
+            f"[OK] Account {account.name!r} registered (id={account.id}, status={account.auth_status}, "
+            f"session={account.session_path}, proxy={account.proxy_url or 'direct'}). "
+            f"Next: --auth-account {account.name}"
+        )
+        return True
+
+
+async def _authenticate_account(db: Database, cfg: Any, account: Any) -> bool:
+    if not account.email or not account.password:
+        logger.error("У аккаунта {!r} не заданы email/пароль: добавьте его через --add-account email:password:totp", account.name)
+        return False
+    simulator = InteractionSimulator(InteractionConfig(key_delay_ms_min=50, key_delay_ms_max=100))
+    runner_kwargs: dict[str, Any] = {
+        "session_dir": account.session_path,
+        "account_name": account.name,
+        "simulator": simulator,
+    }
+    if account.proxy_url is not None:
+        runner_kwargs["proxy"] = account.proxy_url
+    runner = YouTubeRunner(cfg.browser, _resolve_youtube_target(cfg), **runner_kwargs)
+    authenticated = False
+    try:
+        await runner.start()
+        authenticated = await GoogleAuthenticator(simulator).authenticate(
+            runner.context, account.email, account.password, account.totp_secret, account.recovery_email
+        )
+    except GoogleAuthError as exc:
+        logger.error("Авторизация {!r} не удалась: {}", account.name, exc)
+    except Exception as exc:
+        logger.error("Авторизация {!r} прервана ошибкой: {}", account.name, exc)
+    finally:
+        await runner.close()
+    await db.set_account_auth_status(account.id, "authenticated" if authenticated else "failed")
+    return authenticated
+
+
+async def _find_account(db: Database, identifier: str) -> Any | None:
+    account = await db.get_account(identifier)
+    if account is not None:
+        return account
+    wanted = identifier.strip().lower()
+    return next((a for a in await db.list_accounts() if a.email and a.email.lower() == wanted), None)
+
+
+async def auth_account_cli(identifier: str, config_path: str = "config.yaml", headless: bool | None = None) -> bool:
+    """`--auth-account <name_or_email>`: sign the account into YouTube (proxy and fingerprint come from the account)."""
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    async with Database(cfg.app.db_path) as db:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Account {identifier!r} not found. Add it with --add-account email:password:totp", file=sys.stderr)
+            return False
+        ok = await _authenticate_account(db, cfg, account)
+        print(f"[{'OK' if ok else 'FAILED'}] {account.name}: {'authenticated' if ok else 'authentication failed'}")
+        return ok
+
+
+async def import_accounts_file_cli(path: str, config_path: str = "config.yaml", headless: bool | None = None) -> bool:
+    """`--import-accounts-file`: register every line of the file, then authenticate the accounts one by one."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        print(f"[ERROR] Cannot read {path}: {exc}", file=sys.stderr)
+        return False
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    registered: list[Any] = []
+    failed_lines = 0
+    async with Database(cfg.app.db_path) as db:
+        for number, raw in enumerate(lines, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                registered.append(await _register_credentials_account(db, cfg, line))
+            except ValueError as exc:
+                failed_lines += 1
+                print(f"[ERROR] line {number}: {exc}", file=sys.stderr)  # the line itself holds a password: not echoed
+        print(f"[OK] Registered {len(registered)} account(s), skipped {failed_lines} invalid line(s)")
+
+        failed_auth = 0
+        for index, account in enumerate(registered):
+            if index:
+                await asyncio.sleep(random.uniform(5.0, 15.0))
+            logger.info("Авторизация аккаунта {!r} ({}/{})", account.name, index + 1, len(registered))
+            if not await _authenticate_account(db, cfg, account):
+                failed_auth += 1
+        print(f"[{'OK' if not failed_auth else 'FAILED'}] Authenticated {len(registered) - failed_auth} of {len(registered)}")
+    return not failed_lines and not failed_auth
 
 
 async def print_accounts_table(config_path: str = "config.yaml") -> None:
@@ -1010,8 +1160,17 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true", help="Запуск браузера в скрытом/автономном режиме (без видимого окна)")
     parser.add_argument("--login", action="store_true", help="Open headful browser to log into YouTube interactively")
     parser.add_argument("--account", type=str, default=None, help="YouTube account name to use for execution or login")
-    parser.add_argument("--add-account", type=str, default=None, metavar="NAME", help="Add or update account by name")
-    parser.add_argument("--proxy", type=str, default=None, help="Proxy URL for adding account or session override")
+    parser.add_argument(
+        "--add-account",
+        type=str,
+        default=None,
+        metavar="NAME | EMAIL:PASSWORD:TOTP[:RECOVERY_EMAIL]",
+        help="Add or update account by name, or register Google credentials email:password:totp_secret[:recovery_email] (status pending)",
+    )
+    parser.add_argument("--name", type=str, default=None, help="Account name for --add-account with credentials (default: the email)")
+    parser.add_argument("--auth-account", type=str, default=None, metavar="NAME_OR_EMAIL", help="Sign the account into YouTube (Camoufox with its proxy and fixed fingerprint, TOTP 2FA)")
+    parser.add_argument("--import-accounts-file", type=str, default=None, metavar="FILE", help="Import accounts from a text file (one email:password:totp[:recovery_email][:proxy] per line) and authenticate them one by one")
+    parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (http://user:pass@ip:port or ip:port:user:pass) for adding account or session override")
     parser.add_argument("--session", type=str, default=None, help="Session directory path for adding account")
     parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
     parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt)")
@@ -1032,8 +1191,26 @@ def main() -> None:
         return
 
     if args.add_account:
+        if looks_like_credentials(args.add_account):
+            ok = asyncio.run(
+                add_credentials_account_cli(
+                    args.add_account,
+                    name=args.name,
+                    session_path=args.session,
+                    proxy_url=args.proxy,
+                    config_path=args.config,
+                )
+            )
+            sys.exit(0 if ok else 1)
         asyncio.run(add_account_cli(args.add_account, session_path=args.session, proxy_url=args.proxy, config_path=args.config))
         return
+
+    if args.auth_account:
+        sys.exit(0 if asyncio.run(auth_account_cli(args.auth_account, args.config, args.headless or None)) else 1)
+
+    if args.import_accounts_file:
+        ok = asyncio.run(import_accounts_file_cli(args.import_accounts_file, args.config, args.headless or None))
+        sys.exit(0 if ok else 1)
 
     if args.status:
         asyncio.run(print_status(args.config))
@@ -1106,6 +1283,8 @@ def main() -> None:
         or args.account is not None
         or args.videos_file is not None
         or args.add_account is not None
+        or args.auth_account is not None
+        or args.import_accounts_file is not None
         or args.list_accounts
     )
 

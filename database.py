@@ -128,6 +128,15 @@ CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active);
 CREATE INDEX IF NOT EXISTS idx_video_pool_status ON video_pool(status, id);
 """
 
+_ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("email", "TEXT"),
+    ("password", "TEXT"),
+    ("totp_secret", "TEXT"),
+    ("recovery_email", "TEXT"),
+    ("auth_status", "TEXT DEFAULT 'pending'"),
+    ("fingerprint_data", "TEXT"),
+)
+
 _ERROR_LIMIT = 2000
 
 
@@ -236,6 +245,12 @@ class AccountRecord(BaseModel):
     total_replies: int = 0
     created_at: str
     last_used_at: str | None = None
+    email: str | None = None
+    password: str | None = None
+    totp_secret: str | None = None
+    recovery_email: str | None = None
+    auth_status: str = "pending"
+    fingerprint_data: str | None = None
 
 
 class AccountCreate(BaseModel):
@@ -243,6 +258,10 @@ class AccountCreate(BaseModel):
     session_path: str
     proxy_url: str | None = None
     is_active: bool = True
+    email: str | None = None
+    password: str | None = None
+    totp_secret: str | None = None
+    recovery_email: str | None = None
 
 
 class VideoPoolItem(BaseModel):
@@ -352,8 +371,19 @@ class Database:
                 await conn.execute("PRAGMA user_version = 2")
                 await conn.commit()
             await conn.executescript(_MULTI_ACCOUNT_SCHEMA)
+            await self._ensure_account_columns(conn)
             await conn.commit()
         logger.debug("Database schema ensured at {}", self._path)
+
+    @staticmethod
+    async def _ensure_account_columns(conn: aiosqlite.Connection) -> None:
+        """Incremental migration: add the auth columns to an `accounts` table created by an older version."""
+        cursor = await conn.execute("PRAGMA table_info(accounts)")
+        existing = {str(row[1]) for row in await cursor.fetchall()}
+        await cursor.close()
+        for column, ddl in _ACCOUNT_AUTH_COLUMNS:
+            if column not in existing:
+                await conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -1094,6 +1124,10 @@ class Database:
         session_path: str,
         proxy_url: str | None = None,
         is_active: bool = True,
+        email: str | None = None,
+        password: str | None = None,
+        totp_secret: str | None = None,
+        recovery_email: str | None = None,
     ) -> AccountRecord:
         name = name.strip()
         if not name:
@@ -1102,19 +1136,28 @@ class Database:
         if not session_path:
             raise ValueError("session_path must not be empty")
         proxy_url = proxy_url.strip() if proxy_url else None
+        email, password, totp_secret, recovery_email = (
+            (value.strip() or None) if value else None for value in (email, password, totp_secret, recovery_email)
+        )
         now = datetime.now(timezone.utc).isoformat()
         is_active_int = 1 if is_active else 0
         async with self._transaction() as conn:
+            # Credentials passed as None keep what is already stored: old callers never send them.
             await conn.execute(
                 """
-                INSERT INTO accounts (name, session_path, proxy_url, is_active, total_replies, created_at)
-                VALUES (?, ?, ?, ?, 0, ?)
+                INSERT INTO accounts (name, session_path, proxy_url, is_active, total_replies, created_at,
+                                      email, password, totp_secret, recovery_email)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE
                     SET session_path = excluded.session_path,
                         proxy_url = excluded.proxy_url,
-                        is_active = excluded.is_active
+                        is_active = excluded.is_active,
+                        email = COALESCE(excluded.email, accounts.email),
+                        password = COALESCE(excluded.password, accounts.password),
+                        totp_secret = COALESCE(excluded.totp_secret, accounts.totp_secret),
+                        recovery_email = COALESCE(excluded.recovery_email, accounts.recovery_email)
                 """,
-                (name, session_path, proxy_url, is_active_int, now),
+                (name, session_path, proxy_url, is_active_int, now, email, password, totp_secret, recovery_email),
             )
             row = await (await conn.execute("SELECT * FROM accounts WHERE name = ?", (name,))).fetchone()
         if row is None:
@@ -1162,6 +1205,12 @@ class Database:
             val = 1 if is_active else 0
             rows = await self._fetch_all("SELECT * FROM accounts WHERE is_active = ? ORDER BY id ASC", (val,))
         return [AccountRecord.model_validate(dict(row)) for row in rows]
+
+    async def set_account_auth_status(self, account_id: int, status: str) -> None:
+        async with self._transaction() as conn:
+            cursor = await conn.execute("UPDATE accounts SET auth_status = ? WHERE id = ?", (status, account_id))
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account id={account_id} not found")
 
     async def increment_account_stats(
         self,

@@ -221,9 +221,16 @@ class TargetSettings(BaseModel):
         return self
 
 
+_RAW_PROXY_RE = re.compile(r"^([^:/]+):(\d+):([^:@]+):([^@]+)$")  # ip:port:user:pass
+
+
 def parse_proxy(proxy_url: str | None) -> dict[str, str] | None:
     if not proxy_url:
         return None
+    raw = _RAW_PROXY_RE.match(proxy_url.strip())
+    if raw:
+        host, port, user, password = raw.groups()
+        proxy_url = f"http://{user}:{password}@{host}:{port}"
     parsed = urlparse(proxy_url)
     if not parsed.hostname or not parsed.port:
         raise ValueError(f"proxy must include host and port: {proxy_url!r}")
@@ -243,6 +250,10 @@ class AccountSettings(BaseModel):
     session_path: str = Field(default="test_sessions/youtube")
     proxy_url: str | None = None
     is_active: bool = True
+    email: str | None = None
+    password: str | None = None
+    totp_secret: str | None = None
+    recovery_email: str | None = None
 
     def playwright_proxy(self) -> dict[str, str] | None:
         return parse_proxy(self.proxy_url)
