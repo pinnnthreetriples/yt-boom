@@ -193,7 +193,8 @@ class TestFingerprintManager(unittest.TestCase):
             self.assertEqual(first, fake)
             self.assertEqual(second, fake)
             generate.assert_called_once_with(os="windows")
-            self.assertEqual(json.loads((session / "fingerprint.json").read_text(encoding="utf-8")), fake)
+            saved = json.loads((session / "fingerprint.json").read_text(encoding="utf-8"))
+            self.assertEqual((saved["format"], saved["os"], saved["fingerprint"]), (1, "windows", fake))
 
     def test_corrupt_file_is_regenerated(self):
         with tempfile.TemporaryDirectory() as temp:

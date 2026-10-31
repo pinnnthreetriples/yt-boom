@@ -12,7 +12,9 @@ from urllib.parse import parse_qs, urlparse
 
 import aiosqlite
 from loguru import logger
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+from secret_store import SecretStoreError, protect_secret, reveal_secret
 
 NodeStatus = Literal["idle", "busy", "cooldown", "disabled"]
 PayloadStatus = Literal["pending", "submitted", "validated", "failed"]
@@ -138,6 +140,17 @@ _ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 _ERROR_LIMIT = 2000
+_SCHEMA_ATTEMPTS = 6
+
+
+class _Unset:
+    """Marker for "argument not passed": an explicit None must stay distinguishable from it."""
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _Unset()
 
 
 class RecordNotFoundError(RuntimeError):
@@ -246,8 +259,8 @@ class AccountRecord(BaseModel):
     created_at: str
     last_used_at: str | None = None
     email: str | None = None
-    password: str | None = None
-    totp_secret: str | None = None
+    password: str | None = Field(default=None, repr=False, exclude=True)
+    totp_secret: str | None = Field(default=None, repr=False, exclude=True)
     recovery_email: str | None = None
     auth_status: str = "pending"
     fingerprint_data: str | None = None
@@ -259,8 +272,8 @@ class AccountCreate(BaseModel):
     proxy_url: str | None = None
     is_active: bool = True
     email: str | None = None
-    password: str | None = None
-    totp_secret: str | None = None
+    password: str | None = Field(default=None, repr=False, exclude=True)
+    totp_secret: str | None = Field(default=None, repr=False, exclude=True)
     recovery_email: str | None = None
 
 
@@ -336,7 +349,14 @@ class Database:
             row = await cursor.fetchone()
             await cursor.close()
             if not row or str(row[0]).lower() != "wal":
-                await conn.execute("PRAGMA journal_mode=WAL")
+                for attempt in range(1, _SCHEMA_ATTEMPTS + 1):  # switching the mode ignores busy_timeout while another process does it
+                    try:
+                        await conn.execute("PRAGMA journal_mode=WAL")
+                        break
+                    except aiosqlite.OperationalError as exc:
+                        if "locked" not in str(exc).lower() or attempt == _SCHEMA_ATTEMPTS:
+                            raise
+                        await asyncio.sleep(0.1 * attempt)
         except BaseException:
             await conn.close()
             raise
@@ -360,6 +380,18 @@ class Database:
         await self.close()
 
     async def init_schema(self) -> None:
+        """Create / migrate the schema; a few retries when another process holds the write lock at the same time."""
+        for attempt in range(1, _SCHEMA_ATTEMPTS + 1):
+            try:
+                await self._init_schema_once()
+                return
+            except aiosqlite.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == _SCHEMA_ATTEMPTS:
+                    raise
+                logger.debug("База занята другим процессом, повтор инициализации схемы ({}/{})", attempt, _SCHEMA_ATTEMPTS)
+                await asyncio.sleep(0.2 * attempt)
+
+    async def _init_schema_once(self) -> None:
         conn = self.connection
         async with self._lock:
             cursor = await conn.execute("PRAGMA user_version")
@@ -383,7 +415,11 @@ class Database:
         await cursor.close()
         for column, ddl in _ACCOUNT_AUTH_COLUMNS:
             if column not in existing:
-                await conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
+                try:
+                    await conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
+                except aiosqlite.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():  # another process added it first
+                        raise
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -1118,51 +1154,109 @@ class Database:
 
     # ----------------------------------------------------------------- accounts
 
+    @staticmethod
+    def _account_from_row(row: aiosqlite.Row) -> AccountRecord:
+        """AccountRecord with `password` / `totp_secret` decrypted (values of older versions are plain text)."""
+        data = dict(row)
+        for field in ("password", "totp_secret"):
+            try:
+                data[field] = reveal_secret(data.get(field))
+            except SecretStoreError as exc:
+                logger.warning("Аккаунт {!r}: поле {} недоступно: {}", data.get("name"), field, exc)
+                data[field] = None
+        return AccountRecord.model_validate(data)
+
     async def upsert_account(
         self,
         name: str,
-        session_path: str,
-        proxy_url: str | None = None,
-        is_active: bool = True,
+        session_path: str | _Unset = UNSET,
+        proxy_url: str | None | _Unset = UNSET,
+        is_active: bool | _Unset = UNSET,
         email: str | None = None,
         password: str | None = None,
         totp_secret: str | None = None,
         recovery_email: str | None = None,
     ) -> AccountRecord:
+        """Create or update an account by name.
+
+        `session_path`, `proxy_url` and `is_active` keep the stored values when they are not passed (an explicit
+        `proxy_url=None` removes the proxy); a new account needs `session_path`, starts active and without proxy.
+        Credentials passed as None keep what is stored. A changed email, password or proxy resets `auth_status`
+        to `pending`. `password` and `totp_secret` are stored encrypted (Windows DPAPI).
+        """
         name = name.strip()
         if not name:
             raise ValueError("account name must not be empty")
-        session_path = str(session_path).strip()
-        if not session_path:
-            raise ValueError("session_path must not be empty")
-        proxy_url = proxy_url.strip() if proxy_url else None
+        if not isinstance(session_path, _Unset):
+            session_path = str(session_path).strip()
+            if not session_path:
+                raise ValueError("session_path must not be empty")
+        if isinstance(proxy_url, str):
+            proxy_url = proxy_url.strip() or None
         email, password, totp_secret, recovery_email = (
             (value.strip() or None) if value else None for value in (email, password, totp_secret, recovery_email)
         )
         now = datetime.now(timezone.utc).isoformat()
-        is_active_int = 1 if is_active else 0
         async with self._transaction() as conn:
-            # Credentials passed as None keep what is already stored: old callers never send them.
-            await conn.execute(
-                """
-                INSERT INTO accounts (name, session_path, proxy_url, is_active, total_replies, created_at,
-                                      email, password, totp_secret, recovery_email)
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE
-                    SET session_path = excluded.session_path,
-                        proxy_url = excluded.proxy_url,
-                        is_active = excluded.is_active,
-                        email = COALESCE(excluded.email, accounts.email),
-                        password = COALESCE(excluded.password, accounts.password),
-                        totp_secret = COALESCE(excluded.totp_secret, accounts.totp_secret),
-                        recovery_email = COALESCE(excluded.recovery_email, accounts.recovery_email)
-                """,
-                (name, session_path, proxy_url, is_active_int, now, email, password, totp_secret, recovery_email),
-            )
+            row = await (await conn.execute("SELECT * FROM accounts WHERE name = ?", (name,))).fetchone()
+            if row is None:
+                if isinstance(session_path, _Unset):
+                    raise ValueError("session_path is required for a new account")
+                await conn.execute(
+                    """
+                    INSERT INTO accounts (name, session_path, proxy_url, is_active, total_replies, created_at,
+                                          email, password, totp_secret, recovery_email)
+                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        name,
+                        session_path,
+                        None if isinstance(proxy_url, _Unset) else proxy_url,
+                        0 if not isinstance(is_active, _Unset) and not is_active else 1,
+                        now,
+                        email,
+                        protect_secret(password),
+                        protect_secret(totp_secret),
+                        recovery_email,
+                    ),
+                )
+            else:
+                current = self._account_from_row(row)
+                new_session = current.session_path if isinstance(session_path, _Unset) else session_path
+                new_proxy = current.proxy_url if isinstance(proxy_url, _Unset) else proxy_url
+                new_active = current.is_active if isinstance(is_active, _Unset) else bool(is_active)
+                credentials_changed = (
+                    (email is not None and email != current.email)
+                    or (password is not None and password != current.password)
+                    or new_proxy != current.proxy_url
+                )
+                await conn.execute(
+                    """
+                    UPDATE accounts
+                    SET session_path = ?, proxy_url = ?, is_active = ?,
+                        email = COALESCE(?, email),
+                        password = COALESCE(?, password),
+                        totp_secret = COALESCE(?, totp_secret),
+                        recovery_email = COALESCE(?, recovery_email),
+                        auth_status = CASE WHEN ? THEN 'pending' ELSE auth_status END
+                    WHERE id = ?
+                    """,
+                    (
+                        new_session,
+                        new_proxy,
+                        1 if new_active else 0,
+                        email,
+                        protect_secret(password),
+                        protect_secret(totp_secret),
+                        recovery_email,
+                        1 if credentials_changed else 0,
+                        row["id"],
+                    ),
+                )
             row = await (await conn.execute("SELECT * FROM accounts WHERE name = ?", (name,))).fetchone()
         if row is None:
             raise RecordNotFoundError(f"account {name!r} disappeared during upsert")
-        account = AccountRecord.model_validate(dict(row))
+        account = self._account_from_row(row)
         logger.debug("Upserted account {} (id={}, active={})", account.name, account.id, account.is_active)
         return account
 
@@ -1181,7 +1275,7 @@ class Database:
                     raise ValueError(f"account {new_name!r} already exists")
                 await conn.execute("UPDATE accounts SET name = ? WHERE id = ?", (new_name, row["id"]))
                 row = await (await conn.execute("SELECT * FROM accounts WHERE id = ?", (row["id"],))).fetchone()
-        account = AccountRecord.model_validate(dict(row))
+        account = self._account_from_row(row)
         logger.debug("Renamed account {!r} -> {!r} (id={})", old_name, account.name, account.id)
         return account
 
@@ -1192,11 +1286,11 @@ class Database:
             row = await self._fetch_one("SELECT * FROM accounts WHERE name = ?", (str(account_id_or_name),))
             if row is None and isinstance(account_id_or_name, str) and account_id_or_name.isdigit():
                 row = await self._fetch_one("SELECT * FROM accounts WHERE id = ?", (int(account_id_or_name),))
-        return AccountRecord.model_validate(dict(row)) if row else None
+        return self._account_from_row(row) if row else None
 
     async def list_active_accounts(self) -> list[AccountRecord]:
         rows = await self._fetch_all("SELECT * FROM accounts WHERE is_active = 1 ORDER BY id ASC")
-        return [AccountRecord.model_validate(dict(row)) for row in rows]
+        return [self._account_from_row(row) for row in rows]
 
     async def list_accounts(self, is_active: bool | None = None) -> list[AccountRecord]:
         if is_active is None:
@@ -1204,7 +1298,7 @@ class Database:
         else:
             val = 1 if is_active else 0
             rows = await self._fetch_all("SELECT * FROM accounts WHERE is_active = ? ORDER BY id ASC", (val,))
-        return [AccountRecord.model_validate(dict(row)) for row in rows]
+        return [self._account_from_row(row) for row in rows]
 
     async def set_account_auth_status(self, account_id: int, status: str) -> None:
         async with self._transaction() as conn:

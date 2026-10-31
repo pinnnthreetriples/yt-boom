@@ -221,26 +221,84 @@ class TargetSettings(BaseModel):
         return self
 
 
-_RAW_PROXY_RE = re.compile(r"^([^:/]+):(\d+):([^:@]+):([^@]+)$")  # ip:port:user:pass
+_PROXY_HOST = r"(?:\[[0-9A-Fa-f:.]+\]|[^:/@\s\[\]]+)"  # host name, IPv4 or an IPv6 address in brackets
+_RAW_PROXY_RE = re.compile(rf"^({_PROXY_HOST}):(\d{{1,5}}):([^:@\s]+):(\S+)$")  # host:port:user:pass
+_AUTH_PROXY_RE = re.compile(rf"^([^:/@\s]+):([^/\s]*)@({_PROXY_HOST}):(\d{{1,5}})$")  # user:pass@host:port
+_BARE_PROXY_RE = re.compile(rf"^({_PROXY_HOST}):(\d{{1,5}})$")  # host:port
+_PROXY_ERROR = "proxy must include host and port (host:port, host:port:user:pass, user:pass@host:port or scheme://...)"
+
+
+def _proxy_dict(scheme: str, host: str, port: str | int, user: str | None = None, password: str | None = None) -> dict[str, str]:
+    number = int(port)
+    if not 0 < number < 65536:
+        raise ValueError("proxy port must be between 1 and 65535")
+    proxy: dict[str, str] = {"server": f"{scheme}://{host}:{number}"}
+    if user:
+        proxy["username"] = user
+    if password:
+        proxy["password"] = password
+    return proxy
 
 
 def parse_proxy(proxy_url: str | None) -> dict[str, str] | None:
+    """Playwright proxy dict from `scheme://[user:pass@]host:port`, `host:port`, `user:pass@host:port` or `host:port:user:pass`.
+
+    Credentials of the non-URL forms are taken literally (no percent-decoding). IPv6 hosts go in brackets.
+    The error message never contains the proxy string: it may hold a password.
+    """
     if not proxy_url:
         return None
-    raw = _RAW_PROXY_RE.match(proxy_url.strip())
+    text = proxy_url.strip()
+    raw = _RAW_PROXY_RE.match(text)
     if raw:
         host, port, user, password = raw.groups()
-        proxy_url = f"http://{user}:{password}@{host}:{port}"
-    parsed = urlparse(proxy_url)
-    if not parsed.hostname or not parsed.port:
-        raise ValueError(f"proxy must include host and port: {proxy_url!r}")
-    server = f"{parsed.scheme or 'http'}://{parsed.hostname}:{parsed.port}"
-    proxy: dict[str, str] = {"server": server}
-    if parsed.username:
-        proxy["username"] = unquote(parsed.username)
-    if parsed.password:
-        proxy["password"] = unquote(parsed.password)
-    return proxy
+        return _proxy_dict("http", host, port, user, password)
+    auth = _AUTH_PROXY_RE.match(text)
+    if auth:
+        user, password, host, port = auth.groups()
+        return _proxy_dict("http", host, port, user, password)
+    bare = _BARE_PROXY_RE.match(text)
+    if bare:
+        return _proxy_dict("http", bare.group(1), bare.group(2))
+    try:
+        parsed = urlparse(text)
+        hostname, port_number = parsed.hostname, parsed.port
+    except ValueError:
+        raise ValueError(_PROXY_ERROR) from None
+    if not hostname or not port_number:
+        raise ValueError(_PROXY_ERROR)
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    return _proxy_dict(
+        parsed.scheme or "http",
+        host,
+        port_number,
+        unquote(parsed.username) if parsed.username else None,
+        unquote(parsed.password) if parsed.password else None,
+    )
+
+
+def mask_proxy_url(proxy_url: str | None) -> str:
+    """Proxy for logs and tables: `scheme://user:***@host:port`; never contains the password."""
+    text = (proxy_url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = parse_proxy(text)
+    except ValueError:
+        return "***" if "@" in text or text.count(":") >= 3 else text
+    if parsed is None:
+        return ""
+    user = parsed.get("username")
+    if not user:
+        return parsed["server"]
+    scheme, _, host_port = parsed["server"].partition("://")
+    return f"{scheme}://{user}{':***' if parsed.get('password') else ''}@{host_port}"
+
+
+def resolve_account_proxy(account_proxy: str | None, global_proxy: str | None) -> str | None:
+    """The proxy one account uses everywhere (sign-in, posting): its own, otherwise the global `browser.proxy`."""
+    own = account_proxy.strip() if account_proxy else ""
+    return own or (global_proxy or None)
 
 
 class AccountSettings(BaseModel):
@@ -251,8 +309,8 @@ class AccountSettings(BaseModel):
     proxy_url: str | None = None
     is_active: bool = True
     email: str | None = None
-    password: str | None = None
-    totp_secret: str | None = None
+    password: str | None = Field(default=None, repr=False, exclude=True)
+    totp_secret: str | None = Field(default=None, repr=False, exclude=True)
     recovery_email: str | None = None
 
     def playwright_proxy(self) -> dict[str, str] | None:
@@ -479,5 +537,7 @@ __all__ = [
     "TargetSettings",
     "ValidatorSettings",
     "load_config",
+    "mask_proxy_url",
     "parse_proxy",
+    "resolve_account_proxy",
 ]

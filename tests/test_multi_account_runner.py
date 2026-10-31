@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
@@ -43,6 +44,9 @@ class TestMultiAccountRunner(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
+        fingerprint_patch = patch("modules.youtube_runner.get_or_create_fingerprint", return_value={"pinned": True})
+        fingerprint_patch.start()  # _launch_options must not generate a real fingerprint (0.4 s, needs the fpgen data)
+        self.addCleanup(fingerprint_patch.stop)
         self.target = self.browser_cfg.targets[0]
         self.runner = YouTubeRunner(self.browser_cfg, self.target)
 

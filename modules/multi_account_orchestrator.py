@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
-from config import AppConfig, BrowserSettings, TargetSettings, load_config
+from config import AppConfig, BrowserSettings, TargetSettings, load_config, resolve_account_proxy
 from database import (
     AccountRecord,
     ActivityLogCreate,
@@ -93,6 +93,7 @@ class MultiAccountOrchestrator:
         self._account_offset: int = 0
         # Comments taken in this run: parallel accounts must not pick the same one before its payload exists.
         self._claimed: set[str] = set()
+        self._skipped_logged: set[int] = set()
 
     @property
     def db(self) -> Database:
@@ -144,7 +145,7 @@ class MultiAccountOrchestrator:
             browser_settings=self._cfg.browser,
             target=self._yt_target,
             session_dir=acc.session_path,
-            proxy=acc.proxy_url,
+            proxy=resolve_account_proxy(acc.proxy_url, self._cfg.browser.proxy),
             account_name=acc.name,
             simulator=self._simulator,
             rng=self._rng,
@@ -186,11 +187,38 @@ class MultiAccountOrchestrator:
         for acc_id in list(self._runners):
             await self._drop_runner(acc_id)
 
-    async def _pick_account(self) -> AccountRecord | None:
-        """Select next active account with least total replies, rotated round-robin."""
+    @staticmethod
+    def _is_usable(acc: AccountRecord) -> bool:
+        """A failed sign-in is out; a `pending` account with credentials needs a saved session (cookies.sqlite).
+
+        Accounts without credentials (`default`, manual `--login`) keep working whatever their status says.
+        """
+        if acc.auth_status == "failed":
+            return False
+        if acc.auth_status == "pending" and acc.email and not (Path(acc.session_path) / "cookies.sqlite").exists():
+            return False
+        return True
+
+    async def _usable_accounts(self) -> list[AccountRecord]:
+        """Active accounts that can post: sign-in not failed, and not waiting for a first sign-in."""
         accounts = await self._db.list_active_accounts()
         if not accounts:
             accounts = await self.sync_accounts_from_config()
+        usable = [acc for acc in accounts if self._is_usable(acc)]
+        for acc in accounts:
+            if acc not in usable and acc.id not in self._skipped_logged:
+                self._skipped_logged.add(acc.id)
+                logger.warning(
+                    "ИНФО | Аккаунт {!r} пропущен (вход: {}): выполните `youtube_bot.py --auth-account {}`",
+                    acc.name,
+                    acc.auth_status,
+                    acc.name,
+                )
+        return usable
+
+    async def _pick_account(self) -> AccountRecord | None:
+        """Select next active account with least total replies, rotated round-robin."""
+        accounts = await self._usable_accounts()
         if not accounts:
             return None
         n = len(accounts)
@@ -440,9 +468,7 @@ class MultiAccountOrchestrator:
         - Error isolation: exceptions in one account/video don't break others.
         """
         await self.ensure_db()
-        accounts = await self._db.list_active_accounts()
-        if not accounts:
-            accounts = await self.sync_accounts_from_config()
+        accounts = await self._usable_accounts()
         if not accounts:
             logger.warning("ИНФО | Нет активных аккаунтов для выполнения пула видео")
             return 0

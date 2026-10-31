@@ -40,7 +40,7 @@ def _video_id_of(payload: Payload) -> str:
 
 
 def _is_youtube_comment(payload: Payload) -> bool:
-    return bool(_video_id_of(payload)) and (payload.remote_id or "").startswith(("Ugz", "Ugw"))
+    return bool(_video_id_of(payload)) and (payload.remote_id or "").startswith("Ug")
 
 
 def _meta_properties(page: str) -> dict[str, str]:
@@ -208,7 +208,7 @@ class DeliveryValidator:
         needle = _normalize_for_compare(payload.text)
         truncated = description.endswith(("…", "..."))
         prefix = description.rstrip("….").rstrip()
-        if needle not in description and not (truncated and prefix and needle.startswith(prefix)):
+        if needle not in description and not (truncated and len(prefix) >= 8 and needle.startswith(prefix)):
             return verdict(False, "payload text not found in og:description")
         if self._cfg.success_marker and not self._contains([description], self._cfg.success_marker):
             return verdict(False, f"success marker {self._cfg.success_marker!r} not found")

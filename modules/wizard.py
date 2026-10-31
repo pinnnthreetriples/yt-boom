@@ -99,23 +99,12 @@ def mask_secret(secret: str | None, visible_start: int = 7, visible_end: int = 4
 
 
 def mask_proxy(proxy_str: str | None) -> str:
-    """Mask proxy credentials for safe console rendering."""
+    """Mask proxy credentials for safe console rendering (understands URL, user:pass@host:port and host:port:user:pass)."""
     if not proxy_str:
         return "Прямое соединение (без прокси)"
-    try:
-        parsed = urlparse(proxy_str)
-        if not parsed.hostname:
-            return proxy_str
-        auth = ""
-        if parsed.username:
-            user = parsed.username
-            pass_str = ":***" if parsed.password else ""
-            auth = f"{user}{pass_str}@"
-        port_str = f":{parsed.port}" if parsed.port else ""
-        scheme = f"{parsed.scheme}://" if parsed.scheme else "http://"
-        return f"{scheme}{auth}{parsed.hostname}{port_str}"
-    except Exception:
-        return proxy_str
+    from config import mask_proxy_url
+
+    return mask_proxy_url(proxy_str)
 
 
 def normalize_proxy(user_input: str | None) -> str | None:

@@ -1,7 +1,10 @@
 import asyncio
+import ctypes
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,7 +13,13 @@ from config import BrowserSettings, TargetSettings, ValidatorSettings
 from database import AccountRecord, Payload
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
 from modules.multi_account_orchestrator import MultiAccountOrchestrator
-from modules.process_guard import bind_to_kill_on_close_job
+from modules import process_guard
+from modules.process_guard import (
+    JobBasicLimits,
+    JobExtendedLimits,
+    bind_to_kill_on_close_job,
+    configure_kill_on_close_job,
+)
 from modules.validator import DeliveryValidator
 from modules.wizard import check_youtube_session
 from modules.youtube_runner import YouTubeRunner
@@ -45,6 +54,9 @@ class TestRunnerBrowserConfig(unittest.IsolatedAsyncioTestCase):
                 submit_button_selector="b", confirmation_selector="c",
             )],
         )
+        fingerprint_patch = patch("modules.youtube_runner.get_or_create_fingerprint", return_value={"pinned": True})
+        fingerprint_patch.start()  # _launch_options must not generate a real fingerprint (0.4 s, needs the fpgen data)
+        self.addCleanup(fingerprint_patch.stop)
         self.runner = YouTubeRunner(cfg, cfg.targets[0])
 
     def tearDown(self):
@@ -239,10 +251,85 @@ class TestRunnerPoolLimit(unittest.IsolatedAsyncioTestCase):
 
 
 class TestProcessGuard(unittest.TestCase):
+    """The tests never bind the test process itself: structures and calls are checked through a fake kernel32."""
+
+    def test_extended_limits_layout_matches_winapi(self):
+        wide = ctypes.sizeof(ctypes.c_void_p) == 8
+        self.assertEqual(ctypes.sizeof(JobBasicLimits), 64 if wide else 48)
+        self.assertEqual(ctypes.sizeof(JobExtendedLimits), 144 if wide else 112)
+
+    def test_job_is_created_with_kill_on_close_and_the_process_is_assigned(self):
+        calls: dict = {}
+        kernel32 = MagicMock()
+        kernel32.CreateJobObjectW.return_value = 77
+        kernel32.GetCurrentProcess.return_value = -1
+
+        def set_information(job, info_class, limits_ref, size):
+            calls.update(job=job, info_class=info_class, size=size, flags=limits_ref._obj.BasicLimitInformation.LimitFlags)
+            return True
+
+        kernel32.SetInformationJobObject.side_effect = set_information
+        kernel32.AssignProcessToJobObject.return_value = True
+        self.assertEqual(configure_kill_on_close_job(kernel32), 77)
+        self.assertEqual(calls["job"], 77)
+        self.assertEqual(calls["info_class"], 9)  # JobObjectExtendedLimitInformation
+        self.assertEqual(calls["flags"], 0x2000)  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        self.assertEqual(calls["size"], ctypes.sizeof(JobExtendedLimits))
+        kernel32.AssignProcessToJobObject.assert_called_once_with(77, -1)
+        kernel32.CloseHandle.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "win32", "ctypes.WinError")
+    def test_failed_assignment_closes_the_job_handle(self):
+        kernel32 = MagicMock()
+        kernel32.CreateJobObjectW.return_value = 77
+        kernel32.SetInformationJobObject.return_value = True
+        kernel32.AssignProcessToJobObject.return_value = False
+        with self.assertRaises(OSError):
+            configure_kill_on_close_job(kernel32)
+        kernel32.CloseHandle.assert_called_once_with(77)
+
+    def test_bind_configures_the_job_only_once(self):
+        with patch.object(process_guard, "_job_handle", None),              patch.object(process_guard.sys, "platform", "win32"),              patch.object(process_guard.ctypes, "WinDLL", MagicMock(), create=True),              patch.object(process_guard, "configure_kill_on_close_job", return_value=123) as configure:
+            self.assertTrue(bind_to_kill_on_close_job())
+            self.assertTrue(bind_to_kill_on_close_job())
+        configure.assert_called_once()
+
+    def test_failed_setup_is_reported_not_raised(self):
+        with patch.object(process_guard, "_job_handle", None),              patch.object(process_guard.sys, "platform", "win32"),              patch.object(process_guard.ctypes, "WinDLL", MagicMock(), create=True),              patch.object(process_guard, "configure_kill_on_close_job", side_effect=OSError("denied")):
+            self.assertFalse(bind_to_kill_on_close_job())
+
+    def test_other_platforms_are_a_no_op(self):
+        with patch.object(process_guard, "_job_handle", None), patch.object(process_guard.sys, "platform", "linux"):
+            self.assertFalse(bind_to_kill_on_close_job())
+
     @unittest.skipUnless(sys.platform == "win32", "Windows Job Objects")
-    def test_bind_is_idempotent(self):
-        self.assertTrue(bind_to_kill_on_close_job())
-        self.assertTrue(bind_to_kill_on_close_job())
+    def test_children_die_with_a_bound_process(self):
+        """A separate interpreter binds itself, starts a child and exits: the child must be killed with the job."""
+        guard_file = Path(process_guard.__file__).resolve()
+        code = (
+            "import importlib.util, subprocess, sys\n"
+            f"spec = importlib.util.spec_from_file_location('pg', r'{guard_file}')\n"
+            "pg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pg)\n"
+            "if not pg.bind_to_kill_on_close_job():\n"
+            "    print('UNBOUND'); sys.exit(0)\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+            "print(child.pid, flush=True)\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        output = result.stdout.strip().splitlines()
+        if not output or output[-1] == "UNBOUND":
+            self.skipTest("no Job Object available here (an outer job forbids nesting)")
+        pid = output[-1]
+        self.addCleanup(subprocess.run, ["taskkill", "/F", "/PID", pid], capture_output=True)
+
+        def alive() -> bool:
+            listing = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True)
+            return pid in listing.stdout
+
+        deadline = time.monotonic() + 15
+        while alive() and time.monotonic() < deadline:
+            time.sleep(0.3)
+        self.assertFalse(alive(), "the child survived the exit of the process bound to the job")
 
 
 if __name__ == "__main__":

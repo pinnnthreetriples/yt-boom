@@ -14,8 +14,9 @@ from playwright.async_api import Error as PlaywrightError
 from pydantic import BaseModel, ConfigDict
 
 from config import BrowserSettings, TargetSettings, parse_proxy
-from modules.fingerprint_manager import get_or_create_fingerprint
+from modules.fingerprint_manager import get_or_create_fingerprint, is_compatible
 from modules.interaction_simulator import InteractionError, InteractionSimulator
+from modules.page_helpers import first_visible
 from modules.ui_test_runner import NavigationError, SubmissionError, SubmissionResult
 
 
@@ -30,7 +31,7 @@ class YouTubeCommentElement(BaseModel):
 
 
 _UNSET = object()
-_COMMENT_ID_RE = re.compile(r'"commentId"\s*:\s*"(Ug[zw][\w.\-]*)"')
+_COMMENT_ID_RE = re.compile(r'"commentId"\s*:\s*"(Ug[\w-][\w.\-]*)"')  # comment ids start with Ugw, Ugx, Ugy or Ugz
 
 
 class YouTubeRunner:
@@ -91,6 +92,10 @@ class YouTubeRunner:
         self._session_dir.mkdir(parents=True, exist_ok=True)
         self._artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    def launch_options(self) -> dict[str, Any]:
+        """Camoufox options of this account (proxy, prefs, pinned fingerprint): for browser sessions opened outside `start()`."""
+        return self._launch_options()
+
     def _launch_options(self) -> dict[str, Any]:
         prefs = dict(self._cfg.firefox_user_prefs)
         # Autonomous / background execution optimizations:
@@ -135,9 +140,25 @@ class YouTubeRunner:
         """Launch persistent browser session once and keep it open across comments."""
         if self.is_running:
             return self._page
+        if self._camoufox is not None:  # the page was closed under us: release the old browser and its profile lock first
+            await self.close()
         self._prepare_dirs()
-        self._camoufox = AsyncCamoufox(**self._launch_options())
-        self._context = await self._camoufox.__aenter__()
+        options = self._launch_options()
+        self._camoufox = AsyncCamoufox(**options)
+        try:
+            self._context = await self._camoufox.__aenter__()
+        except Exception as exc:
+            pinned = options.get("fingerprint")
+            if pinned is None or is_compatible(pinned):
+                raise
+            logger.warning("Сохранённый отпечаток несовместим с установленным Camoufox ({}), создаю новый", exc)
+            try:
+                await self._camoufox.__aexit__(None, None, None)
+            except Exception as close_exc:
+                logger.debug("Ошибка при освобождении неудавшегося запуска: {}", close_exc)
+            options["fingerprint"] = get_or_create_fingerprint(self._session_dir, self._cfg.os, force_new=True)
+            self._camoufox = AsyncCamoufox(**options)
+            self._context = await self._camoufox.__aenter__()
 
         pages = getattr(self._context, "pages", [])
         self._page = pages[0] if pages else await self._context.new_page()
@@ -424,8 +445,8 @@ class YouTubeRunner:
             sign_in = page.locator("a[aria-label*='Sign in' i], a:has-text('Sign in'), a:has-text('Войти')")
             if await sign_in.count() > 0:
                 msg = (
-                    "Сессия YouTube в test_sessions/youtube не авторизована. "
-                    "Выполните вход через `python youtube_bot.py --login`, чтобы отправлять комментарии."
+                    f"Сессия YouTube в {self._session_dir} не авторизована. Выполните вход через "
+                    "`python youtube_bot.py --auth-account <аккаунт>` или `--login`, чтобы отправлять комментарии."
                 )
                 logger.warning(msg)
                 if dry_run:
@@ -526,7 +547,7 @@ class YouTubeRunner:
 
     @staticmethod
     async def _extract_remote_id(response: Any) -> str | None:
-        """Server-side commentId (Ugz.../Ugw...) from the create_comment response body."""
+        """Server-side commentId (Ugw.../Ugx.../Ugy.../Ugz...) from the create_comment response body."""
         try:
             body = await response.text()
         except Exception as exc:
@@ -578,12 +599,7 @@ class YouTubeRunner:
     @staticmethod
     async def _first_visible(page: Any, selector: str, limit: int = 8) -> Any | None:
         """First visible match of `selector`; YouTube keeps hidden duplicates of comments ahead of the real one."""
-        matches = page.locator(selector)
-        for index in range(min(await matches.count(), limit)):
-            candidate = matches.nth(index)
-            if await candidate.is_visible():
-                return candidate
-        return None
+        return await first_visible(page, selector, limit=limit)
 
     async def _find_sub_comment_reply_button(
         self,

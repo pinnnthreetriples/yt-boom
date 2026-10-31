@@ -5,7 +5,6 @@ import inspect
 import math
 import random
 from typing import Any
-from unittest.mock import AsyncMock
 
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -288,28 +287,18 @@ class InteractionSimulator:
         typed = False
         # Playwright keyboard.down/up natively accepts US ASCII characters and named keys.
         # Non-ASCII (Cyrillic, emojis) should directly use keyboard.type to avoid IPC Unknown key errors.
-        is_async_down = callable(down_fn) and (
-            inspect.iscoroutinefunction(down_fn)
-            or isinstance(down_fn, AsyncMock)
-            or type(down_fn).__name__ == "AsyncMock"
-        )
-        is_async_up = callable(up_fn) and (
-            inspect.iscoroutinefunction(up_fn)
-            or isinstance(up_fn, AsyncMock)
-            or type(up_fn).__name__ == "AsyncMock"
-        )
-        if ord(character) <= 127 and is_async_down and is_async_up:
+        if ord(character) <= 127 and inspect.iscoroutinefunction(down_fn) and inspect.iscoroutinefunction(up_fn):
             try:
-                res_down = down_fn(character)
-                if asyncio.iscoroutine(res_down):
-                    await res_down
-                await asyncio.sleep(hold_time)
-                res_up = up_fn(character)
-                if asyncio.iscoroutine(res_up):
-                    await res_up
-                typed = True
+                await down_fn(character)
             except Exception:
-                typed = False
+                pass
+            else:
+                typed = True  # the key went down: a failed release must not type the character a second time
+                await asyncio.sleep(hold_time)
+                try:
+                    await up_fn(character)
+                except Exception:
+                    pass
         if not typed:
             type_fn = getattr(page.keyboard, "type", None)
             if callable(type_fn):

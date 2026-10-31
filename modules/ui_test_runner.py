@@ -78,12 +78,15 @@ class UITestRunner:
                 artifacts_dir=self._artifacts_dir,
                 rng=self._rng,
             )
-            return await yt_runner.run(
-                text,
-                external_id=external_id,
-                payload_id=payload_id,
-                query=query,
-            )
+            try:
+                return await yt_runner.run(
+                    text,
+                    external_id=external_id,
+                    payload_id=payload_id,
+                    query=query,
+                )
+            finally:
+                await yt_runner.close()  # run() opens a persistent browser: without this it outlives the call and locks the profile
 
         self._prepare_dirs()
 
