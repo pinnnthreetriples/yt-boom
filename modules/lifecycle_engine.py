@@ -65,7 +65,10 @@ class AccountLifecycleEngine:
     @staticmethod
     def authenticated_at(account: AccountRecord) -> datetime | None:
         """First sign-in of the account; an authenticated account from before this field is aged from its creation."""
-        return _parse_utc(account.authenticated_at) or _parse_utc(account.created_at)
+        if account.authenticated_at:
+            # a damaged stamp means "unknown": the account starts ageing now instead of looking mature
+            return _parse_utc(account.authenticated_at) or datetime.now(timezone.utc)
+        return _parse_utc(account.created_at)
 
     @classmethod
     def age_hours(cls, account: AccountRecord, now: datetime | None = None) -> float:
@@ -90,12 +93,16 @@ class AccountLifecycleEngine:
         return max(0.0, cls.STAGE_RULES["quarantine"].end_hour - cls.age_hours(account, now))
 
     @classmethod
-    def next_interval_sec(cls, stage: str, rng: random.Random | None = None) -> float | None:
-        """Pause to keep before this account's next comment (random inside the stage's range); None: no comments."""
+    def cooldown_sec(cls, stage: str, last_comment_at: str | None) -> float | None:
+        """Pause required after the comment posted at `last_comment_at`; None: this stage has no comments.
+
+        Random inside the stage's range, but seeded by the comment's timestamp: the same comment always gets the
+        same pause, so the answer does not change between two checks while the next one still differs.
+        """
         rule = cls.STAGE_RULES.get(stage)
         if rule is None or rule.interval_min_sec == float("inf"):
             return None
-        return (rng or random).uniform(rule.interval_min_sec, rule.interval_max_sec)
+        return random.Random(last_comment_at).uniform(rule.interval_min_sec, rule.interval_max_sec)
 
     @classmethod
     async def evaluate_eligibility(
@@ -144,9 +151,9 @@ class AccountLifecycleEngine:
         if done >= limit:
             return EligibilityResult(False, stage, "wait", "Daily limit reached", limit, done)
 
-        interval = cls.STAGE_RULES[stage].interval_min_sec
         last = _parse_utc(account.last_comment_at)
         if last is not None:
+            interval = cls.cooldown_sec(stage, account.last_comment_at) or 0.0
             elapsed = (now - last).total_seconds()
             if elapsed < interval:
                 return EligibilityResult(

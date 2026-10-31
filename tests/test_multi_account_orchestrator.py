@@ -644,6 +644,30 @@ class TestLifecyclePacing(unittest.IsolatedAsyncioTestCase):
         limits = self.config.limits
         self.assertTrue(all(limits.pause_min_seconds <= p <= limits.pause_max_seconds for p in pauses))
 
+    async def test_parallel_workers_cannot_exceed_a_probation_accounts_daily_limit(self) -> None:
+        account = await self._account("probation_acc", 50)
+        for n in (2, 3):
+            await self.db.add_video_to_pool(f"https://www.youtube.com/watch?v=lifevid{n}{n}{n}{n}", comments_target=1)
+        orchestrator, runner = self._orchestrator(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="r", duration_seconds=0.1)
+        )
+        orchestrator._account_mode, orchestrator._concurrency = "share", 2
+        orchestrator._semaphore = asyncio.Semaphore(2)
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            await orchestrator.execute_video_pool(max_comments_per_video=1)
+        self.assertEqual(runner.run.await_count, 1)
+        self.assertEqual((await self.db.get_account(account.id)).daily_comments_done, 1)
+
+    async def test_gated_account_leaves_the_videos_pending_in_each_mode(self) -> None:
+        await self._account("probation_acc", 50)
+        orchestrator, runner = self._orchestrator(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="r", duration_seconds=0.1)
+        )
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            done = await orchestrator.execute_video_pool(max_comments_per_video=3)
+        self.assertEqual(done, 1)
+        self.assertEqual(len(await self.db.list_pool_videos(status="pending")), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

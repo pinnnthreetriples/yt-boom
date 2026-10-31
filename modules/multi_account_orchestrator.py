@@ -101,6 +101,8 @@ class MultiAccountOrchestrator:
         self._lifecycle_logged: set[tuple[int, str]] = set()
         self._warmer = warmer or AccountWarmer(self._cfg.browser, simulator=self._simulator, rng=self._rng)
         self._warmup_tasks: dict[int, asyncio.Task[Any]] = {}
+        self._warmup_failed_at: dict[int, datetime] = {}
+        self._gate_stopped = False  # an account was held back by its lifecycle limits during this run
         self._warmup_slot = asyncio.Semaphore(1)  # one warm-up browser at a time
 
     @property
@@ -231,6 +233,9 @@ class MultiAccountOrchestrator:
         """Start a background warm-up unless one runs already, the last one is under 4 h old, or this is a dry run."""
         if self._dry_run or acc.id in self._warmup_tasks:
             return
+        failed_at = self._warmup_failed_at.get(acc.id)
+        if failed_at is not None and datetime.now(timezone.utc) - failed_at <= self.WARMUP_INTERVAL:
+            return  # a failed warm-up is not retried on every account pick
         if acc.last_warmup_at:
             try:
                 last = datetime.fromisoformat(acc.last_warmup_at.replace("Z", "+00:00"))
@@ -246,8 +251,11 @@ class MultiAccountOrchestrator:
     async def _run_warmup(self, acc: AccountRecord) -> None:
         try:
             async with self._warmup_slot:
-                await self._warmer.warm_up(acc, db=self._db)
+                result = await self._warmer.warm_up(acc, db=self._db)
+            if not getattr(result, "success", True):
+                self._warmup_failed_at[acc.id] = datetime.now(timezone.utc)
         except Exception as exc:
+            self._warmup_failed_at[acc.id] = datetime.now(timezone.utc)
             logger.error("[LIFECYCLE] Warm-up of account {} failed: {}", acc.name, exc)
         finally:
             self._warmup_tasks.pop(acc.id, None)
@@ -270,7 +278,7 @@ class MultiAccountOrchestrator:
             accounts = await self.sync_accounts_from_config()
         usable = [acc for acc in accounts if self._is_usable(acc) and await self._passes_lifecycle_gate(acc)]
         for acc in accounts:
-            if acc not in usable and acc.id not in self._skipped_logged:
+            if acc not in usable and not self._is_usable(acc) and acc.id not in self._skipped_logged:
                 self._skipped_logged.add(acc.id)
                 logger.warning(
                     "ИНФО | Аккаунт {!r} пропущен (вход: {}): выполните `youtube_bot.py --auth-account {}`",
@@ -366,6 +374,7 @@ class MultiAccountOrchestrator:
 
                 acc = account or await self._pick_account()
                 if acc is not None and account is not None and not await self._may_comment_now(acc):
+                    self._gate_stopped = True
                     self._claimed.discard(it.external_id)
                     break
                 if acc is None:
@@ -421,6 +430,10 @@ class MultiAccountOrchestrator:
                     # Run submission with error isolation. One browser per account stays open
                     # for the whole run; the lock keeps two videos off the same profile.
                     async with self._runner_locks[acc.id]:
+                        # picked by parallel workers before any of them posted: re-check against the saved counters
+                        if not await self._may_comment_now(acc):
+                            self._gate_stopped = True
+                            continue
                         runner = await self._get_runner(acc)
                         try:
                             sub_res = await runner.run(
@@ -451,6 +464,11 @@ class MultiAccountOrchestrator:
                                 )
                             )
                             continue
+                        if not self._dry_run:  # inside the lock: the next worker of this account sees it
+                            if sub_res.success:
+                                await self._db.record_account_comment_success(acc.id)
+                            else:
+                                await self._record_error(acc)
 
                     mode = "dry_run" if self._dry_run else "live"
                     status = (
@@ -503,8 +521,6 @@ class MultiAccountOrchestrator:
                         )
                         if self._dry_run:
                             await self._db.increment_account_stats(acc.id, replies=1)
-                        else:
-                            await self._db.record_account_comment_success(acc.id)
                         logger.success(
                             "УСПЕХ | Аккаунт {!r} успешно ответил на комментарий {} к видео {}",
                             acc.name,
@@ -514,7 +530,6 @@ class MultiAccountOrchestrator:
                         video_comments_done += 1
                         posted = True
                     else:
-                        await self._record_error(acc)
                         logger.error(
                             "ОШИБКА | Не удалось отправить ответ аккаунтом {!r} к видео {}: {}",
                             acc.name,
@@ -609,7 +624,7 @@ class MultiAccountOrchestrator:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             await self._close_runners()
-        if self._account_mode == "each":
+        if self._account_mode == "each" and not self._gate_stopped:
             for video in videos:
                 await self._db.update_pool_video_progress(video.id, comments_added=0, completed=True)
         total_comments = sum(r for r in results if isinstance(r, int))

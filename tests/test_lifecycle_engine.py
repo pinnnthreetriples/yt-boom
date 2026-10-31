@@ -50,11 +50,18 @@ class TestStageProgression(unittest.TestCase):
         self.assertAlmostEqual(AccountLifecycleEngine.quarantine_hours_left(_account(6), T0), 18.0)
         self.assertEqual(AccountLifecycleEngine.quarantine_hours_left(_account(30), T0), 0.0)
 
-    def test_mature_interval_is_random_inside_45_to_90_minutes(self):
-        for _ in range(50):
-            self.assertTrue(2700 <= AccountLifecycleEngine.next_interval_sec("mature") <= 5400)
-        self.assertEqual(AccountLifecycleEngine.next_interval_sec("probation"), 10800)
-        self.assertIsNone(AccountLifecycleEngine.next_interval_sec("quarantine"))
+    def test_mature_cooldown_is_random_inside_45_to_90_minutes_but_stable_per_comment(self):
+        stamps = [(T0 - timedelta(minutes=n)).isoformat() for n in range(60)]
+        values = [AccountLifecycleEngine.cooldown_sec("mature", stamp) for stamp in stamps]
+        self.assertTrue(all(2700 <= v <= 5400 for v in values))
+        self.assertGreater(len(set(values)), 30)  # differs from comment to comment
+        self.assertEqual(AccountLifecycleEngine.cooldown_sec("mature", stamps[0]), values[0])  # same comment, same answer
+        self.assertEqual(AccountLifecycleEngine.cooldown_sec("probation", stamps[0]), 10800)
+        self.assertIsNone(AccountLifecycleEngine.cooldown_sec("quarantine", stamps[0]))
+
+    def test_damaged_sign_in_stamp_does_not_make_an_account_mature(self):
+        damaged = _account(authenticated_at="garbage", created_at=(T0 - timedelta(days=30)).isoformat())
+        self.assertEqual(AccountLifecycleEngine.calculate_stage(damaged, datetime.now(timezone.utc))[0], "quarantine")
 
 
 class TestEligibility(unittest.IsolatedAsyncioTestCase):
@@ -99,7 +106,7 @@ class TestEligibility(unittest.IsolatedAsyncioTestCase):
         blocked = await self.check(_account(100, daily_comments_done=1, last_comment_at=(T0 - timedelta(minutes=44)).isoformat()))
         self.assertFalse(blocked.can_comment)
         self.assertEqual(blocked.reason, "Interval cooldown active")
-        ok = await self.check(_account(100, daily_comments_done=1, last_comment_at=(T0 - timedelta(minutes=46)).isoformat()))
+        ok = await self.check(_account(100, daily_comments_done=1, last_comment_at=(T0 - timedelta(minutes=91)).isoformat()))
         self.assertTrue(ok.can_comment)
 
     async def test_daily_counter_restarts_after_the_reset_moment_with_timezone_aware_times(self):
@@ -197,6 +204,20 @@ class TestDatabaseLifecycle(unittest.IsolatedAsyncioTestCase):
             acc = await db.get_account("legacy")
         self.assertEqual((acc.lifecycle_stage, acc.daily_comments_limit, acc.warmup_sessions_done), ("quarantine", 0, 0))
 
+    async def test_legacy_authenticated_account_keeps_its_age_after_migration(self):
+        path = self.root / "legacy.db"
+        async with Database(path) as db:
+            acc = await db.upsert_account("old", str(self.root / "old"))
+            await db.set_account_auth_status(acc.id, "authenticated")  # the way accounts were signed in before
+            async with db._transaction() as conn:
+                await conn.execute("UPDATE accounts SET created_at = '2026-01-01T00:00:00+00:00' WHERE id = ?", (acc.id,))
+        async with Database(path) as db:  # the next start backfills the stamp
+            acc = await db.get_account("old")
+            self.assertEqual(acc.authenticated_at, "2026-01-01T00:00:00+00:00")
+            await db.mark_account_authenticated(acc.id)  # a later re-login does not send it back to quarantine
+            acc = await db.get_account("old")
+        self.assertEqual(AccountLifecycleEngine.calculate_stage(acc)[0], "mature")
+
     async def test_fingerprint_sync_in_both_directions(self):
         session = self.root / "s"
         session.mkdir()
@@ -241,7 +262,7 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
         orch = MultiAccountOrchestrator.__new__(MultiAccountOrchestrator)  # only the gate's attributes are needed
         orch._db, orch._cfg, orch._dry_run = db, cfg, dry_run
         orch._skipped_logged, orch._lifecycle_logged = set(), set()
-        orch._warmer, orch._warmup_tasks = warmer, {}
+        orch._warmer, orch._warmup_tasks, orch._warmup_failed_at = warmer, {}, {}
         orch._warmup_slot = asyncio.Semaphore(1)
         return orch, warmer
 
@@ -268,6 +289,17 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await orch._usable_accounts(), [])
         await orch._finish_warmups()
         warmer.warm_up.assert_not_awaited()
+
+    async def test_failed_warmup_is_not_retried_on_every_pick(self):
+        db = AsyncMock(spec=Database)
+        db.list_active_accounts.return_value = [_account(2)]
+        orch, warmer = self._orchestrator(db)
+        warmer.warm_up.return_value = MagicMock(success=False)
+
+        for _ in range(4):
+            await orch._usable_accounts()
+            await orch._finish_warmups()
+        self.assertEqual(warmer.warm_up.await_count, 1)
 
     async def test_dry_run_never_starts_a_warmup(self):
         db = AsyncMock(spec=Database)

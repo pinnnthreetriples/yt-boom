@@ -460,6 +460,10 @@ class Database:
                 except aiosqlite.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():  # another process added it first
                         raise
+        # accounts signed in before the lifecycle existed age from their creation, not from their next re-login
+        await conn.execute(
+            "UPDATE accounts SET authenticated_at = created_at WHERE auth_status = 'authenticated' AND authenticated_at IS NULL"
+        )
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
