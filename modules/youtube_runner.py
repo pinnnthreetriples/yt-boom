@@ -106,14 +106,9 @@ class YouTubeRunner:
         prefs.setdefault("dom.timeout.background_budget_regeneration_rate", 100)
         prefs.setdefault("widget.windows.window_occlusion_tracking.enabled", False)
         prefs.setdefault("browser.tabs.unloadOnLowMemory", False)
-        prefs.setdefault("media.peerconnection.enabled", False)
+        prefs.setdefault("network.proxy.socks_remote_dns", True)
         prefs.setdefault("network.http.http3.enable", False)
-        # RAM / lifecycle: no Site Isolation, a single content process, no audio, no in-memory cache
-        prefs.setdefault("fission.autostart", False)
-        prefs.setdefault("dom.ipc.processCount", 1)
-        prefs.setdefault("dom.ipc.processCount.webIsolated", 1)
         prefs.setdefault("media.volume_scale", "0.0")
-        prefs.setdefault("browser.cache.memory.enable", False)
         # No native Windows Hello / passkey prompt during Google sign-in
         prefs.setdefault("security.webauth.webauthn", False)
 

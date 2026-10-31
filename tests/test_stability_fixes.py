@@ -64,11 +64,8 @@ class TestRunnerBrowserConfig(unittest.IsolatedAsyncioTestCase):
 
     def test_resource_and_background_prefs(self):
         prefs = self.runner._launch_options()["firefox_user_prefs"]
-        self.assertIs(prefs["fission.autostart"], False)
-        self.assertEqual(prefs["dom.ipc.processCount"], 1)
-        self.assertEqual(prefs["dom.ipc.processCount.webIsolated"], 1)
         self.assertEqual(prefs["media.volume_scale"], "0.0")
-        self.assertIs(prefs["browser.cache.memory.enable"], False)
+        self.assertIs(prefs["network.proxy.socks_remote_dns"], True)
         self.assertIs(prefs["widget.windows.window_occlusion_tracking.enabled"], False)
         self.assertIs(prefs["dom.timeout.enable_budget_timer_throttling"], False)
 
