@@ -73,6 +73,10 @@ _NEIGHBORS: dict[str, str] = {
 }
 
 
+_SHIFTED = frozenset('!@#$%^&*()_+{}|:"<>?~')
+_WORD_PAUSE_PROBABILITY = 0.05  # chance of a short hesitation between two words
+_WORD_PAUSE_MS = (250.0, 700.0)
+
 _HIT_TEST_JS = """(el, p) => {
     const top = document.elementFromPoint(p.x, p.y);
     return !!top && (top === el || el.contains(top));
@@ -137,6 +141,14 @@ class InteractionSimulator:
 
     def _delay(self, minimum_ms: float, maximum_ms: float) -> float:
         return self._rng.uniform(minimum_ms, maximum_ms) / 1000
+
+    def _lognormal_ms(self, minimum_ms: float, maximum_ms: float) -> float:
+        """Right-skewed keystroke timing: [min, max] holds ~90% of the draws, a rare long tail runs past max."""
+        if minimum_ms <= 0 or maximum_ms <= minimum_ms:
+            return float(minimum_ms)
+        sigma = math.log(maximum_ms / minimum_ms) / (2 * 1.645)
+        value = self._rng.lognormvariate(math.log(math.sqrt(minimum_ms * maximum_ms)), sigma)
+        return min(max(value, minimum_ms * 0.6), maximum_ms * 2.5)
 
     async def human_pause(self, minimum_seconds: float, maximum_seconds: float) -> None:
         low, high = sorted((max(0.0, minimum_seconds), max(0.0, maximum_seconds)))
@@ -281,7 +293,7 @@ class InteractionSimulator:
                 await asyncio.sleep(self._rng.uniform(0.1, 0.35))
 
     async def _press_character(self, page: Any, character: str) -> None:
-        hold_time = self._delay(self._cfg.key_hold_ms_min, self._cfg.key_hold_ms_max)
+        hold_time = self._lognormal_ms(self._cfg.key_hold_ms_min, self._cfg.key_hold_ms_max) / 1000
         down_fn = getattr(page.keyboard, "down", None)
         up_fn = getattr(page.keyboard, "up", None)
         typed = False
@@ -311,10 +323,10 @@ class InteractionSimulator:
         self._ensure_open(page)
         if not text:
             return
-        for character in text:
+        for index, character in enumerate(text):
             if character == "\n":
                 press_fn = getattr(page.keyboard, "press", None)
-                hold_ms = int(self._rng.uniform(self._cfg.key_hold_ms_min, self._cfg.key_hold_ms_max))
+                hold_ms = int(self._lognormal_ms(self._cfg.key_hold_ms_min, self._cfg.key_hold_ms_max))
                 if callable(press_fn):
                     try:
                         res = press_fn("Enter", delay=hold_ms)
@@ -330,7 +342,7 @@ class InteractionSimulator:
                 await self._type_with_typo(page, character)
             else:
                 await self._press_character(page, character)
-            await asyncio.sleep(self._character_delay(character))
+            await asyncio.sleep(self._character_delay(character, text[index + 1 : index + 2]))
 
     async def _type_with_typo(self, page: Any, character: str) -> None:
         neighbors = _NEIGHBORS.get(character.lower())
@@ -345,7 +357,7 @@ class InteractionSimulator:
             self._delay(self._cfg.backspace_delay_ms_min, self._cfg.backspace_delay_ms_max)
         )
         press_fn = getattr(page.keyboard, "press", None)
-        hold_ms = int(self._rng.uniform(self._cfg.key_hold_ms_min, self._cfg.key_hold_ms_max))
+        hold_ms = int(self._lognormal_ms(self._cfg.key_hold_ms_min, self._cfg.key_hold_ms_max))
         if callable(press_fn):
             try:
                 res = press_fn("Backspace", delay=hold_ms)
@@ -360,11 +372,24 @@ class InteractionSimulator:
         )
         await self._press_character(page, character)
 
-    def _character_delay(self, character: str) -> float:
-        delay = self._delay(self._cfg.key_delay_ms_min, self._cfg.key_delay_ms_max)
-        if character in " .,;:!?":
-            delay *= 1.4
-        return delay
+    def _character_delay(self, character: str, following: str = "") -> float:
+        """Seconds to wait after `character`: lognormal base, longer at word and sentence breaks and on Shift keys.
+
+        Punctuation pauses only when it ends a word ("end. Next"), not inside "name@mail.com" or "a.b".
+        """
+        delay = self._lognormal_ms(self._cfg.key_delay_ms_min, self._cfg.key_delay_ms_max)
+        at_word_end = following in ("", " ", "\n")
+        if character == " ":
+            delay *= self._rng.uniform(1.3, 2.0)
+            if self._rng.random() < _WORD_PAUSE_PROBABILITY:
+                delay += self._rng.uniform(*_WORD_PAUSE_MS)
+        elif character in ".!?" and at_word_end:
+            delay *= self._rng.uniform(1.8, 3.0)
+        elif character in ",;:" and at_word_end:
+            delay *= self._rng.uniform(1.4, 2.2)
+        elif character.isupper() or character in _SHIFTED:
+            delay *= self._rng.uniform(1.1, 1.5)
+        return delay / 1000
 
     async def idle(self, page: Any, max_seconds: float) -> None:
         self._ensure_open(page)

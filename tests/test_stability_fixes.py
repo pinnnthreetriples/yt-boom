@@ -123,6 +123,7 @@ class TestTypeTextAllowTypos(unittest.IsolatedAsyncioTestCase):
         rng = MagicMock()
         rng.random.return_value = 0.0  # would trigger a typo on every letter
         rng.uniform.return_value = 5.0
+        rng.lognormvariate.return_value = 5.0
         rng.choice.side_effect = lambda choices: choices[0]
         sim = InteractionSimulator(InteractionConfig(typo_probability=0.5), rng=rng)
         with patch("asyncio.sleep", new_callable=AsyncMock), \

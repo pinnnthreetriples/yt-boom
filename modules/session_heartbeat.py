@@ -13,6 +13,10 @@ from loguru import logger
 
 from config import resolve_account_proxy
 from database import AccountRecord
+from modules.fingerprint_manager import load_fingerprint
+
+# Sessions are made by Camoufox (Firefox): the request must look like Firefox, not like a Chrome replaying the cookies.
+HEARTBEAT_IMPERSONATE = "firefox133"
 
 
 @dataclass(frozen=True)
@@ -41,7 +45,7 @@ def read_youtube_cookies(session_dir: str | Path) -> dict[str, str]:
     try:
         conn = sqlite3.connect(uri, uri=True)
         cur = conn.cursor()
-        cur.execute("SELECT name, value FROM moz_cookies WHERE host LIKE '%youtube.com'")
+        cur.execute("SELECT name, value FROM moz_cookies WHERE host IN ('.youtube.com', 'youtube.com')")
         for name, value in cur.fetchall():
             cookies[name] = value
         conn.close()
@@ -59,7 +63,9 @@ def read_login_info_metadata(session_dir: str | Path) -> tuple[bool, str | None,
     try:
         conn = sqlite3.connect(uri, uri=True)
         cur = conn.cursor()
-        cur.execute("SELECT expiry FROM moz_cookies WHERE name='LOGIN_INFO' AND host LIKE '%youtube.com' LIMIT 1")
+        cur.execute(
+            "SELECT expiry FROM moz_cookies WHERE name='LOGIN_INFO' AND host IN ('.youtube.com', 'youtube.com') LIMIT 1"
+        )
         row = cur.fetchone()
         conn.close()
         if not row:
@@ -77,13 +83,62 @@ def read_login_info_metadata(session_dir: str | Path) -> tuple[bool, str | None,
         return False, None, None
 
 
+def check_session_offline(session_dir: str | Path, account_name: str = "default") -> HeartbeatStatus:
+    """Routine status from the profile alone, no network: LOGIN_INFO present and not expired.
+
+    A session revoked on Google's side is not seen here; `check_session_heartbeat` asks YouTube.
+    """
+    has_login_info, expires_at_str, days_left = read_login_info_metadata(session_dir)
+    if not has_login_info:
+        return HeartbeatStatus(
+            account_name=account_name,
+            is_alive=False,
+            login_info_present=False,
+            details="LOGIN_INFO cookie not found in profile",
+        )
+    expired = days_left is not None and days_left <= 0
+    return HeartbeatStatus(
+        account_name=account_name,
+        is_alive=not expired,
+        login_info_present=True,
+        expires_at=expires_at_str,
+        days_remaining=days_left,
+        details="LOGIN_INFO expired" if expired else "LOGIN_INFO present (offline check, not verified with YouTube)",
+    )
+
+
+def _firefox_languages_header(languages: list[str]) -> str:
+    """Accept-Language the way Firefox builds it: en-US,en;q=0.5 / es-ES,en-US;q=0.7,en;q=0.3."""
+    parts = [languages[0]]
+    parts += [f"{lang};q={round(1 - index / len(languages), 1)}" for index, lang in enumerate(languages) if index]
+    return ",".join(parts)
+
+
+def fingerprint_headers(session_dir: str | Path) -> dict[str, str]:
+    """User-Agent and Accept-Language the profile's browser presents (from its pinned fingerprint.json).
+
+    Empty when the profile has no fingerprint: the impersonation defaults then apply.
+    """
+    navigator = (load_fingerprint(Path(session_dir)) or {}).get("navigator") or {}
+    headers: dict[str, str] = {}
+    if navigator.get("userAgent"):
+        headers["User-Agent"] = str(navigator["userAgent"])
+    languages = [lang for lang in navigator.get("languages") or [] if isinstance(lang, str) and lang]
+    if languages:
+        headers["Accept-Language"] = _firefox_languages_header(languages)
+    return headers
+
+
 async def check_session_heartbeat(
     session_dir: str | Path,
     account_name: str = "default",
     proxy: str | None = None,
     timeout: float = 15.0,
 ) -> HeartbeatStatus:
-    """Send lightweight HTTP request to YouTube to verify session validity without launching a browser."""
+    """Send lightweight HTTP request to YouTube to verify session validity without launching a browser.
+
+    Cookies are only read from the profile; rotated Set-Cookie values are not written back (the browser owns the DB).
+    """
     has_login_info, expires_at_str, days_left = read_login_info_metadata(session_dir)
     if not has_login_info:
         return HeartbeatStatus(
@@ -104,18 +159,12 @@ async def check_session_heartbeat(
 
     try:
         async with AsyncSession(
-            impersonate="chrome124",
+            impersonate=HEARTBEAT_IMPERSONATE,
             proxy=proxy,
             timeout=timeout,
-            headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-            },
+            headers=fingerprint_headers(session_dir),
         ) as session:
-            resp = await session.get("https://www.youtube.com/?hl=en", cookies=cookies)
+            resp = await session.get("https://www.youtube.com/", cookies=cookies)
             if resp.status_code != 200:
                 return HeartbeatStatus(
                     account_name=account_name,

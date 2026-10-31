@@ -82,6 +82,12 @@ def get_or_create_fingerprint(session_dir: Path, target_os: str = "windows", *, 
     return fingerprint
 
 
+def load_fingerprint(session_dir: Path) -> dict[str, Any] | None:
+    """The fingerprint pinned to the profile, read-only: never generates or rewrites the file."""
+    saved = _read_saved(Path(session_dir) / FINGERPRINT_FILE)
+    return saved[0] if saved else None
+
+
 def is_compatible(fingerprint: dict[str, Any]) -> bool:
     """True when the installed Camoufox can turn this fingerprint into a browser config (format drift after updates)."""
     try:
@@ -94,4 +100,4 @@ def is_compatible(fingerprint: dict[str, Any]) -> bool:
     return True
 
 
-__all__ = ["FINGERPRINT_FILE", "FORMAT_VERSION", "get_or_create_fingerprint", "is_compatible"]
+__all__ = ["FINGERPRINT_FILE", "FORMAT_VERSION", "get_or_create_fingerprint", "is_compatible", "load_fingerprint"]

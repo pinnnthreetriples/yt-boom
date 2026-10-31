@@ -18,7 +18,7 @@ from modules.google_authenticator import GoogleAuthenticator, GoogleAuthError, r
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
-from modules.session_heartbeat import check_account_heartbeat, HeartbeatStatus
+from modules.session_heartbeat import check_account_heartbeat, check_session_offline, HeartbeatStatus
 from modules.youtube_collector import YouTubeCollector, extract_video_id
 from modules.youtube_runner import YouTubeRunner
 
@@ -339,8 +339,8 @@ async def import_accounts_file_cli(
     return not failed_lines and not failed_auth
 
 
-async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml") -> bool:
-    """Verify session validity and LOGIN_INFO via lightweight HTTP without launching browser."""
+async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml", online: bool = False) -> bool:
+    """Session status from the profile's LOGIN_INFO cookie; with `online` also asks YouTube over HTTP (no browser)."""
     cfg = load_config(config_path)
     async with Database(cfg.app.db_path) as db:
         if identifier and identifier != "ALL":
@@ -366,7 +366,10 @@ async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml"
         print("-" * 95)
         all_alive = True
         for acc in accounts:
-            res = await check_account_heartbeat(acc, default_proxy=cfg.browser.proxy)
+            if online:
+                res = await check_account_heartbeat(acc, default_proxy=cfg.browser.proxy)
+            else:
+                res = check_session_offline(acc.session_path, acc.name)
             status_str = "ALIVE" if res.is_alive else "EXPIRED"
             if not res.is_alive:
                 all_alive = False
@@ -1304,7 +1307,8 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="With --import-accounts-file: sign in accounts that are already authenticated too")
     parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (http://user:pass@ip:port or ip:port:user:pass) for adding account or session override")
     parser.add_argument("--session", type=str, default=None, help="Session directory path for adding account")
-    parser.add_argument("--heartbeat", "--check-session", dest="heartbeat", nargs="?", const="ALL", default=None, metavar="NAME_OR_ALL", help="Verify session validity and LOGIN_INFO via lightweight HTTP (default: all active accounts)")
+    parser.add_argument("--heartbeat", "--check-session", dest="heartbeat", nargs="?", const="ALL", default=None, metavar="NAME_OR_ALL", help="Show session status from the LOGIN_INFO cookie, no network (default: all active accounts)")
+    parser.add_argument("--heartbeat-online", action="store_true", help="With --heartbeat: also verify the session with an HTTP request to YouTube (Firefox-like, through the account proxy)")
     parser.add_argument("--warm-up", type=str, default=None, metavar="NAME_OR_EMAIL", help="Run humanized browser warm-up for an account (natural watch, mouse movement, comments scroll)")
     parser.add_argument("--warm-up-duration", type=float, default=45.0, help="Duration in seconds for warm-up viewing (default: 45.0)")
     parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
@@ -1322,7 +1326,7 @@ def main() -> None:
     bind_to_kill_on_close_job()  # browser children die with this process, even on a crash
 
     if args.heartbeat is not None:
-        ok = asyncio.run(heartbeat_cli(args.heartbeat, args.config))
+        ok = asyncio.run(heartbeat_cli(args.heartbeat, args.config, online=args.heartbeat_online))
         sys.exit(0 if ok else 1)
 
     if args.warm_up:
