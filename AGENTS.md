@@ -27,13 +27,19 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/pool_manager.py` — video list (`video_pool` table): pasted / file links and reply progress
 - `modules/validator.py` — read-only DOM/cache rendering verification module
 - `modules/wizard.py` — minimalist interactive CMD setup wizard & dashboard (5-step onboarding, search setup, and interactive Activity Audit Log)
-- `tests/` — comprehensive automated test suite (103 unit and integration tests)
+- `modules/google_authenticator.py` — automated Google sign-in state machine (TOTP 2FA, speedbump handling, in-situ channel creation)
+- `modules/totp_helper.py` — RFC 6238 TOTP engine with time window rollover protection
+- `modules/account_parser.py` — single account and batch account file parser (`email:pass:totp[:recovery][:proxy]`)
+- `modules/secret_store.py` — Windows DPAPI credential encryption layer for local SQLite storage
+- `modules/fingerprint_manager.py` — stable hardware fingerprint manager per browser session directory
+- `tests/` — comprehensive automated test suite (400 unit and integration tests)
 - `run_tests.py` — test discovery and test suite runner
 - `test_sessions/` — local browser session storage directories
 
 ## 4. Technical & Implementation Rules
 - **Browser Automation Setup:** Use `camoufox.async_api.AsyncCamoufox` with `persistent_context=True`, `os="windows"`, `geoip=True`.
-- **Network Routing:** Configure `firefox_user_prefs={"media.peerconnection.enabled": False, "network.http.http3.enable": False}` for isolated proxy testing.
+- **Selector Robustness:** Target YouTube action buttons by structural IDs (e.g. `#reply-button-end :is(button, a)`) rather than locale-dependent strings to support any UI language (English, Russian, Kyrgyz, etc.).
+- **Channel State:** Automated handling for initial channel creation dialogs (`ytd-channel-creation-dialog-renderer`) when new Google accounts reply for the first time.
 - **Typography Normalizer (`normalize_text`):**
   - Replace em-dashes (`—`, `–`) with standard hyphens `-`.
   - Replace guillemets (`«»`) with standard quotes `""`.
@@ -45,11 +51,14 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 ## 5. Commands
 - Run all automated tests: `python run_tests.py`
 - Launch interactive setup wizard: `python youtube_bot.py` (or `python youtube_bot.py --wizard`)
+- Authenticate single account: `python youtube_bot.py --auth-account <name>`
+- Import accounts from file: `python youtube_bot.py --import-accounts-file <path>`
+- List all stored accounts: `python youtube_bot.py --list-accounts`
 - Multi-video search & reply: `python youtube_bot.py --search "python" --min-views 10000 --max-views 500000 --comments-per-video 10 --dry-run`
 - View activity history / audit log: `python youtube_bot.py --history`
 - List YouTube sub-comments: `python youtube_bot.py --video "https://www.youtube.com/watch?v=..." --list-replies --limit 5`
 - Video list with all accounts: `python youtube_bot.py --videos-file videos.txt --concurrency 2 --account-mode each --dry-run`
-- Dry run bot on single video: `python youtube_bot.py --video "https://www.youtube.com/watch?v=..." --limit 2 --dry-run`
+- Dry run bot on single video: `python youtube_bot.py --video "https://www.youtube.com/watch?v=..." --account <name> --limit 1 --dry-run`
 - Interactive YouTube login: `python youtube_bot.py --login`
 - Check database metrics: `python youtube_bot.py --status`
 - Run orchestrator: `python main.py` (or `python main.py --wizard`)

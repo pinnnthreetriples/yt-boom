@@ -127,6 +127,7 @@ class YouTubeRunner:
             options["proxy"] = proxy_dict
         try:
             options["fingerprint"] = get_or_create_fingerprint(self._session_dir, self._cfg.os)
+            options["i_know_what_im_doing"] = True
         except Exception as exc:
             logger.warning("Не удалось получить сохранённый отпечаток, Camoufox сгенерирует случайный: {}", exc)
         return options
@@ -152,6 +153,7 @@ class YouTubeRunner:
             except Exception as close_exc:
                 logger.debug("Ошибка при освобождении неудавшегося запуска: {}", close_exc)
             options["fingerprint"] = get_or_create_fingerprint(self._session_dir, self._cfg.os, force_new=True)
+            options["i_know_what_im_doing"] = True
             self._camoufox = AsyncCamoufox(**options)
             self._context = await self._camoufox.__aenter__()
 
@@ -605,13 +607,15 @@ class YouTubeRunner:
         """Locate the specific Reply button corresponding to a comment under comment with retry loop."""
         selectors: list[str] = []
         if comment_id:
-            # 1. Exact match by sub-comment's permalink timestamp anchor. With a known target nothing else is
-            # allowed: replies load lazily, and a generic fallback would grab the parent's Reply button instead.
+            # 1. Exact match by sub-comment's permalink timestamp anchor. Matches both <button> (when channel
+            # exists) and <a> (when profile setup dialog is required).
             selectors.extend([
+                f"ytd-comment-view-model:has(a[href*='lc={comment_id}']) #reply-button-end :is(button, a)",
                 f"ytd-comment-view-model:has(a[href*='lc={comment_id}']) #reply-button-end button",
-                f"ytd-comment-renderer:has(a[href*='lc={comment_id}']) #reply-button-end button",
-                f"a[href*='lc={comment_id}'] >> xpath=ancestor::ytd-comment-view-model >> #reply-button-end button",
-                f"a[href*='lc={comment_id}'] >> xpath=ancestor::ytd-comment-renderer >> #reply-button-end button",
+                f"ytd-comment-view-model:has(a[href*='lc={comment_id}']) #reply-button-end a",
+                f"ytd-comment-renderer:has(a[href*='lc={comment_id}']) #reply-button-end :is(button, a)",
+                f"a[href*='lc={comment_id}'] >> xpath=ancestor::ytd-comment-view-model >> #reply-button-end :is(button, a)",
+                f"a[href*='lc={comment_id}'] >> xpath=ancestor::ytd-comment-renderer >> #reply-button-end :is(button, a)",
                 f"ytd-comment-view-model:has(a[href*='lc={comment_id}']) button[aria-label*='Ответить' i]",
                 f"ytd-comment-view-model:has(a[href*='lc={comment_id}']) button[aria-label*='Reply' i]",
                 f"a[href*='lc={comment_id}'] >> xpath=ancestor::ytd-comment-view-model >> button[aria-label*='Ответить' i]",
@@ -620,22 +624,23 @@ class YouTubeRunner:
 
         generic = [
             # 2. Reply button inside highlighted sub-comment (&lc= permalink)
-            "ytd-comment-view-model[linked-comment-badge] #reply-button-end button",
-            "ytd-comment-renderer[linked-comment-badge] #reply-button-end button",
-            ".badge-shape-wiz--highlighted >> xpath=ancestor::ytd-comment-view-model >> #reply-button-end button",
+            "ytd-comment-view-model[linked-comment-badge] #reply-button-end :is(button, a)",
+            "ytd-comment-view-model:has(#linked-comment-badge) #reply-button-end :is(button, a)",
+            "ytd-comment-renderer[linked-comment-badge] #reply-button-end :is(button, a)",
+            ".badge-shape-wiz--highlighted >> xpath=ancestor::ytd-comment-view-model >> #reply-button-end :is(button, a)",
             "ytd-comment-view-model[linked-comment-badge] button[aria-label*='Ответить' i]",
             "ytd-comment-view-model[linked-comment-badge] button[aria-label*='Reply' i]",
             # 3. Reply button inside expanded replies container (#replies #expander)
-            "#replies #expander ytd-comment-view-model #reply-button-end button",
-            "#replies #expander ytd-comment-renderer #reply-button-end button",
-            "ytd-comment-replies-renderer #expander #reply-button-end button",
-            "ytd-comment-replies-renderer ytd-comment-view-model #reply-button-end button",
+            "#replies #expander ytd-comment-view-model #reply-button-end :is(button, a)",
+            "#replies #expander ytd-comment-renderer #reply-button-end :is(button, a)",
+            "ytd-comment-replies-renderer #expander #reply-button-end :is(button, a)",
+            "ytd-comment-replies-renderer ytd-comment-view-model #reply-button-end :is(button, a)",
             # 4. Fallback: reply button in replies section
-            "#replies #reply-button-end button",
+            "#replies #reply-button-end :is(button, a)",
             "ytd-comment-thread-renderer #replies button[aria-label*='Reply' i]",
             "ytd-comment-thread-renderer #replies button[aria-label*='Ответить' i]",
             # 5. Last resort fallback
-            "#reply-button-end button",
+            "#reply-button-end :is(button, a)",
             "button[aria-label*='Reply' i]",
             "button[aria-label*='Ответить' i]",
             "button:has-text('Reply')",

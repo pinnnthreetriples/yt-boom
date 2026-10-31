@@ -539,6 +539,30 @@ class GoogleAuthenticator:
             raise GoogleAuthError("после входа YouTube открылся в гостевом режиме (LOGGED_IN=false)")
         if config.get("channelId"):
             return
+
+        # Modern YouTube: check avatar menu for in-situ create_channel dialog
+        avatar = await self._first_visible(page, ("button#avatar-btn", "#avatar-btn"), timeout_seconds=3.0)
+        if avatar is not None:
+            await self._simulator.click_locator(page, avatar)
+            await self._simulator.human_pause(1.0, 2.0)
+            create_link = await self._first_visible(page, ("a[href*='create_channel']",), timeout_seconds=3.0)
+            if create_link is not None:
+                logger.info("У аккаунта нет канала, создаю через меню профиля")
+                await self._simulator.click_locator(page, create_link)
+                await self._simulator.human_pause(2.0, 3.0)
+                button = await self._first_visible(page, (CREATE_CHANNEL_BUTTON,), timeout_seconds=15.0)
+                if button is not None:
+                    await self._simulator.click_locator(page, button)
+                    await self._simulator.human_pause(3.0, 5.0)
+                    logger.info("Канал создан")
+                    return
+            else:
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                return
+
         logger.info("У аккаунта нет канала, создаю")
         await page.goto(CHANNEL_CREATION_URL, wait_until="domcontentloaded")
         button = await self._first_visible(page, (CREATE_CHANNEL_BUTTON,), timeout_seconds=15.0)
