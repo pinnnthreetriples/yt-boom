@@ -62,3 +62,20 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - Interactive YouTube login: `python youtube_bot.py --login`
 - Check database metrics: `python youtube_bot.py --status`
 - Run orchestrator: `python main.py` (or `python main.py --wizard`)
+
+## 6. MEX Agent Memory Integration
+All AI agents (Antigravity, Claude Code, Cursor, etc.) working on this repository must interact with MEX memory (`mex-agent`):
+- **Bootstrap Context:** At the beginning of each session or task, read `.mex/ROUTER.md` and load appropriate context files (`.mex/context/`).
+- **Architectural Decisions:** Automatically log major architectural choices via:
+  ```powershell
+  mex log --type decision "<decision and rationale>" --file <file-path>
+  ```
+- **Critical Findings & Edge Cases:** Record non-obvious quirks, bug resolutions, or DOM discoveries via:
+  ```powershell
+  mex log --type note "<finding details>" --file <file-path>
+  ```
+- **Risks & Limits:** Record technical limitations or operational risks via:
+  ```powershell
+  mex log --type risk "<risk text>"
+  ```
+- **Sync & Integrity:** Ensure post-commit hooks (`mex watch`) remain enabled, verify health with `mex doctor` and `mex check`, and keep logging cadence at `mex logging significant`.

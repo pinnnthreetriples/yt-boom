@@ -1,0 +1,10 @@
+{
+  "setupMode": "code-repo",
+  "aiTools": [
+    "claude"
+  ],
+  "scaffold_id": "3bcb11a2-16be-4792-9e74-9d294e994cbb",
+  "scaffold_name": "claude-yt",
+  "origin": null,
+  "upstream": null
+}
