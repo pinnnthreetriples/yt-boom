@@ -14,6 +14,7 @@ from config import AppConfig, ConfigError, TargetSettings, load_config
 from database import Database, Payload, QueueItem, TestNode
 from modules.collector import CollectedItem, Collector, CollectorError
 from modules.interaction_simulator import InteractionSimulator
+from modules.process_guard import bind_to_kill_on_close_job
 from modules.processor import DeepSeekProcessor, ProcessorError, resolve_reply_text
 from modules.ui_test_runner import UITestRunner
 from modules.validator import DeliveryValidator
@@ -438,6 +439,8 @@ def main(argv: list[str] | None = None) -> int:
         print("  --headless            Force headless browser mode")
         print("  --no-headless         Force headful browser mode with visible windows")
         return 0
+
+    bind_to_kill_on_close_job()  # browser children die with this process, even on a crash
 
     if (
         "--wizard" in arguments

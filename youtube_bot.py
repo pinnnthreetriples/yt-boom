@@ -12,6 +12,7 @@ from config import load_config
 from database import ActivityLogCreate, Database
 from modules.collector import CollectorError
 from modules.interaction_simulator import InteractionSimulator
+from modules.process_guard import bind_to_kill_on_close_job
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.youtube_collector import YouTubeCollector, extract_video_id
 from modules.youtube_runner import YouTubeRunner
@@ -1024,6 +1025,7 @@ def main() -> None:
 
     args = parser.parse_args()
     setup_cli_logging(args.log_level)
+    bind_to_kill_on_close_job()  # browser children die with this process, even on a crash
 
     if args.list_accounts:
         asyncio.run(print_accounts_table(args.config))

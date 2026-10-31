@@ -29,6 +29,7 @@ class YouTubeCommentElement(BaseModel):
 
 
 _UNSET = object()
+_COMMENT_ID_RE = re.compile(r'"commentId"\s*:\s*"(Ug[zw][\w.\-]*)"')
 
 
 class YouTubeRunner:
@@ -97,6 +98,12 @@ class YouTubeRunner:
         prefs.setdefault("browser.tabs.unloadOnLowMemory", False)
         prefs.setdefault("media.peerconnection.enabled", False)
         prefs.setdefault("network.http.http3.enable", False)
+        # RAM / lifecycle: no Site Isolation, a single content process, no audio, no in-memory cache
+        prefs.setdefault("fission.autostart", False)
+        prefs.setdefault("dom.ipc.processCount", 1)
+        prefs.setdefault("dom.ipc.processCount.webIsolated", 1)
+        prefs.setdefault("media.volume_scale", "0.0")
+        prefs.setdefault("browser.cache.memory.enable", False)
 
         options: dict[str, Any] = {
             "headless": self._cfg.headless,
@@ -120,35 +127,6 @@ class YouTubeRunner:
         self._prepare_dirs()
         self._camoufox = AsyncCamoufox(**self._launch_options())
         self._context = await self._camoufox.__aenter__()
-
-        # Register Page Visibility spoofing init script so YouTube doesn't freeze in background
-        try:
-            await self._context.add_init_script("""
-                // Ensure YouTube and Polymer always see the page as visible and active,
-                // even when minimized or running in the background.
-                try {
-                    Object.defineProperty(Document.prototype, 'visibilityState', {
-                        get: () => 'visible',
-                        configurable: true
-                    });
-                    Object.defineProperty(Document.prototype, 'hidden', {
-                        get: () => false,
-                        configurable: true
-                    });
-                    Object.defineProperty(Document.prototype, 'webkitVisibilityState', {
-                        get: () => 'visible',
-                        configurable: true
-                    });
-                    Object.defineProperty(Document.prototype, 'webkitHidden', {
-                        get: () => false,
-                        configurable: true
-                    });
-                    window.addEventListener('visibilitychange', e => e.stopImmediatePropagation(), true);
-                    window.addEventListener('blur', e => e.stopImmediatePropagation(), true);
-                } catch (e) {}
-            """)
-        except Exception as exc:
-            logger.debug("Не удалось добавить init_script для Page Visibility: {}", exc)
 
         pages = getattr(self._context, "pages", [])
         self._page = pages[0] if pages else await self._context.new_page()
@@ -450,29 +428,13 @@ class YouTubeRunner:
         await self._simulator.human_pause(1.0, 2.0)
 
         # 2. Wait for YouTube reply dialog to open with retry
-        reply_input_selectors = [
-            "#reply-dialog #contenteditable-root",
-            "ytd-comment-reply-dialog-renderer #contenteditable-root",
-            "div#contenteditable-root[contenteditable='true']",
-            "#contenteditable-textarea #contenteditable-root",
-            "div[aria-label*='reply' i][contenteditable='true']",
-            "div[aria-label*='ответ' i][contenteditable='true']",
-            "ytd-comment-reply-dialog-renderer textarea",
-        ]
-
-        reply_input = None
-        input_deadline = time.monotonic() + 6.0
-        while time.monotonic() < input_deadline and reply_input is None:
-            for sel in reply_input_selectors:
-                try:
-                    locator = await self._first_visible(page, sel)
-                    if locator is not None:
-                        reply_input = locator
-                        break
-                except Exception:
-                    continue
-            if reply_input is None:
-                await asyncio.sleep(0.4)
+        reply_input = await self._wait_reply_input(page)
+        if reply_input is None and await self._confirm_channel_creation(page):
+            # The first click only raised the profile setup dialog: click Reply again to open the form
+            logger.debug("Повторное нажатие кнопки «Ответить» после создания канала")
+            await self._simulator.click_locator(page, reply_button)
+            await self._simulator.human_pause(1.0, 2.0)
+            reply_input = await self._wait_reply_input(page)
 
         if reply_input is None:
             if dry_run:
@@ -546,8 +508,61 @@ class YouTubeRunner:
             raise SubmissionError(f"YouTube rejected the reply: HTTP {response.status}")
         await self._simulator.human_pause(1.5, 3.0)
 
-        remote_id = f"yt_reply_{int(time.time())}"
+        remote_id = await self._extract_remote_id(response)
+        if remote_id is None:
+            logger.warning("В ответе create_comment не найден серверный commentId")
         return remote_id
+
+    @staticmethod
+    async def _extract_remote_id(response: Any) -> str | None:
+        """Server-side commentId (Ugz.../Ugw...) from the create_comment response body."""
+        try:
+            body = await response.text()
+        except Exception as exc:
+            logger.debug("Не удалось прочитать тело ответа create_comment: {}", exc)
+            return None
+        match = _COMMENT_ID_RE.search(body or "")
+        return match.group(1) if match else None
+
+    async def _wait_reply_input(self, page: Any, timeout_seconds: float = 6.0) -> Any | None:
+        reply_input_selectors = [
+            "#reply-dialog #contenteditable-root",
+            "ytd-comment-reply-dialog-renderer #contenteditable-root",
+            "div#contenteditable-root[contenteditable='true']",
+            "#contenteditable-textarea #contenteditable-root",
+            "div[aria-label*='reply' i][contenteditable='true']",
+            "div[aria-label*='ответ' i][contenteditable='true']",
+            "ytd-comment-reply-dialog-renderer textarea",
+        ]
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            for sel in reply_input_selectors:
+                try:
+                    locator = await self._first_visible(page, sel)
+                    if locator is not None:
+                        return locator
+                except Exception:
+                    continue
+            await asyncio.sleep(0.4)
+        return None
+
+    async def _confirm_channel_creation(self, page: Any) -> bool:
+        """Confirm the first-time profile setup dialog if it blocks the reply form; True when it was closed."""
+        try:
+            dialog = await self._first_visible(page, "ytd-channel-creation-dialog-renderer")
+            if dialog is None:
+                return False
+            logger.debug("Диалог первичной настройки профиля YouTube, подтверждение")
+            button = await self._first_visible(page, "ytd-channel-creation-dialog-renderer #create-channel-button button")
+            if button is None:
+                return False
+            await self._simulator.click_locator(page, button)
+            await dialog.wait_for(state="hidden", timeout=15000)
+            await self._simulator.human_pause(1.0, 2.0)
+            return True
+        except Exception as exc:
+            logger.debug("Не удалось закрыть диалог создания канала: {}", exc)
+            return False
 
     @staticmethod
     async def _first_visible(page: Any, selector: str, limit: int = 8) -> Any | None:

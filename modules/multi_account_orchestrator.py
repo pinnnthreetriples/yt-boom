@@ -150,11 +150,28 @@ class MultiAccountOrchestrator:
             rng=self._rng,
         )
 
-    def _get_runner(self, acc: AccountRecord) -> Any:
-        """Return the account's long-lived runner, creating it on first use."""
+    async def _get_runner(self, acc: AccountRecord) -> Any:
+        """Return the account's long-lived runner, creating it on first use; the pool never exceeds `concurrency`."""
         runner = self._runners.get(acc.id)
         if runner is None:
-            runner = self._runners[acc.id] = self.create_runner(acc)
+            while len(self._runners) >= self._concurrency:
+                idle_acc_id = next(
+                    (
+                        acc_id
+                        for acc_id in self._runners
+                        if acc_id != acc.id
+                        and not self._runner_locks[acc_id].locked()
+                        and self._in_flight[acc_id] == 0
+                    ),
+                    None,
+                )
+                if idle_acc_id is None:
+                    break  # every other browser is busy: nothing safe to unload
+                await self._drop_runner(idle_acc_id)
+            # re-check: _drop_runner awaits, another task may have created this account's runner meanwhile
+            runner = self._runners.get(acc.id)
+            if runner is None:
+                runner = self._runners[acc.id] = self.create_runner(acc)
         return runner
 
     async def _drop_runner(self, acc_id: int) -> None:
@@ -300,7 +317,7 @@ class MultiAccountOrchestrator:
                     # Run submission with error isolation. One browser per account stays open
                     # for the whole run; the lock keeps two videos off the same profile.
                     async with self._runner_locks[acc.id]:
-                        runner = self._get_runner(acc)
+                        runner = await self._get_runner(acc)
                         try:
                             sub_res = await runner.run(
                                 reply_text,

@@ -256,15 +256,19 @@ def check_youtube_session(session_root: Path) -> tuple[bool, str]:
         uri = f"file:{cookies_db.as_posix()}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
         cursor = conn.cursor()
-        cursor.execute("SELECT name FROM moz_cookies WHERE host LIKE '%youtube%' OR host LIKE '%google%'")
-        cookie_names = {row[0] for row in cursor.fetchall()}
+        # Total Cookie Protection partitions google.com cookies away from youtube.com: only LOGIN_INFO
+        # stored for youtube.com proves the profile is signed in on the target domain.
+        cursor.execute(
+            "SELECT COUNT(*) FROM moz_cookies WHERE host LIKE '%youtube.com%' AND name = 'LOGIN_INFO'"
+        )
+        has_login = cursor.fetchone()[0] > 0
+        cursor.execute("SELECT COUNT(*) FROM moz_cookies WHERE host LIKE '%youtube%' OR host LIKE '%google%'")
+        has_cookies = cursor.fetchone()[0] > 0
         conn.close()
 
-        auth_markers = {"LOGIN_INFO", "SID", "SAPISID", "SSID", "__Secure-3PSID", "__Secure-1PSID"}
-        matched = auth_markers & cookie_names
-        if matched:
+        if has_login:
             return True, "Авторизован (сессия активна)"
-        if cookie_names:
+        if has_cookies:
             return False, "Гостевой режим (вход в аккаунт НЕ выполнен)"
         return False, "Сессия пуста (нужен вход)"
     except Exception as exc:

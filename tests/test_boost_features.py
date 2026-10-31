@@ -438,9 +438,11 @@ class TestBoostFeatures(unittest.IsolatedAsyncioTestCase):
             mock = MagicMock()
             if "reply" in sel:
                 mock.first = reply_btn
+                mock.nth = MagicMock(return_value=reply_btn)
                 mock.count = AsyncMock(return_value=1)
             elif "contenteditable" in sel:
                 mock.first = reply_input
+                mock.nth = MagicMock(return_value=reply_input)
                 mock.count = AsyncMock(return_value=1)
             else:
                 mock.first = MagicMock(count=AsyncMock(return_value=0), is_visible=AsyncMock(return_value=False))

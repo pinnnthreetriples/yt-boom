@@ -318,7 +318,7 @@ class InteractionSimulator:
                     await res_type
             await asyncio.sleep(hold_time)
 
-    async def type_text(self, page: Any, text: str) -> None:
+    async def type_text(self, page: Any, text: str, allow_typos: bool = True) -> None:
         self._ensure_open(page)
         if not text:
             return
@@ -337,7 +337,7 @@ class InteractionSimulator:
                             await res
                 await asyncio.sleep(self._delay(self._cfg.key_delay_ms_min, self._cfg.key_delay_ms_max) * 1.8)
                 continue
-            if character.isalpha() and self._rng.random() < self._cfg.typo_probability:
+            if allow_typos is True and character.isalpha() and self._rng.random() < self._cfg.typo_probability:
                 await self._type_with_typo(page, character)
             else:
                 await self._press_character(page, character)
