@@ -8,3 +8,4 @@
 {"timestamp":"2026-10-31T20:59:02.030Z","kind":"decision","message":"Adding geo_country schema column and auto-detection via Google Terms endpoint upon successful auth","files":["database.py"],"cwd":"."}
 {"timestamp":"2026-10-31T21:04:13.258Z","kind":"note","message":"Camoufox/Firefox cookies.sqlite stores expiry in microseconds/milliseconds (e.g. 1828036010538); normalize timestamp by dividing by 1000 if > 1e11","files":["modules/session_heartbeat.py"],"cwd":"."}
 {"timestamp":"2026-10-31T21:05:12.848Z","kind":"note","message":"Lightweight YouTube heartbeat via curl_cffi requires filtering moz_cookies specifically for host LIKE '%.youtube.com' so Google.com cookies do not overwrite YouTube-specific SID/HSID/SSID","files":["modules/session_heartbeat.py"],"cwd":"."}
+{"timestamp":"2026-10-31T23:15:11.816Z","kind":"decision","message":"Adopted Firefox-consistent session heartbeat and log-normal typing cadences","files":["modules/interaction_simulator.py"],"cwd":"."}
