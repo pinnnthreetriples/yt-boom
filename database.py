@@ -137,6 +137,7 @@ _ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
     ("recovery_email", "TEXT"),
     ("auth_status", "TEXT DEFAULT 'pending'"),
     ("fingerprint_data", "TEXT"),
+    ("geo_country", "TEXT"),
 )
 
 _ERROR_LIMIT = 2000
@@ -264,6 +265,7 @@ class AccountRecord(BaseModel):
     recovery_email: str | None = None
     auth_status: str = "pending"
     fingerprint_data: str | None = None
+    geo_country: str | None = None
 
 
 class AccountCreate(BaseModel):
@@ -275,6 +277,7 @@ class AccountCreate(BaseModel):
     password: str | None = Field(default=None, repr=False, exclude=True)
     totp_secret: str | None = Field(default=None, repr=False, exclude=True)
     recovery_email: str | None = None
+    geo_country: str | None = None
 
 
 class VideoPoolItem(BaseModel):
@@ -1176,6 +1179,7 @@ class Database:
         password: str | None = None,
         totp_secret: str | None = None,
         recovery_email: str | None = None,
+        geo_country: str | None | _Unset = UNSET,
     ) -> AccountRecord:
         """Create or update an account by name.
 
@@ -1205,8 +1209,8 @@ class Database:
                 await conn.execute(
                     """
                     INSERT INTO accounts (name, session_path, proxy_url, is_active, total_replies, created_at,
-                                          email, password, totp_secret, recovery_email)
-                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                                          email, password, totp_secret, recovery_email, geo_country)
+                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         name,
@@ -1218,6 +1222,7 @@ class Database:
                         protect_secret(password),
                         protect_secret(totp_secret),
                         recovery_email,
+                        None if isinstance(geo_country, _Unset) else geo_country,
                     ),
                 )
             else:
@@ -1225,6 +1230,7 @@ class Database:
                 new_session = current.session_path if isinstance(session_path, _Unset) else session_path
                 new_proxy = current.proxy_url if isinstance(proxy_url, _Unset) else proxy_url
                 new_active = current.is_active if isinstance(is_active, _Unset) else bool(is_active)
+                new_country = current.geo_country if isinstance(geo_country, _Unset) else geo_country
                 credentials_changed = (
                     (email is not None and email != current.email)
                     or (password is not None and password != current.password)
@@ -1238,6 +1244,7 @@ class Database:
                         password = COALESCE(?, password),
                         totp_secret = COALESCE(?, totp_secret),
                         recovery_email = COALESCE(?, recovery_email),
+                        geo_country = ?,
                         auth_status = CASE WHEN ? THEN 'pending' ELSE auth_status END
                     WHERE id = ?
                     """,
@@ -1249,6 +1256,7 @@ class Database:
                         protect_secret(password),
                         protect_secret(totp_secret),
                         recovery_email,
+                        new_country,
                         1 if credentials_changed else 0,
                         row["id"],
                     ),
@@ -1303,6 +1311,12 @@ class Database:
     async def set_account_auth_status(self, account_id: int, status: str) -> None:
         async with self._transaction() as conn:
             cursor = await conn.execute("UPDATE accounts SET auth_status = ? WHERE id = ?", (status, account_id))
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account id={account_id} not found")
+
+    async def set_account_geo_country(self, account_id: int, geo_country: str | None) -> None:
+        async with self._transaction() as conn:
+            cursor = await conn.execute("UPDATE accounts SET geo_country = ? WHERE id = ?", (geo_country, account_id))
             if cursor.rowcount == 0:
                 raise RecordNotFoundError(f"account id={account_id} not found")
 

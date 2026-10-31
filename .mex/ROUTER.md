@@ -22,6 +22,8 @@ edges:
     condition: when handling Google account sign-in or 2FA TOTP challenges
   - target: patterns/account-management.md
     condition: when importing accounts or managing DPAPI credentials
+  - target: patterns/account-warming-heartbeat.md
+    condition: when inspecting session health or warming fresh accounts
   - target: patterns/debug-browser-interaction.md
     condition: when diagnosing browser automation or selector issues
 last_updated: 2026-10-31

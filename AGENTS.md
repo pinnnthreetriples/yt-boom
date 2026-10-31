@@ -32,7 +32,9 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/account_parser.py` — single account and batch account file parser (`email:pass:totp[:recovery][:proxy]`)
 - `modules/secret_store.py` — Windows DPAPI credential encryption layer for local SQLite storage
 - `modules/fingerprint_manager.py` — stable hardware fingerprint manager per browser session directory
-- `tests/` — comprehensive automated test suite (400 unit and integration tests)
+- `modules/session_heartbeat.py` — lightweight HTTP session token keep-alive & validity verifier (`curl_cffi` reading `cookies.sqlite`)
+- `modules/account_warmer.py` — behavioral account warm-up runner (natural video viewing, mouse movement, comments scroll)
+- `tests/` — comprehensive automated test suite (410 unit and integration tests)
 - `run_tests.py` — test discovery and test suite runner
 - `test_sessions/` — local browser session storage directories
 
@@ -54,6 +56,8 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - Authenticate single account: `python youtube_bot.py --auth-account <name>`
 - Import accounts from file: `python youtube_bot.py --import-accounts-file <path>`
 - List all stored accounts: `python youtube_bot.py --list-accounts`
+- Check account session heartbeat (lightweight HTTP): `python youtube_bot.py --heartbeat [account]`
+- Run account warm-up: `python youtube_bot.py --warm-up <name> [--warm-up-duration 45]`
 - Multi-video search & reply: `python youtube_bot.py --search "python" --min-views 10000 --max-views 500000 --comments-per-video 10 --dry-run`
 - View activity history / audit log: `python youtube_bot.py --history`
 - List YouTube sub-comments: `python youtube_bot.py --video "https://www.youtube.com/watch?v=..." --list-replies --limit 5`

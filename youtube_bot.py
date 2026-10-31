@@ -13,10 +13,12 @@ from config import AppConfig, load_config, mask_proxy_url, resolve_account_proxy
 from database import AccountRecord, ActivityLogCreate, Database, RecordNotFoundError
 from modules.collector import CollectorError
 from modules.account_parser import looks_like_credentials, parse_account_line
+from modules.account_warmer import AccountWarmer, WarmUpResult
 from modules.google_authenticator import GoogleAuthenticator, GoogleAuthError, read_session_owner, write_session_owner
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
+from modules.session_heartbeat import check_account_heartbeat, HeartbeatStatus
 from modules.youtube_collector import YouTubeCollector, extract_video_id
 from modules.youtube_runner import YouTubeRunner
 
@@ -236,7 +238,8 @@ async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRe
     new_status: str | None = None
     try:
         await runner.start()
-        authenticated = await GoogleAuthenticator(simulator).authenticate(
+        authenticator = GoogleAuthenticator(simulator)
+        authenticated = await authenticator.authenticate(
             runner.context,
             account.email,
             account.password,
@@ -245,6 +248,8 @@ async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRe
             force_relogin=force_relogin,
         )
         new_status = "authenticated"
+        if authenticator.detected_country:
+            await db.set_account_geo_country(account.id, authenticator.detected_country)
     except GoogleAuthError as exc:
         logger.error("Авторизация {!r} не удалась: {}", account.name, exc)
         new_status = "failed"
@@ -334,6 +339,66 @@ async def import_accounts_file_cli(
     return not failed_lines and not failed_auth
 
 
+async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml") -> bool:
+    """Verify session validity and LOGIN_INFO via lightweight HTTP without launching browser."""
+    cfg = load_config(config_path)
+    async with Database(cfg.app.db_path) as db:
+        if identifier and identifier != "ALL":
+            account = await _find_account(db, identifier)
+            if account is None:
+                print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
+                return False
+            accounts = [account]
+        else:
+            accounts = await db.list_active_accounts()
+            if not accounts:
+                accounts = await db.list_accounts()
+
+        if not accounts:
+            print("[INFO] No accounts found in database.")
+            return False
+
+        print("\n" + "=" * 95)
+        print("                           ACCOUNT SESSION HEARTBEAT")
+        print("=" * 95)
+        header = f"{'Account':<16} | {'Status':<8} | {'Days Left':<10} | {'Expires At (UTC)':<22} | {'Details'}"
+        print(header)
+        print("-" * 95)
+        all_alive = True
+        for acc in accounts:
+            res = await check_account_heartbeat(acc, default_proxy=cfg.browser.proxy)
+            status_str = "ALIVE" if res.is_alive else "EXPIRED"
+            if not res.is_alive:
+                all_alive = False
+            days_str = f"{res.days_remaining:.1f}d" if res.days_remaining is not None else "-"
+            exp_str = res.expires_at or "-"
+            print(f"{acc.name:<16} | {status_str:<8} | {days_str:<10} | {exp_str:<22} | {res.details}")
+        print("=" * 95 + "\n")
+        return all_alive
+
+
+async def warm_up_cli(
+    identifier: str,
+    config_path: str = "config.yaml",
+    duration: float = 45.0,
+    target_video: str | None = None,
+    headless: bool | None = None,
+) -> bool:
+    """Run humanized browser warm-up for an account."""
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    async with Database(cfg.app.db_path) as db:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
+            return False
+        warmer = AccountWarmer(cfg.browser)
+        res = await warmer.warm_up(account, duration_seconds=duration, target_video_url=target_video, db=db)
+        print(f"[{'OK' if res.success else 'FAILED'}] {res.account_name}: {res.details}")
+        return res.success
+
+
 async def print_accounts_table(config_path: str = "config.yaml") -> None:
     """Pretty-print a table of all accounts with stats from DB."""
     cfg = load_config(config_path)
@@ -359,7 +424,7 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
             print("  No accounts found in database or configuration.")
         else:
             header = (
-                f"{'ID':<4} | {'Name':<16} | {'Status':<8} | {'Auth':<13} | {'Replies':<8} | "
+                f"{'ID':<4} | {'Name':<16} | {'Status':<8} | {'Auth':<13} | {'Geo':<12} | {'Replies':<8} | "
                 f"{'Email':<24} | {'Proxy':<30} | {'Session Path'}"
             )
             print(header)
@@ -367,6 +432,7 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
             for acc in accounts:
                 status = "ACTIVE" if acc.is_active else "DISABLED"
                 proxy_display = mask_proxy_url(acc.proxy_url) if acc.proxy_url else "direct (no proxy)"
+                geo_display = acc.geo_country or "-"
                 if len(proxy_display) > 30:
                     proxy_display = proxy_display[:27] + "..."  # the masked form: never cut credentials open
                 row = (
@@ -374,6 +440,7 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
                     f"{acc.name:<16} | "
                     f"{status:<8} | "
                     f"{acc.auth_status:<13} | "
+                    f"{geo_display:<12} | "
                     f"{acc.total_replies:<8} | "
                     f"{mask_email(acc.email):<24} | "
                     f"{proxy_display:<30} | "
@@ -1237,6 +1304,9 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="With --import-accounts-file: sign in accounts that are already authenticated too")
     parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (http://user:pass@ip:port or ip:port:user:pass) for adding account or session override")
     parser.add_argument("--session", type=str, default=None, help="Session directory path for adding account")
+    parser.add_argument("--heartbeat", "--check-session", dest="heartbeat", nargs="?", const="ALL", default=None, metavar="NAME_OR_ALL", help="Verify session validity and LOGIN_INFO via lightweight HTTP (default: all active accounts)")
+    parser.add_argument("--warm-up", type=str, default=None, metavar="NAME_OR_EMAIL", help="Run humanized browser warm-up for an account (natural watch, mouse movement, comments scroll)")
+    parser.add_argument("--warm-up-duration", type=float, default=45.0, help="Duration in seconds for warm-up viewing (default: 45.0)")
     parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
     parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt)")
     parser.add_argument("--concurrency", "-j", type=int, default=None, help="Accounts working at the same time (default: limits.max_concurrent_sessions)")
@@ -1250,6 +1320,22 @@ def main() -> None:
     args = parser.parse_args()
     setup_cli_logging(args.log_level)
     bind_to_kill_on_close_job()  # browser children die with this process, even on a crash
+
+    if args.heartbeat is not None:
+        ok = asyncio.run(heartbeat_cli(args.heartbeat, args.config))
+        sys.exit(0 if ok else 1)
+
+    if args.warm_up:
+        ok = asyncio.run(
+            warm_up_cli(
+                args.warm_up,
+                args.config,
+                duration=args.warm_up_duration,
+                target_video=args.video,
+                headless=args.headless or None,
+            )
+        )
+        sys.exit(0 if ok else 1)
 
     if args.list_accounts:
         asyncio.run(print_accounts_table(args.config))

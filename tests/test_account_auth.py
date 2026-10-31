@@ -163,7 +163,7 @@ class TestAccountsMigration(unittest.IsolatedAsyncioTestCase):
             columns = {row[1] for row in check.execute("PRAGMA table_info(accounts)")}
         finally:
             check.close()
-        self.assertTrue({"email", "password", "totp_secret", "recovery_email", "auth_status", "fingerprint_data"} <= columns)
+        self.assertTrue({"email", "password", "totp_secret", "recovery_email", "auth_status", "fingerprint_data", "geo_country"} <= columns)
 
     async def test_upsert_stores_credentials_and_old_callers_keep_them(self):
         async with Database(self.path) as db:
@@ -180,6 +180,9 @@ class TestAccountsMigration(unittest.IsolatedAsyncioTestCase):
             listed = await db.list_accounts()
             self.assertEqual(listed[0].auth_status, "authenticated")
             self.assertEqual(listed[0].email, "bob@gmail.com")
+            await db.set_account_geo_country(created.id, "Kyrgyzstan")
+            updated = await db.list_accounts()
+            self.assertEqual(updated[0].geo_country, "Kyrgyzstan")
 
 
 class TestFingerprintManager(unittest.TestCase):

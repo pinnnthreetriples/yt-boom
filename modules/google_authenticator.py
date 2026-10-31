@@ -17,6 +17,7 @@ from modules.totp_helper import generate_fresh_totp, get_remaining_seconds
 
 YOUTUBE_HOME_URL = "https://www.youtube.com/?hl=en&gl=US"
 CHANNEL_CREATION_URL = "https://www.youtube.com/channel_creation"
+GOOGLE_TERMS_URL = "https://policies.google.com/terms?hl=en"
 
 # Hosts that carry the sign-in flow and its speedbumps; accounts.youtube.com (SetSID redirects) is only transit.
 GOOGLE_HOSTS = frozenset({"accounts.google.com", "gds.google.com", "myaccount.google.com"})
@@ -152,6 +153,7 @@ class GoogleAuthenticator:
 
     def __init__(self, simulator: InteractionSimulator) -> None:
         self._simulator = simulator
+        self.detected_country: str | None = None
 
     async def is_session_authenticated(self, context: Any) -> bool:
         """Zero-risk fast path: a live LOGIN_INFO cookie on .youtube.com means the profile is already signed in."""
@@ -209,6 +211,12 @@ class GoogleAuthenticator:
             await self._ensure_channel(page)
             if not await self.is_session_authenticated(context):
                 raise GoogleAuthError("после создания канала кука LOGIN_INFO пропала")
+            try:
+                self.detected_country = await self.detect_account_country(page)
+                if self.detected_country:
+                    logger.info("Определён гео-регион аккаунта: {}", self.detected_country)
+            except Exception as exc:
+                logger.debug("Не удалось определить страну аккаунта: {}", exc)
             logger.success("Авторизация в YouTube завершена")
             return True
         except Exception as exc:
@@ -224,6 +232,30 @@ class GoogleAuthenticator:
                 await page.close()
             except Exception as exc:
                 logger.debug("Не удалось закрыть страницу авторизации: {}", exc)
+
+    async def detect_account_country(self, page: Any) -> str | None:
+        """Fetch the account's registered country version from Google Terms (hl=en)."""
+        try:
+            await page.goto(GOOGLE_TERMS_URL, wait_until="domcontentloaded")
+            await self._simulator.human_pause(0.5, 1.5)
+            content = await page.content()
+            import re
+            m = re.search(r"Country version:\s*([A-Za-z\s\-]+?)(?:<|\n|\r|$)", content, re.IGNORECASE)
+            if m:
+                country = m.group(1).strip().split("<")[0].strip()
+                if country:
+                    return country
+            for el in await page.query_selector_all("span, div, p, h1, h2, h3"):
+                txt = (await el.inner_text()).strip()
+                if "Country version:" in txt:
+                    parts = txt.split("Country version:")
+                    if len(parts) > 1 and parts[1].strip():
+                        candidate = parts[1].strip().split("\n")[0].strip()
+                        if candidate:
+                            return candidate
+        except Exception as exc:
+            logger.debug("Не удалось определить страну аккаунта: {}", exc)
+        return None
 
     # ------------------------------------------------------------------ entry point
 
