@@ -680,8 +680,10 @@ class TestHostGpuReachesWebgl(unittest.TestCase):
 
     def test_cached_host_gpu_becomes_the_webgl_config_without_probing(self):
         _KNOWN_WEBGL_GPUS.pop(self.HOST, None)
+        # a stand-in `sys` for the module only: patching the real sys.platform makes camoufox import msvcrt on Linux
+        windows_sys = SimpleNamespace(platform="win32", executable=sys.executable)
         with tempfile.TemporaryDirectory() as temp, \
-             patch("modules.fingerprint_manager.sys.platform", "win32"), \
+             patch("modules.fingerprint_manager.sys", windows_sys), \
              patch("modules.fingerprint_manager._probe_host_renderer") as probe:
             self.assertEqual(host_webgl_config(self._cache(Path(temp), self.HOST), "windows"), self.HOST)
             self.assertIsNone(host_webgl_config(Path(temp) / "empty" / "acc", "windows"))  # no cache: nothing to pin
@@ -780,6 +782,7 @@ class TestWindowsTaskbar(unittest.TestCase):
             self.assertEqual(get_or_create_fingerprint(Path(temp) / "mac", "macos")["screen"]["availHeight"], 1080)
             self.assertEqual(generate.call_count, 2)
 
+    @unittest.skipUnless(sys.platform == "win32", "camoufox clamps the screen to the host display, which only Windows keeps at the fingerprint's size")
     def test_camoufox_keeps_the_48px_gap_and_a_consistent_window(self):
         from camoufox.fingerprints import generate_fingerprint
 
