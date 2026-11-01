@@ -18,6 +18,7 @@ from config import AccountSettings, BrowserSettings, TargetSettings, mask_proxy_
 from database import UNSET, AccountRecord, Database, Payload
 from modules.account_parser import ParsedAccount, parse_account_line
 from modules.fingerprint_manager import (
+    _KNOWN_WEBGL_GPUS,
     _fix_windows_taskbar,
     _probe_host_renderer,
     get_or_create_fingerprint,
@@ -678,7 +679,10 @@ class TestHostGpuReachesWebgl(unittest.TestCase):
         return root / "acc"
 
     def test_cached_host_gpu_becomes_the_webgl_config_without_probing(self):
-        with tempfile.TemporaryDirectory() as temp,              patch("modules.fingerprint_manager.sys.platform", "win32"),              patch("modules.fingerprint_manager._probe_host_renderer") as probe:
+        _KNOWN_WEBGL_GPUS.pop(self.HOST, None)
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("modules.fingerprint_manager.sys.platform", "win32"), \
+             patch("modules.fingerprint_manager._probe_host_renderer") as probe:
             self.assertEqual(host_webgl_config(self._cache(Path(temp), self.HOST), "windows"), self.HOST)
             self.assertIsNone(host_webgl_config(Path(temp) / "empty" / "acc", "windows"))  # no cache: nothing to pin
             probe.assert_not_called()
@@ -694,16 +698,37 @@ class TestHostGpuReachesWebgl(unittest.TestCase):
             with patch("modules.fingerprint_manager.sys.platform", "win32"):
                 self.assertIsNone(host_webgl_config(unknown, "windows"))
 
+    def test_gpu_table_is_read_and_the_unknown_gpu_warned_about_once_per_gpu(self):
+        gpu = ("Google Inc. (Acme)", "ANGLE (Acme, Acme X Direct3D11), or similar")
+        _KNOWN_WEBGL_GPUS.pop(gpu, None)
+        _KNOWN_WEBGL_GPUS.pop(self.HOST, None)
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("modules.fingerprint_manager.sys.platform", "win32"), \
+             patch("camoufox.webgl.firefox_gpus", return_value=frozenset({self.HOST})) as table, \
+             patch("modules.fingerprint_manager.logger") as log:
+            session = self._cache(Path(temp), gpu)
+            for _ in range(3):
+                self.assertIsNone(host_webgl_config(session, "windows"))
+            self.assertEqual((table.call_count, log.warning.call_count), (1, 1))
+            self._cache(Path(temp), self.HOST)  # re-detected GPU: read from the file again, looked up once
+            for _ in range(3):
+                self.assertEqual(host_webgl_config(session, "windows"), self.HOST)
+            self.assertEqual(table.call_count, 2)
+        _KNOWN_WEBGL_GPUS.pop(gpu, None)
+        _KNOWN_WEBGL_GPUS.pop(self.HOST, None)
+
     def test_runner_passes_the_pin_and_camoufox_applies_it_headful_and_headless(self):
         from camoufox.fingerprints import generate_fingerprint
 
         fingerprint = generate_fingerprint(os="windows", gpu={"vendor": self.HOST[0], "renderer": self.HOST[1]})
         with tempfile.TemporaryDirectory() as temp:
             runner = _runner(Path(temp))
-            with patch("modules.youtube_runner.get_or_create_fingerprint", return_value=fingerprint),                  patch("modules.youtube_runner.host_webgl_config", return_value=self.HOST):
+            with patch("modules.youtube_runner.get_or_create_fingerprint", return_value=fingerprint), \
+                 patch("modules.youtube_runner.host_webgl_config", return_value=self.HOST):
                 options = runner._launch_options()
             self.assertEqual(options["webgl_config"], self.HOST)
-            with patch("modules.youtube_runner.get_or_create_fingerprint", return_value=fingerprint),                  patch("modules.youtube_runner.host_webgl_config", return_value=None):
+            with patch("modules.youtube_runner.get_or_create_fingerprint", return_value=fingerprint), \
+                 patch("modules.youtube_runner.host_webgl_config", return_value=None):
                 self.assertNotIn("webgl_config", runner._launch_options())  # no pin: as before
             seen = set()
             for headless in (True, False):
@@ -744,7 +769,9 @@ class TestWindowsTaskbar(unittest.TestCase):
             _fix_windows_taskbar(odd)
 
     def test_only_a_new_windows_fingerprint_is_corrected_and_the_saved_one_is_reused_as_is(self):
-        with tempfile.TemporaryDirectory() as temp,              patch("modules.fingerprint_manager.host_gpu", return_value=None),              patch("camoufox.fingerprints.generate_fingerprint", side_effect=lambda os: self._fp()) as generate:
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("modules.fingerprint_manager.host_gpu", return_value=None), \
+             patch("camoufox.fingerprints.generate_fingerprint", side_effect=lambda os: self._fp()) as generate:
             win = get_or_create_fingerprint(Path(temp) / "win", "windows")
             self.assertEqual(win["screen"]["availHeight"], 1032)
             saved = json.loads((Path(temp) / "win" / "fingerprint.json").read_text(encoding="utf-8"))

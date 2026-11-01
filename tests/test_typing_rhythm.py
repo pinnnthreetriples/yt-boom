@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import re
 import statistics
+import unicodedata
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -208,6 +209,26 @@ class TestTypoFinalTextInvariant(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(keyboard.text, text)
             for position in keyboard.deleted_positions:
                 self.assertFalse(any(start <= position < end for start, end in protected), f"seed={seed} pos={position}")
+
+    async def test_no_wrong_character_next_to_a_combining_mark(self) -> None:
+        sim = _simulator()
+        self.assertFalse(sim._can_transpose("ab\u0301c", 0))  # the mark follows the swapped pair
+        self.assertFalse(sim._can_transpose("x\u0301ab", 2))  # the mark precedes it
+        with patch.object(sim._rng, "choice", return_value=2):
+            # "tehe\u0301x": the lag may not end on a base letter that carries a mark
+            self.assertEqual(sim._late_notice_chars("tehe\u0301x", 0, []), 1)
+            self.assertEqual(sim._late_notice_chars("te\u0301hx", 0, []), 0)
+        marked = ["e\u0301то прове\u0301рка с ударе\u0301нием", "cafe\u0301 au lait, tre\u0300s bien", "ab\u0301c abc\u0301 a\u0301bc"]
+        for seed in range(80):
+            for sample in marked:
+                page, keyboard = self._page()
+                sim = _simulator(seed, typo_probability=0.5)
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    await sim.type_text(page, sample)
+                self.assertEqual(keyboard.text, sample, f"seed={seed}")
+                for position in keyboard.deleted_positions:
+                    near = sample[max(0, position - 1) : position + 2]
+                    self.assertFalse(any(unicodedata.category(c).startswith("M") for c in near), f"seed={seed} {sample!r} pos={position}")
 
     async def test_transposition_share_zero_means_substitution_only(self) -> None:
         page, keyboard = self._page()

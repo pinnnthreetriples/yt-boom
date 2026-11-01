@@ -4,10 +4,10 @@ import asyncio
 import re
 from typing import Any
 
-from curl_cffi.requests.exceptions import RequestException
 from loguru import logger
 
 _API_KEY_RE = re.compile(r'"INNERTUBE_API_KEY":"([^"]+)"')
+_ANY_COMMENT_ID_RE = re.compile(r'"commentId"\s*:\s*"')
 _CLIENT_VERSION_RE = re.compile(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"')
 
 
@@ -53,16 +53,24 @@ class CommentVisibilityChecker:
             )
             if resp.status_code != 200:
                 return None
+            # A real answer is JSON with `onResponseReceivedEndpoints` and (live, 2026-11) carries 20+ commentId keys
+            # (`commentEntityPayload.properties.commentId`, `commentViewModel.commentId`); anything else is "unknown".
+            if not isinstance(resp.json(), dict) or not _ANY_COMMENT_ID_RE.search(resp.text):
+                return None
             # only the /next answer counts: the watch page HTML repeats `lc=` whatever the comment's state
             return re.search(r'"commentId"\s*:\s*"' + re.escape(comment_id) + '"', resp.text) is not None
-        except (RequestException, AttributeError, ValueError) as exc:
+        except Exception as exc:
             logger.debug("Проверка видимости комментария {} не выполнена: {}", comment_id, exc)
             return None
 
     async def watch(self, video_id: str, comment_id: str, account_name: str) -> bool | None:
         """Wait, check once and log a miss; the caller runs it in the background."""
         await asyncio.sleep(self._delay)
-        seen = await self.is_visible(video_id, comment_id)
+        try:
+            seen = await self.is_visible(video_id, comment_id)
+        except Exception as exc:  # a background task: nothing may escape as "exception was never retrieved"
+            logger.debug("Проверка видимости комментария {} прервана: {}", comment_id, exc)
+            return None
         if seen is False:
             logger.warning(
                 "[ВИДИМОСТЬ] Комментарий {} аккаунта {!r} под видео {} не найден в анонимной выдаче через {:.0f}с "

@@ -781,6 +781,34 @@ class TestVisibilityHook(TestLifecyclePacing):
         self.assertEqual(checker.watch.await_count, 1)
         self.assertFalse(orchestrator._visibility_tasks)
 
+    async def test_leaving_on_an_error_cancels_pending_checks_instead_of_waiting(self) -> None:
+        await self._account("manual_acc", None)
+        checker = self._checker(asyncio.Event())  # never released: a normal exit would wait forever
+        orchestrator = self._watched(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="Ugx.r1", duration_seconds=0.1), checker
+        )
+        original = orchestrator._execute_video_pool
+
+        async def fail_after_posting(*args, **kwargs):
+            await original(*args, **kwargs)
+            raise RuntimeError("pool failed")
+
+        orchestrator._execute_video_pool = fail_after_posting
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            with self.assertRaises(RuntimeError):
+                await asyncio.wait_for(orchestrator.execute_video_pool(max_comments_per_video=1), timeout=10)
+        self.assertFalse(orchestrator._visibility_tasks)
+
+    async def test_gate_message_is_logged_only_in_each_mode(self) -> None:
+        account = await self._account("mature_acc", 100)
+        for mode, expected in (("each", 1), ("share", 0)):
+            orchestrator, _ = self._orchestrator(lambda *a, **k: None)
+            orchestrator._account_mode = mode
+            with patch("modules.multi_account_orchestrator.logger") as log:
+                orchestrator._gate_account(account)
+            self.assertEqual(log.info.call_count, expected)
+            self.assertIn(account.id, orchestrator._gated_accounts)
+
 
 if __name__ == "__main__":
     unittest.main()
