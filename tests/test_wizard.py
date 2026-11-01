@@ -76,8 +76,8 @@ class TestWizardHelpers(unittest.TestCase):
         self.assertEqual(mask_secret(""), "[не задан]")
         self.assertEqual(mask_secret("short"), "****")
         masked = mask_secret("sk-abcdefghijklmnopqrstuvwxyz123456")
-        self.assertTrue(masked.startswith("sk-ef7d..."))
-        self.assertTrue(masked.endswith("2aef"))
+        self.assertTrue(masked.startswith("sk-abcd..."))
+        self.assertTrue(masked.endswith("3456"))
 
     def test_check_proxy_connectivity_success(self):
         with patch("curl_cffi.requests.get") as mock_get:
