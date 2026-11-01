@@ -13,6 +13,7 @@ from loguru import logger
 FINGERPRINT_FILE = "fingerprint.json"
 FORMAT_VERSION = 1
 HOST_GPU_FILE = "_host_gpu.json"  # next to the account profiles; delete it to re-detect after a GPU or driver change
+WINDOWS_TASKBAR_PX = 48  # Windows 11 taskbar height; camoufox's fix_screen_no_taskbar assumes Windows 10's 40
 
 # Firefox hands pages a sanitized GPU "bucket" through plain getParameter(RENDERER) that Camoufox does not spoof,
 # only UNMASKED_RENDERER. A pinned GPU that differs from the host bucket makes the two disagree, so we read the bucket.
@@ -82,18 +83,25 @@ def _probe_host_renderer() -> str | None:
     return renderer if isinstance(renderer, str) else None
 
 
+def _cached_host_gpu(cache_dir: Path) -> dict[str, str] | None:
+    try:
+        cached = json.loads((Path(cache_dir) / HOST_GPU_FILE).read_text(encoding="utf-8"))
+        if isinstance(cached, dict) and cached.get("vendor") and cached.get("renderer"):
+            return {"vendor": str(cached["vendor"]), "renderer": str(cached["renderer"])}
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def host_gpu(cache_dir: Path) -> dict[str, str] | None:
     """The GPU (vendor, renderer) Firefox shows on this host, for fpgen's `gpu` condition; None when it cannot be told.
 
     Detected once and kept in `cache_dir/_host_gpu.json`.
     """
     path = Path(cache_dir) / HOST_GPU_FILE
-    try:
-        cached = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(cached, dict) and cached.get("vendor") and cached.get("renderer"):
-            return {"vendor": str(cached["vendor"]), "renderer": str(cached["renderer"])}
-    except (OSError, ValueError):
-        pass
+    cached = _cached_host_gpu(cache_dir)
+    if cached:
+        return cached
     renderer = _probe_host_renderer()
     match = re.match(r"ANGLE \(([^,]+),", renderer or "")
     if renderer is None or match is None:
@@ -106,6 +114,52 @@ def host_gpu(cache_dir: Path) -> dict[str, str] | None:
     except OSError as exc:
         logger.warning("Не удалось сохранить GPU хоста {}: {}", path, exc)
     return gpu
+
+
+def host_webgl_config(session_dir: Path, target_os: str = "windows") -> tuple[str, str] | None:
+    """(vendor, renderer) for Camoufox's `webgl_config` so UNMASKED_* always equals the host GPU that plain RENDERER shows.
+
+    A fingerprint's `gpu` only steers fpgen's other fields; Camoufox redraws the WebGL GPU at launch from a seed that
+    changes with the screen (headful vs headless, another monitor), so the pin never reached the browser. None when
+    there is nothing to pin (another OS, a non-Windows host, no cached host GPU or one Camoufox has no WebGL data for).
+    """
+    if target_os.lower() != "windows" or sys.platform != "win32":
+        return None
+    gpu = _cached_host_gpu(Path(session_dir).parent)  # never probes: the cache is written when a fingerprint is generated
+    if not gpu:
+        return None
+    pair = (gpu["vendor"], gpu["renderer"])
+    try:
+        from camoufox.webgl import firefox_gpus
+
+        known = pair in firefox_gpus("windows")
+    except Exception as exc:
+        logger.warning("Не удалось сверить GPU хоста с данными Camoufox: {}", exc)
+        return None
+    if not known:
+        logger.warning("Camoufox не знает WebGL-параметров GPU хоста {!r}: GPU не будет закреплён", pair[1])
+        return None
+    return pair
+
+
+def _fix_windows_taskbar(fingerprint: dict[str, Any]) -> None:
+    """availHeight == height claims a screen without a taskbar: use Windows 11's 48 px (camoufox's own fix says 40).
+
+    Every Windows identity presents Windows 11 (its fonts, overlay scrollbars) and the host taskbar is 48 px. The window
+    is clamped to the new available area like camoufox does, so outer/inner heights never exceed it.
+    """
+    screen = fingerprint.get("screen")
+    if not isinstance(screen, dict) or not screen.get("height") or screen.get("availHeight") != screen["height"]:
+        return
+    avail = screen["height"] - WINDOWS_TASKBAR_PX
+    screen["availHeight"] = avail
+    window = fingerprint.get("window")
+    outer = window.get("outerHeight") if isinstance(window, dict) else None
+    if outer and outer > avail:
+        inner = window.get("innerHeight")
+        window["outerHeight"] = avail
+        if inner:
+            window["innerHeight"] = avail - (outer - inner)
 
 
 def get_or_create_fingerprint(session_dir: Path, target_os: str = "windows", *, force_new: bool = False) -> dict[str, Any]:
@@ -135,6 +189,8 @@ def get_or_create_fingerprint(session_dir: Path, target_os: str = "windows", *, 
             logger.warning("Нет отпечатка с GPU хоста {}: {}. Беру случайный", gpu["renderer"], exc)
     if fingerprint is None:
         fingerprint = generate_fingerprint(os=target_os)
+    if target_os.lower() == "windows":
+        _fix_windows_taskbar(fingerprint)
     try:
         _write_atomic(path, fingerprint, target_os)
     except OSError as exc:
@@ -162,4 +218,4 @@ def is_compatible(fingerprint: dict[str, Any]) -> bool:
     return True
 
 
-__all__ = ["FINGERPRINT_FILE", "FORMAT_VERSION", "get_or_create_fingerprint", "is_compatible", "load_fingerprint"]
+__all__ = ["FINGERPRINT_FILE", "FORMAT_VERSION", "get_or_create_fingerprint", "host_webgl_config", "is_compatible", "load_fingerprint"]

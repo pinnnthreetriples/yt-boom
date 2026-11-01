@@ -15,6 +15,7 @@ from modules.session_heartbeat import (
     check_account_heartbeat,
     check_session_heartbeat,
     check_session_offline,
+    curl_proxy_url,
     fingerprint_headers,
     get_cookies_db_path,
     read_login_info_metadata,
@@ -183,6 +184,43 @@ class TestSessionHeartbeat(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Chrome", json.dumps(kwargs["headers"]))
         mock_session.get.assert_awaited_once()
         self.assertEqual(mock_session.get.await_args.args[0], "https://www.youtube.com/")
+
+    def test_curl_proxy_url_resolves_dns_on_the_proxy_and_accepts_every_proxy_form(self) -> None:
+        cases = {
+            "http://1.2.3.4:80": "http://1.2.3.4:80",
+            "http://user:pass@1.2.3.4:8080": "http://user:pass@1.2.3.4:8080",
+            "socks5://user:pw@1.2.3.4:1080": "socks5h://user:pw@1.2.3.4:1080",
+            "socks5://1.2.3.4:1080": "socks5h://1.2.3.4:1080",
+            "socks5h://1.2.3.4:1080": "socks5h://1.2.3.4:1080",
+            "socks5://user:p%40ss%3Aw%2Frd%23@[::1]:1080": "socks5h://user:p%40ss%3Aw%2Frd%23@[::1]:1080",
+            "1.2.3.4:8080:user:pw": "http://user:pw@1.2.3.4:8080",
+            "user:pw@1.2.3.4:8080": "http://user:pw@1.2.3.4:8080",
+            "1.2.3.4:8080": "http://1.2.3.4:8080",
+        }
+        for given, expected in cases.items():
+            with self.subTest(given=given):
+                self.assertEqual(curl_proxy_url(given), expected)
+        self.assertIsNone(curl_proxy_url(None))
+        self.assertIsNone(curl_proxy_url(""))
+
+    async def test_socks5_proxy_reaches_curl_as_socks5h(self) -> None:
+        self._create_mock_cookies_db([(".youtube.com", "LOGIN_INFO", "t", int(time.time() + 86400 * 30))])
+        mock_session = AsyncMock()
+        mock_session.get.return_value = MagicMock(status_code=200, text='{"LOGGED_IN": true}')
+        mock_session.__aenter__.return_value = mock_session
+
+        with patch("modules.session_heartbeat.AsyncSession", return_value=mock_session) as session_cls:
+            await check_session_heartbeat(self.session_path, proxy="socks5://user:p%40ss@1.2.3.4:1080")
+            self.assertEqual(session_cls.call_args.kwargs["proxy"], "socks5h://user:p%40ss@1.2.3.4:1080")
+            await check_session_heartbeat(self.session_path, proxy="1.2.3.4:8080:user:pw")
+            self.assertEqual(session_cls.call_args.kwargs["proxy"], "http://user:pw@1.2.3.4:8080")
+
+    async def test_invalid_proxy_is_reported_without_leaking_it(self) -> None:
+        self._create_mock_cookies_db([(".youtube.com", "LOGIN_INFO", "t", int(time.time() + 86400 * 30))])
+        with patch("modules.session_heartbeat.AsyncSession", side_effect=AssertionError("network used")):
+            res = await check_session_heartbeat(self.session_path, proxy="socks5://user:SECRETPW@nohost")
+        self.assertFalse(res.is_alive)
+        self.assertNotIn("SECRETPW", res.details)
 
     async def test_heartbeat_never_writes_to_the_cookie_db(self) -> None:
         future_ts = int(time.time() + 86400 * 30)

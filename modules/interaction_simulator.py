@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import math
 import random
+import re
 from typing import Any
 
 from loguru import logger
@@ -76,6 +77,8 @@ _NEIGHBORS: dict[str, str] = {
 _SHIFTED = frozenset('!@#$%^&*()_+{}|:"<>?~')
 _WORD_PAUSE_PROBABILITY = 0.05  # chance of a short hesitation between two words
 _WORD_PAUSE_MS = (250.0, 700.0)
+_PROTECTED_SPAN = re.compile(r"@[\w.\-]+|(?:https?://|www\.)\S+")  # mentions and links never get typos
+_LATE_NOTICE_CHARS = (1, 2)  # a transposition is noticed after this many more characters
 
 _HIT_TEST_JS = """(el, p) => {
     const top = document.elementFromPoint(p.x, p.y);
@@ -90,7 +93,8 @@ class InteractionError(RuntimeError):
 class InteractionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    typo_probability: float = Field(default=0.04, ge=0, le=0.5)
+    typo_probability: float = Field(default=0.04, ge=0, le=0.5)  # per letter; the share below is a subset of it
+    transposition_share: float = Field(default=0.35, ge=0, le=1)  # of those typos: swapped neighbours ("teh")
     key_delay_ms_min: int = Field(default=45, ge=5)
     key_delay_ms_max: int = Field(default=130, ge=5)
     key_hold_ms_min: int = Field(default=60, ge=10)
@@ -323,7 +327,11 @@ class InteractionSimulator:
         self._ensure_open(page)
         if not text:
             return
+        protected = [match.span() for match in _PROTECTED_SPAN.finditer(text)]
+        skip_until = 0
         for index, character in enumerate(text):
+            if index < skip_until:  # already typed by a transposition correction
+                continue
             if character == "\n":
                 press_fn = getattr(page.keyboard, "press", None)
                 hold_ms = int(self._lognormal_ms(self._cfg.key_hold_ms_min, self._cfg.key_hold_ms_max))
@@ -338,7 +346,17 @@ class InteractionSimulator:
                             await res
                 await asyncio.sleep(self._delay(self._cfg.key_delay_ms_min, self._cfg.key_delay_ms_max) * 1.8)
                 continue
-            if allow_typos is True and character.isalpha() and self._rng.random() < self._cfg.typo_probability:
+            if (
+                allow_typos is True
+                and character.isalpha()
+                and not self._in_spans(index, protected)
+                and self._rng.random() < self._cfg.typo_probability
+            ):
+                if self._can_transpose(text, index, protected) and self._rng.random() < self._cfg.transposition_share:
+                    lag = self._late_notice_chars(text, index, protected)
+                    await self._type_with_transposition(page, text, index, lag)
+                    skip_until = index + 2 + lag
+                    continue
                 await self._type_with_typo(page, character)
             else:
                 await self._press_character(page, character)
@@ -356,21 +374,71 @@ class InteractionSimulator:
         await asyncio.sleep(
             self._delay(self._cfg.backspace_delay_ms_min, self._cfg.backspace_delay_ms_max)
         )
-        press_fn = getattr(page.keyboard, "press", None)
-        hold_ms = int(self._lognormal_ms(self._cfg.key_hold_ms_min, self._cfg.key_hold_ms_max))
-        if callable(press_fn):
-            try:
-                res = press_fn("Backspace", delay=hold_ms)
-                if asyncio.iscoroutine(res):
-                    await res
-            except TypeError:
-                res = press_fn("Backspace")
-                if asyncio.iscoroutine(res):
-                    await res
+        await self._press_backspace(page)
         await asyncio.sleep(
             self._delay(self._cfg.backspace_delay_ms_min, self._cfg.backspace_delay_ms_max)
         )
         await self._press_character(page, character)
+
+    async def _press_backspace(self, page: Any) -> None:
+        press_fn = getattr(page.keyboard, "press", None)
+        if not callable(press_fn):  # a skipped Backspace would leave the typo in the posted text
+            raise InteractionError("keyboard.press is unavailable: cannot correct a typo")
+        hold_ms = int(self._lognormal_ms(self._cfg.key_hold_ms_min, self._cfg.key_hold_ms_max))
+        try:
+            res = press_fn("Backspace", delay=hold_ms)
+            if asyncio.iscoroutine(res):
+                await res
+        except TypeError:
+            res = press_fn("Backspace")
+            if asyncio.iscoroutine(res):
+                await res
+
+    @staticmethod
+    def _in_spans(index: int, spans: list[tuple[int, int]]) -> bool:
+        return any(start <= index < end for start, end in spans)
+
+    @classmethod
+    def _can_transpose(cls, text: str, index: int, spans: list[tuple[int, int]] | None = None) -> bool:
+        """True when the letters at `index` and `index + 1` are two different lowercase letters outside mentions/links."""
+        pair = text[index : index + 2]
+        if len(pair) < 2 or not all(c.isalpha() and not c.isupper() for c in pair) or pair[0] == pair[1]:
+            return False
+        return not any(cls._in_spans(i, spans or []) for i in (index, index + 1))
+
+    def _late_notice_chars(self, text: str, index: int, spans: list[tuple[int, int]]) -> int:
+        """How many characters after the swapped pair get typed before the slip is noticed (fewer at a line or link end).
+
+        Only characters typed with one keystroke and removed by one Backspace qualify: no newline, no emoji or
+        combining marks (code points above U+2000), nothing inside a mention or link.
+        """
+        wanted = self._rng.choice(_LATE_NOTICE_CHARS)
+        lag = 0
+        while lag < wanted:
+            position = index + 2 + lag
+            if position >= len(text) or text[position] == "\n" or ord(text[position]) >= 0x2000:
+                break
+            if self._in_spans(position, spans):
+                break
+            lag += 1
+        return lag
+
+    async def _type_with_transposition(self, page: Any, text: str, index: int, lag: int) -> None:
+        """Type `text[index + 1]` before `text[index]` plus `lag` more characters, notice, delete them all, retype."""
+        end = index + 2 + lag
+        wrong = text[index + 1] + text[index] + text[index + 2 : end]
+        logger.trace("Injecting transposition {!r} for {!r}", wrong, text[index:end])
+        for position, character in enumerate(wrong):
+            await self._press_character(page, character)
+            await asyncio.sleep(self._character_delay(character, wrong[position + 1 : position + 2]))
+        await asyncio.sleep(self._delay(self._cfg.backspace_delay_ms_min, self._cfg.backspace_delay_ms_max) * 2)
+        for _ in wrong:  # exactly one Backspace per typed character
+            await self._press_backspace(page)
+            await asyncio.sleep(self._lognormal_ms(self._cfg.key_delay_ms_min, self._cfg.key_delay_ms_max) / 1000)
+        await asyncio.sleep(self._delay(self._cfg.backspace_delay_ms_min, self._cfg.backspace_delay_ms_max))
+        for position in range(index, end):
+            await self._press_character(page, text[position])
+            await asyncio.sleep(self._character_delay(text[position], text[position + 1 : position + 2]))
 
     def _character_delay(self, character: str, following: str = "") -> float:
         """Seconds to wait after `character`: lognormal base, longer at word and sentence breaks and on Shift keys.

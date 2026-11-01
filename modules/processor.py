@@ -15,10 +15,11 @@ from modules.collector import CollectedItem
 
 _WHITESPACE = re.compile(r"\s+")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_NON_WORD = re.compile(r"[\W_]+")
 
 
 DEFAULT_STYLES: tuple[str, ...] = (
-    "friendly agreement and encouragement",
+    "casual remark that picks up one specific detail of the comment",
     "thoughtful and insightful follow-up question",
     "humorous, witty remark or light banter",
     "concise acknowledgement or brief nod",
@@ -26,12 +27,39 @@ DEFAULT_STYLES: tuple[str, ...] = (
 )
 
 
+ANTI_CLICHE_RULES = (
+    "Never open with stock praise or agreement such as 'В точку!', 'Полностью согласен с автором!', "
+    "'Spot on!', 'Great point!' or \"Couldn't agree more!\", and never sound like an assistant. "
+    "Start with your own concrete reaction, the way an ordinary viewer would."
+)
+
+# Paraphrases whose character-3gram Jaccard overlap reaches this value count as the same text
+# (measured: copies 0.9+, real paraphrases 0.2-0.55, unrelated comments below 0.2).
+SIMILARITY_LIMIT = 0.6
+_RECENT_VARIANTS_MAX = 20
+_RECENT_VARIANTS_IN_PROMPT = 5
+_RETRY_HINT = (
+    "\n\nThe previous rewrite was too similar to the original or to the used ones. "
+    "Use a clearly different sentence structure and vocabulary."
+)
+
 PARAPHRASE_SYSTEM_PROMPT = (
     "You rewrite a short YouTube comment so that it says exactly the same thing in different words. "
     "Keep the language, tone, approximate length, emoji, links and every @mention unchanged. "
     "Do not add or drop facts. Reply with the rewritten comment only, without quotes or explanations."
 )
 _MENTION = re.compile(r"@[\w.\-]+")
+
+
+def _trigrams(text: str) -> set[str]:
+    padded = f" {_NON_WORD.sub(' ', text.lower()).strip()} "
+    return {padded[i : i + 3] for i in range(len(padded) - 2)} if len(padded) > 2 else set()
+
+
+def text_similarity(first: str, second: str) -> float:
+    """Jaccard overlap of character 3-grams (case and punctuation ignored): 1.0 for copies, ~0 for unrelated text."""
+    a, b = _trigrams(first), _trigrams(second)
+    return len(a & b) / len(a | b) if a and b else 0.0
 
 
 class ProcessorError(RuntimeError):
@@ -131,7 +159,8 @@ class DeepSeekProcessor:
         self._api = api_settings
         self._text = text_settings
         self._rng = rng or random.Random()
-        self._recent_variants: deque[str] = deque(maxlen=5)
+        self._recent_variants: deque[str] = deque(maxlen=_RECENT_VARIANTS_MAX)
+        self.fallback_count = 0
         self._client = AsyncOpenAI(
             api_key=api_settings.api_key,
             base_url=api_settings.base_url,
@@ -143,34 +172,56 @@ class DeepSeekProcessor:
         await self._client.close()
 
     async def paraphrase(self, text: str) -> str:
-        """Reword `text` keeping its meaning; returns `text` unchanged if the model fails or drops a mention."""
-        prompt = f"Comment:\n{text}"
-        if self._recent_variants:
-            prompt += "\n\nAlready used, choose different wording:\n" + "\n".join(f"- {v}" for v in self._recent_variants)
-        try:
-            response = await self._client.chat.completions.create(
-                model=self._api.model,
-                messages=[
-                    {"role": "system", "content": PARAPHRASE_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=max(float(self._api.temperature), 0.9),
-                max_tokens=self._api.max_tokens,
-                stream=False,
-            )
-        except Exception as exc:
-            logger.warning("Перефразирование не удалось ({}); отправляем шаблон как есть", exc)
-            return text
+        """Reword `text` keeping its meaning, with one retry when the result is unusable or a near-copy.
 
-        content = self._extract_text(response)
-        variant = _WHITESPACE.sub(" ", content.strip().strip("\"'«»“”")).strip() if content else ""
+        A variant is unusable when it is empty, too long, drops a mention, or reaches SIMILARITY_LIMIT against the
+        template or a recently produced variant. When no usable variant comes out (API error, two bad results) the
+        template itself is returned and logged loudly; callers still post it.
+        """
         mentions = [m.rstrip(".-") for m in _MENTION.findall(text)]
         limit = max(self._text.max_output_length, int(len(text) * 1.5))
-        if not variant or len(variant) > limit or any(m not in variant for m in mentions):
-            logger.warning("Перефразирование дало непригодный текст; отправляем шаблон как есть")
-            return text
-        self._recent_variants.append(variant)
-        return variant
+        for attempt in (1, 2):
+            prompt = f"Comment:\n{text}"
+            if self._recent_variants:
+                used = list(self._recent_variants)[-_RECENT_VARIANTS_IN_PROMPT:]
+                prompt += "\n\nAlready used, choose different wording:\n" + "\n".join(f"- {v}" for v in used)
+            if attempt == 2:
+                prompt += _RETRY_HINT
+            try:
+                response = await self._client.chat.completions.create(
+                    model=self._api.model,
+                    messages=[
+                        {"role": "system", "content": PARAPHRASE_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=max(float(self._api.temperature), 0.9),
+                    max_tokens=self._api.max_tokens,
+                    stream=False,
+                )
+            except Exception as exc:
+                logger.warning("Перефразирование не удалось ({})", exc)
+                break
+
+            content = self._extract_text(response)
+            variant = _WHITESPACE.sub(" ", content.strip().strip("\"'«»“”")).strip() if content else ""
+            if not variant or len(variant) > limit or any(m not in variant for m in mentions):
+                logger.warning("Перефразирование дало непригодный текст (попытка {}/2)", attempt)
+                continue
+            # No await between this check and the append: parallel workers always see each other's finished variants.
+            if any(text_similarity(variant, other) >= SIMILARITY_LIMIT for other in (text, *self._recent_variants)):
+                logger.warning("Перефразирование слишком похоже на шаблон или недавний ответ (попытка {}/2)", attempt)
+                continue
+            self._recent_variants.append(variant)
+            return variant
+
+        self.fallback_count += 1
+        logger.error(
+            "Перефразирование не дало уникального текста: шаблон уйдёт БЕЗ ИЗМЕНЕНИЙ (случай №{}); "
+            "добавьте больше разных шаблонов в custom_replies",
+            self.fallback_count,
+        )
+        self._recent_variants.append(text)  # later paraphrases must not echo what is about to be posted
+        return text
 
     async def generate(self, item: CollectedItem, *, style: str | None = None) -> str:
         if not item.text.strip():
@@ -200,7 +251,7 @@ class DeepSeekProcessor:
             prompt = f"{prompt}\nTone/Style: {chosen_style}"
 
         messages = [
-            {"role": "system", "content": self._text.system_prompt.strip()},
+            {"role": "system", "content": f"{self._text.system_prompt.strip()}\n\n{ANTI_CLICHE_RULES}"},
             {"role": "user", "content": prompt.strip()},
         ]
 
@@ -294,10 +345,12 @@ class DeepSeekProcessor:
 
 
 __all__ = [
+    "ANTI_CLICHE_RULES",
     "DEFAULT_STYLES",
     "DeepSeekProcessor",
     "ProcessorError",
     "normalize_text",
     "resolve_reply_text",
     "should_paraphrase",
+    "text_similarity",
 ]
