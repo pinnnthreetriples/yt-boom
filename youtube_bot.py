@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from loguru import logger
 
@@ -336,17 +336,22 @@ async def register_account_lines(
     reported as skipped instead of overwriting its credentials.
     """
     result = AccountImportResult()
+    # a renamed account keeps its e-mail, so a repeated line is recognised by the e-mail too, not only by the name
+    known_emails = {a.email.lower() for a in await db.list_accounts() if a.email} if skip_existing else set()
     for number, raw in enumerate(lines, start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         try:
             if skip_existing:
-                name = parse_account_line(line).default_name
-                if await db.get_account(name) is not None:
+                parsed = parse_account_line(line)
+                if parsed.email.lower() in known_emails or await db.get_account(parsed.default_name) is not None:
                     result.skipped.append((number, "аккаунт уже есть"))
                     continue
-            result.added.append(await _register_credentials_account(db, cfg, line))
+            account = await _register_credentials_account(db, cfg, line)
+            result.added.append(account)
+            if account.email:
+                known_emails.add(account.email.lower())
         except (ValueError, RecordNotFoundError) as exc:
             result.errors.append((number, str(exc)))  # the line itself holds a password: it is never echoed
     return result
@@ -361,8 +366,9 @@ async def import_accounts_file_cli(
     """
     try:
         lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
-    except OSError as exc:
-        print(f"[ERROR] Cannot read {path}: {exc}", file=sys.stderr)
+    except (OSError, UnicodeDecodeError) as exc:
+        reason = "not UTF-8 text (save the file as UTF-8)" if isinstance(exc, UnicodeDecodeError) else exc
+        print(f"[ERROR] Cannot read {path}: {reason}", file=sys.stderr)
         return False
     cfg = load_config(config_path)
     if headless is not None:
@@ -481,7 +487,7 @@ def warm_candidates(accounts: Iterable[AccountRecord], names: Iterable[str] | No
 
 
 async def warm_accounts(
-    db: Database, cfg: AppConfig, targets: list[AccountRecord], duration: float = 45.0, report: Any = print
+    db: Database, cfg: AppConfig, targets: list[AccountRecord], duration: float = 45.0, report: Callable[[str], None] = print
 ) -> list[WarmUpResult]:
     """Warm `targets` up one after another (a pause between them); `report` gets one line per account."""
     warmer = AccountWarmer(cfg.browser)
@@ -500,7 +506,7 @@ async def warm_selected_cli(
     names: list[str],
     duration: float = 45.0,
     headless: bool | None = None,
-    report: Any = print,
+    report: Callable[[str], None] = print,
 ) -> list[WarmUpResult]:
     """Wizard «прогрев выбранных»: the accounts called `names`, in that order.
 
@@ -512,18 +518,21 @@ async def warm_selected_cli(
     if headless is not None:
         cfg.browser.headless = headless
     results: list[WarmUpResult] = []
+    worked = False  # something already ran: the next account waits first (a skipped one costs no pause)
     async with Database(cfg.app.db_path) as db:
-        for index, name in enumerate(names):
+        for name in names:
             account = await db.get_account(name)
-            if account is not None and index and (account.auth_status != "authenticated" or warm_candidates([account])):
+            needs_sign_in = account is not None and account.auth_status != "authenticated"
+            if account is not None and worked and (needs_sign_in or warm_candidates([account])):
                 await asyncio.sleep(_pause_between_accounts(account))
             if account is None:
                 results.append(WarmUpResult(name, False, None, 0.0, "account not found"))
-            elif account.auth_status != "authenticated":
+            elif needs_sign_in:
+                worked = True
                 ok = await _authenticate_account(db, cfg, account)
-                details = "signed in, intro warm-up done" if ok else "sign-in failed"
-                results.append(WarmUpResult(account.name, ok, None, 0.0, details))
+                results.append(WarmUpResult(account.name, ok, None, 0.0, "signed in" if ok else "sign-in failed"))
             elif warm_candidates([account]):
+                worked = True
                 results.extend(await warm_accounts(db, cfg, [account], duration, report=lambda _line: None))
             else:
                 results.append(WarmUpResult(account.name, True, None, 0.0, "skipped: past quarantine and ageing"))

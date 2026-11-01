@@ -46,10 +46,6 @@ class LifecycleView:
     quota_done: int | None = None
     quota_limit: int | None = None
 
-    @property
-    def restricted(self) -> bool:
-        return self.stage == "restricted"
-
 
 def _parse_utc(value: str | None) -> datetime | None:
     if not value:

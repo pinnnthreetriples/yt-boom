@@ -770,8 +770,19 @@ def _read_account_paste() -> list[str]:
     while True:
         line = _read_secret_line(f" {len(lines) + 1:>3} › ")
         if not line.strip():
+            _drain_console_input()
             return lines
         lines.append(line)
+
+
+def _drain_console_input() -> None:
+    """Drop what is still unread after the paste ended (a blank line in the middle): it must not feed the next prompt."""
+    if not _pools_console_paste():
+        return
+    import msvcrt
+    time.sleep(0.2)  # the rest of a long paste is still arriving
+    while msvcrt.kbhit():
+        msvcrt.getwch()
 
 
 def _read_accounts_file() -> list[str] | None:
@@ -781,6 +792,9 @@ def _read_accounts_file() -> list[str] | None:
         return None
     try:
         return Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except UnicodeDecodeError:
+        tui.status_line("err", "Файл не в кодировке UTF-8 — сохраните его как UTF-8")
+        return None
     except OSError as exc:
         tui.status_line("err", f"Не удалось прочитать файл: {exc.strerror or exc.__class__.__name__}")
         return None
@@ -843,8 +857,10 @@ def _setup_import(config_path: Path) -> tuple[str, str] | None:
 
     try:
         result = _setup_register(config_path, lines)
+    except KeyboardInterrupt:
+        return "warn", "Импорт прерван — часть аккаунтов могла добавиться, проверьте список"
     except Exception as exc:  # a broken DB or config: the lines are not in the message
-        return "err", f"Импорт не выполнен: {exc.__class__.__name__}"
+        return "err", f"Импорт не выполнен ({exc.__class__.__name__}) — часть аккаунтов могла добавиться, проверьте список"
     safe_print()
     for kind, text in format_import_summary(len(result.added), result.skipped, result.errors, account_lines):
         tui.status_line(kind, text)
@@ -888,7 +904,7 @@ def _setup_run_warmup(config_path: Path, names: list[str] | None = None) -> tupl
     except KeyboardInterrupt:
         return "warn", "Прогрев прерван"
     except Exception as exc:
-        return "err", f"Прогрев не удался: {exc.__class__.__name__}: {exc}"
+        return "err", f"Прогрев не удался: {exc.__class__.__name__} (подробности в логе)"
     return format_warm_summary(results)
 
 

@@ -42,7 +42,7 @@ def parse_warm_selection(text: str, count: int) -> list[int]:
     picked: list[int] = []
     for token in answer.replace(",", " ").split():
         if not token.isdigit():
-            raise ValueError(f"«{token}» — не номер. Введите a, n или номера через пробел")
+            raise ValueError("Не распознано. Введите a, n или номера через пробел")  # the token is never echoed
         number = int(token)
         if not 1 <= number <= count:
             raise ValueError(f"Номер {number} вне списка (1–{count})")
@@ -53,7 +53,7 @@ def parse_warm_selection(text: str, count: int) -> list[int]:
 
 def clean_pasted_lines(lines: Iterable[str]) -> list[str]:
     """Source lines with the BOM and line ends removed; blank lines and comments stay, so line numbers match the source."""
-    return [line.lstrip("﻿").rstrip("\r\n") for line in lines]
+    return [line.lstrip("\ufeff").rstrip("\r\n") for line in lines]
 
 
 def count_account_lines(lines: Iterable[str]) -> int:
@@ -156,9 +156,11 @@ def lifecycle_rows(
     for acc in accounts:
         view = AccountLifecycleEngine.summarize(acc, now)
         alive = session_alive(acc)
-        last = format_ago(acc.last_warmup_at, now) if acc.last_warmup_at else "—"
+        last = format_ago(acc.last_warmup_at, now)
         if view.age_hours is None:  # not signed in yet: no age, no quota
             quota, pause, pause_style = "—", "нужен вход", "warn"
+        elif not acc.is_active:  # switched off: the orchestrator never picks it
+            quota, pause, pause_style = f"{view.quota_done}/{view.quota_limit}", "отключён", "dim"
         else:
             quota = f"{view.quota_done}/{view.quota_limit}"
             pause, pause_style = _pause_text(acc, view.stage, now)
