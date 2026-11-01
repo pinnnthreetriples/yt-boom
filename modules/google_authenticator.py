@@ -13,7 +13,7 @@ from loguru import logger
 from playwright.async_api import Error as PlaywrightError
 
 from modules.interaction_simulator import InteractionError, InteractionSimulator
-from modules.page_helpers import first_visible
+from modules.page_helpers import CONSENT_REJECT_SELECTORS, SIGN_IN_LINK, first_visible
 from modules.totp_helper import generate_fresh_totp, get_remaining_seconds
 
 YOUTUBE_HOME_URL = "https://www.youtube.com/?hl=en&gl=US"
@@ -26,7 +26,11 @@ YOUTUBE_HOSTS = frozenset({"www.youtube.com", "youtube.com", "m.youtube.com"})
 
 
 def _buttons(*labels: str) -> tuple[str, ...]:
-    """`button` and `[role=button]` selectors for each label (Google renders both)."""
+    """`button` and `[role=button]` selectors for each label (Google renders both).
+
+    Text matching is allowed ONLY for the five constants below (see the note above them): never use this helper for
+    YouTube UI. `tests/test_selector_guard.py` allowlists exactly this helper and those constants.
+    """
     return tuple(
         selector
         for label in labels
@@ -34,7 +38,8 @@ def _buttons(*labels: str) -> tuple[str, ...]:
     )
 
 
-SIGN_IN_LINK = 'ytd-masthead #buttons a[href*="ServiceLogin"]'
+# Selectors are structural only (ids, names, types, data-*): the accounts run in any UI language and Google localizes
+# visible text and aria-label. Without Next the flow presses Enter (see _enter_value).
 NEXT_BUTTONS = (
     'button#passwordNext',
     'button#identifierNext',
@@ -42,19 +47,8 @@ NEXT_BUTTONS = (
     '#passwordNext button',
     '#identifierNext button',
     '#totpNext button',
-    'button:has-text("Next")',
-    'button:has-text("Далее")',
-    '[role="button"]:has-text("Next")',
-    '[role="button"]:has-text("Далее")',
 )
-CONSENT_REJECT = (
-    'button[aria-label*="Reject all"]',
-    'button:has-text("Reject all")',
-    'button:has-text("Отклонить все")',
-    'button[aria-label*="Accept all"]',
-    'button:has-text("Accept all")',
-    'button:has-text("Принять все")',
-)
+CONSENT_REJECT = CONSENT_REJECT_SELECTORS
 EMAIL_INPUT = ('input#identifierId', 'input[name="identifier"]', 'input[type="email"]:not([name*="recovery"]):not([id*="recovery"])')
 PASSWORD_INPUT = ('input[type="password"]', 'input[name="Passwd"]')
 TOTP_INPUT = ('input#totpPin',)
@@ -62,19 +56,18 @@ TOTP_TRUST_CHECKBOX = ('input#trustDevice', 'input[name="TrustDevice"]', 'input[
 KPE_INPUT = ('input#knowledge-preregistered-email-response',)
 CAPTCHA_MARKERS = ('img#captchaimg', 'iframe[src*="recaptcha"]')
 ERROR_BLOCKS = ('[role="alert"]', 'div[jsname="B34EJ"]', '[aria-live="assertive"] [jsname="B34EJ"]')
+AUTHENTICATOR_OPTION = ('div[data-challengetype="6"]',)
+# DELIBERATE, DO NOT "FIX" BLINDLY: these five are the only text matchers allowed in modules/*.py. They target
+# accounts.google.com sign-in / speedbump screens (not YouTube UI), which have no structural handle, and the login must
+# stay fully automatic. Labels cover en and ru only; any other language falls through to the "неизвестный экран" error.
+# Never match "Continue" on the passkey screen: it opens the native Windows Hello prompt.
 TRY_ANOTHER_WAY = _buttons("Try another way", "Другой способ")
-AUTHENTICATOR_OPTION = (
-    'div[data-challengetype="6"]',
-    '[role="link"]:has-text("Google Authenticator")',
-    'li:has-text("Google Authenticator")',
-)
 USE_ANOTHER_ACCOUNT = (
     '[role="link"]:has-text("Use another account")',
     'li:has-text("Use another account")',
     '[role="link"]:has-text("Использовать другой аккаунт")',
     'li:has-text("Использовать другой аккаунт")',
 )
-# Only refusals: "Continue" on the passkey screen would open the native Windows Hello prompt.
 DECLINE_BUTTONS = _buttons("Not now", "Не сейчас", "Skip", "Пропустить", "No thanks", "Нет, спасибо", "Cancel", "Отмена")
 WAS_IT_YOU_BUTTONS = _buttons("Yes, it was me", "Да, это я")
 ACKNOWLEDGE_BUTTONS = _buttons("I understand", "Я понимаю") + ('input[type="submit"][value="I understand"]',)
