@@ -51,7 +51,7 @@ Then read this file fully before doing anything else in this session.
 - Account lifecycle engine (`modules/lifecycle_engine.py`): quarantine 0-24h, aging 24-48h (no comments), probation 48-72h (1/day, 3h cooldown), mature 72h+ (5/day, 45-90 min); 3 consecutive errors restrict an account; `--lifecycle` and `--warm-quarantined` CLI
 - Wizard stage 1 «Аккаунты» menu: `5` import accounts (file or pasted `login:password:TOTP` lines, then pick who to warm up), `6` warm up all quarantine/aging accounts, `8` read-only lifecycle table (`modules/account_menu_logic.py`)
 - Channel profile (`modules/profile_manager.py`): wizard stage 1 `9` «Профиль канала» → account (Space/Enter) → card with nickname / description / avatar edit rows saved as a DB draft (`accounts.profile_*`), «Применить на YouTube» publishes it through YouTube Studio in the account's own Camoufox profile; `--apply-profile <name>` does the same from the CLI
-- Comprehensive automated test suite (659 passing unit and integration tests)
+- Comprehensive automated test suite (709 passing unit and integration tests)
 
 **Not yet built:**
 - Real-time WebRTC audio stream generation for interactive live events
