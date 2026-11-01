@@ -290,16 +290,23 @@ class MultiAccountOrchestrator:
             logger.info("[ВИДИМОСТЬ] Ожидание проверки видимости ответов: {}", len(tasks))
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _cancel_visibility_checks(self) -> None:
+        tasks = list(self._visibility_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     def _gate_account(self, acc: AccountRecord) -> None:
         """Stop `acc` for this run: its remaining videos stay in the pool for the next one."""
         if acc.id in self._gated_accounts:
             return
         self._gated_accounts.add(acc.id)
-        logger.info(
-            "[LIFECYCLE] Account {} reached its comment limits: a run leaves about one comment per account, "
-            "the remaining videos stay pending for the next run",
-            acc.name,
-        )
+        if self._account_mode == "each":  # in "share" mode nothing stops: the next pick takes another account
+            logger.info(
+                "[LIFECYCLE] Account {} reached its comment limits: a run leaves about one comment per account, "
+                "the remaining videos stay pending for the next run",
+                acc.name,
+            )
 
     async def _may_comment_now(self, acc: AccountRecord) -> bool:
         """Re-check an account that was picked earlier (mode "each") against its current counters in the database."""
@@ -601,6 +608,9 @@ class MultiAccountOrchestrator:
         """Run the video pool, then wait for the warm-up sessions the lifecycle gate started."""
         try:
             return await self._execute_video_pool(max_comments_per_video, comments_target_per_video)
+        except BaseException:
+            await self._cancel_visibility_checks()  # leaving on an error: do not wait out the check delay
+            raise
         finally:
             await self._finish_warmups()
             await self._finish_visibility_checks()
@@ -695,9 +705,7 @@ class MultiAccountOrchestrator:
         for task in list(self._warmup_tasks.values()):
             task.cancel()
         await asyncio.gather(*self._warmup_tasks.values(), return_exceptions=True)
-        for task in list(self._visibility_tasks):
-            task.cancel()
-        await asyncio.gather(*self._visibility_tasks, return_exceptions=True)
+        await self._cancel_visibility_checks()
         await self._close_runners()
         if hasattr(self._collector, "close"):
             try:

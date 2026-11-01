@@ -226,6 +226,9 @@ class TestProcessor(unittest.TestCase):
         self.assertLess(text_similarity(self.TEMPLATE, self.PARAPHRASE), 0.6)
         self.assertLess(text_similarity(self.TEMPLATE, "а где купить такой же? ссылку скиньте кто знает"), 0.3)
         self.assertEqual(text_similarity("", "что-то"), 0.0)
+        self.assertEqual(text_similarity("😂😂", "😂😂"), 1.0)  # no trigrams, but the same text
+        self.assertEqual(text_similarity("!!!", " !!! "), 1.0)
+        self.assertEqual(text_similarity("😂", "🔥"), 0.0)
 
     def test_paraphrase_retries_once_when_too_close_to_the_template(self):
         out, create = self._paraphrase(self.TEMPLATE, self.TEMPLATE + "!", self.PARAPHRASE, calls=1)

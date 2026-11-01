@@ -140,7 +140,7 @@ class YouTubeRunner:
         if self._camoufox is not None:  # the page was closed under us: release the old browser and its profile lock first
             await self.close()
         self._prepare_dirs()
-        options = self._launch_options()
+        options = await asyncio.to_thread(self._launch_options)  # fingerprint file and GPU table reads must not stall the loop
         self._camoufox = AsyncCamoufox(**options)
         try:
             self._context = await self._camoufox.__aenter__()

@@ -13,6 +13,7 @@ from loguru import logger
 FINGERPRINT_FILE = "fingerprint.json"
 FORMAT_VERSION = 1
 HOST_GPU_FILE = "_host_gpu.json"  # next to the account profiles; delete it to re-detect after a GPU or driver change
+_KNOWN_WEBGL_GPUS: dict[tuple[str, str], bool] = {}  # host GPU -> does Camoufox have WebGL data for it
 WINDOWS_TASKBAR_PX = 48  # Windows 11 taskbar height; camoufox's fix_screen_no_taskbar assumes Windows 10's 40
 
 # Firefox hands pages a sanitized GPU "bucket" through plain getParameter(RENDERER) that Camoufox does not spoof,
@@ -129,17 +130,18 @@ def host_webgl_config(session_dir: Path, target_os: str = "windows") -> tuple[st
     if not gpu:
         return None
     pair = (gpu["vendor"], gpu["renderer"])
-    try:
-        from camoufox.webgl import firefox_gpus
+    known = _KNOWN_WEBGL_GPUS.get(pair)
+    if known is None:  # fpgen's GPU table takes ~0.5 s to load: ask once per GPU, and warn once
+        try:
+            from camoufox.webgl import firefox_gpus
 
-        known = pair in firefox_gpus("windows")
-    except Exception as exc:
-        logger.warning("Не удалось сверить GPU хоста с данными Camoufox: {}", exc)
-        return None
-    if not known:
-        logger.warning("Camoufox не знает WebGL-параметров GPU хоста {!r}: GPU не будет закреплён", pair[1])
-        return None
-    return pair
+            known = _KNOWN_WEBGL_GPUS[pair] = pair in firefox_gpus("windows")
+        except Exception as exc:
+            logger.warning("Не удалось сверить GPU хоста с данными Camoufox: {}", exc)
+            return None
+        if not known:
+            logger.warning("Camoufox не знает WebGL-параметров GPU хоста {!r}: GPU не будет закреплён", pair[1])
+    return pair if known else None
 
 
 def _fix_windows_taskbar(fingerprint: dict[str, Any]) -> None:

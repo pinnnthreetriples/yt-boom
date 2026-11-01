@@ -59,7 +59,9 @@ def _trigrams(text: str) -> set[str]:
 def text_similarity(first: str, second: str) -> float:
     """Jaccard overlap of character 3-grams (case and punctuation ignored): 1.0 for copies, ~0 for unrelated text."""
     a, b = _trigrams(first), _trigrams(second)
-    return len(a & b) / len(a | b) if a and b else 0.0
+    if not a or not b:  # emoji- or punctuation-only text has no trigrams: identical text still counts as a copy
+        return 1.0 if first.strip().lower() == second.strip().lower() and first.strip() else 0.0
+    return len(a & b) / len(a | b)
 
 
 class ProcessorError(RuntimeError):

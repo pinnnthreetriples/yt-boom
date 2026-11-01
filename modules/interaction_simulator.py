@@ -5,6 +5,7 @@ import inspect
 import math
 import random
 import re
+import unicodedata
 from typing import Any
 
 from loguru import logger
@@ -350,6 +351,7 @@ class InteractionSimulator:
                 allow_typos is True
                 and character.isalpha()
                 and not self._in_spans(index, protected)
+                and not self._marks_adjacent(text, index, index + 1)
                 and self._rng.random() < self._cfg.typo_probability
             ):
                 if self._can_transpose(text, index, protected) and self._rng.random() < self._cfg.transposition_share:
@@ -398,11 +400,22 @@ class InteractionSimulator:
     def _in_spans(index: int, spans: list[tuple[int, int]]) -> bool:
         return any(start <= index < end for start, end in spans)
 
+    @staticmethod
+    def _marks_adjacent(text: str, first: int, last: int) -> bool:
+        """True when a combining mark sits right before `first` or right after `last` (or inside): no wrong keystroke there,
+        whatever a Backspace removes (one code point or a whole cluster)."""
+        return any(
+            0 <= i < len(text) and unicodedata.category(text[i]).startswith("M")
+            for i in range(first - 1, last + 2)
+        )
+
     @classmethod
     def _can_transpose(cls, text: str, index: int, spans: list[tuple[int, int]] | None = None) -> bool:
         """True when the letters at `index` and `index + 1` are two different lowercase letters outside mentions/links."""
         pair = text[index : index + 2]
         if len(pair) < 2 or not all(c.isalpha() and not c.isupper() for c in pair) or pair[0] == pair[1]:
+            return False
+        if cls._marks_adjacent(text, index, index + 1):
             return False
         return not any(cls._in_spans(i, spans or []) for i in (index, index + 1))
 
@@ -410,13 +423,16 @@ class InteractionSimulator:
         """How many characters after the swapped pair get typed before the slip is noticed (fewer at a line or link end).
 
         Only characters typed with one keystroke and removed by one Backspace qualify: no newline, no emoji or
-        combining marks (code points above U+2000), nothing inside a mention or link.
+        code points above U+2000, nothing inside a mention or link, and no character that is, or sits next to,
+        a combining mark.
         """
         wanted = self._rng.choice(_LATE_NOTICE_CHARS)
         lag = 0
         while lag < wanted:
             position = index + 2 + lag
             if position >= len(text) or text[position] == "\n" or ord(text[position]) >= 0x2000:
+                break
+            if self._marks_adjacent(text, position, position):
                 break
             if self._in_spans(position, spans):
                 break
