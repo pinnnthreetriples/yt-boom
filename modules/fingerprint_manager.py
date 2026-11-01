@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +12,18 @@ from loguru import logger
 
 FINGERPRINT_FILE = "fingerprint.json"
 FORMAT_VERSION = 1
+HOST_GPU_FILE = "_host_gpu.json"  # next to the account profiles; delete it to re-detect after a GPU or driver change
+
+# Firefox hands pages a sanitized GPU "bucket" through plain getParameter(RENDERER) that Camoufox does not spoof,
+# only UNMASKED_RENDERER. A pinned GPU that differs from the host bucket makes the two disagree, so we read the bucket.
+_HOST_RENDERER_PROBE = """
+import json
+from camoufox.sync_api import Camoufox
+
+with Camoufox(headless=True, os="windows") as browser:
+    page = browser.new_page()
+    print(json.dumps(page.evaluate("() => { const g = document.createElement('canvas').getContext('webgl'); return g.getParameter(g.RENDERER); }")))
+"""
 
 _OS_MARKERS: tuple[tuple[str, str], ...] = (
     ("Windows", "windows"),
@@ -56,8 +71,47 @@ def _write_atomic(path: Path, fingerprint: dict[str, Any], target_os: str) -> No
     os.replace(tmp, path)  # a crash mid-write never leaves a half-written file under the real name
 
 
+def _probe_host_renderer() -> str | None:
+    """The plain WebGL RENDERER string of this machine, read in a throwaway headless Camoufox (own process: no event loop clash)."""
+    try:
+        done = subprocess.run([sys.executable, "-c", _HOST_RENDERER_PROBE], capture_output=True, text=True, timeout=120)
+        renderer = json.loads(done.stdout.strip().splitlines()[-1])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
+        logger.warning("Не удалось определить GPU хоста: {}", exc)
+        return None
+    return renderer if isinstance(renderer, str) else None
+
+
+def host_gpu(cache_dir: Path) -> dict[str, str] | None:
+    """The GPU (vendor, renderer) Firefox shows on this host, for fpgen's `gpu` condition; None when it cannot be told.
+
+    Detected once and kept in `cache_dir/_host_gpu.json`.
+    """
+    path = Path(cache_dir) / HOST_GPU_FILE
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(cached, dict) and cached.get("vendor") and cached.get("renderer"):
+            return {"vendor": str(cached["vendor"]), "renderer": str(cached["renderer"])}
+    except (OSError, ValueError):
+        pass
+    renderer = _probe_host_renderer()
+    match = re.match(r"ANGLE \(([^,]+),", renderer or "")
+    if renderer is None or match is None:
+        logger.warning("GPU хоста не распознан ({!r}): отпечаток не будет привязан к нему", renderer)
+        return None
+    gpu = {"vendor": f"Google Inc. ({match.group(1)})", "renderer": renderer}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(gpu), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Не удалось сохранить GPU хоста {}: {}", path, exc)
+    return gpu
+
+
 def get_or_create_fingerprint(session_dir: Path, target_os: str = "windows", *, force_new: bool = False) -> dict[str, Any]:
     """Pin the device fingerprint (GPU, audio, screen) to the account: generate it once and reuse it on every start.
+
+    On a Windows host a new Windows fingerprint takes the host's own GPU so plain and unmasked WebGL agree.
 
     The file stores the OS it was generated for (older flat files are read as is). A different requested OS or
     `force_new` makes a new fingerprint: an identity must not claim Windows on a macOS profile.
@@ -72,7 +126,15 @@ def get_or_create_fingerprint(session_dir: Path, target_os: str = "windows", *, 
 
     from camoufox.fingerprints import generate_fingerprint
 
-    fingerprint = generate_fingerprint(os=target_os)
+    fingerprint = None
+    gpu = host_gpu(path.parent.parent) if target_os.lower() == "windows" and sys.platform == "win32" else None
+    if gpu:
+        try:
+            fingerprint = generate_fingerprint(os=target_os, gpu=gpu)
+        except Exception as exc:
+            logger.warning("Нет отпечатка с GPU хоста {}: {}. Беру случайный", gpu["renderer"], exc)
+    if fingerprint is None:
+        fingerprint = generate_fingerprint(os=target_os)
     try:
         _write_atomic(path, fingerprint, target_os)
     except OSError as exc:

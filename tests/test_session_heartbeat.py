@@ -136,40 +136,50 @@ class TestSessionHeartbeat(unittest.IsolatedAsyncioTestCase):
         payload = {"format": 1, "os": "windows", "fingerprint": {"navigator": navigator}}
         (self.session_path / "fingerprint.json").write_text(json.dumps(payload), encoding="utf-8")
 
-    def test_fingerprint_headers_follow_the_pinned_fingerprint(self) -> None:
+    def test_fingerprint_headers_carry_the_installed_firefox_version(self) -> None:
         self._write_fingerprint({
             "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
             "languages": ["es-ES", "en-US", "en"],
         })
-        headers = fingerprint_headers(self.session_path)
-        self.assertIn("Firefox/146.0", headers["User-Agent"])
-        self.assertEqual(headers["Accept-Language"], "es-ES,en-US;q=0.7,en;q=0.3")
+        with patch("modules.session_heartbeat._installed_firefox_major", return_value="156"):
+            headers = fingerprint_headers(self.session_path)
+        self.assertEqual(
+            headers["User-Agent"], "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:156.0) Gecko/20100101 Firefox/156.0"
+        )
 
-    def test_fingerprint_headers_two_languages_match_firefox_default(self) -> None:
-        self._write_fingerprint({"userAgent": "UA", "languages": ["en-US", "en"]})
-        self.assertEqual(fingerprint_headers(self.session_path)["Accept-Language"], "en-US,en;q=0.5")
+    def test_fingerprint_headers_keep_the_pinned_ua_when_the_version_is_unknown(self) -> None:
+        self._write_fingerprint({"userAgent": "Mozilla/5.0 Firefox/146.0"})
+        with patch("modules.session_heartbeat._installed_firefox_major", return_value=None):
+            self.assertEqual(fingerprint_headers(self.session_path)["User-Agent"], "Mozilla/5.0 Firefox/146.0")
 
-    def test_fingerprint_headers_empty_without_fingerprint(self) -> None:
-        self.assertEqual(fingerprint_headers(self.session_path), {})
+    def test_accept_language_follows_the_configured_locale_not_the_fingerprint(self) -> None:
+        self._write_fingerprint({"userAgent": "UA", "languages": ["es-ES", "en-US", "en"]})
+        self.assertEqual(fingerprint_headers(self.session_path)["Accept-Language"], "en-US,en;q=0.9")
+        self.assertEqual(fingerprint_headers(self.session_path, "de-DE")["Accept-Language"], "de-DE,de;q=0.9")
+        self.assertEqual(fingerprint_headers(self.session_path, "en")["Accept-Language"], "en")
+
+    def test_fingerprint_headers_without_fingerprint_only_set_the_language(self) -> None:
+        self.assertEqual(fingerprint_headers(self.session_path), {"Accept-Language": "en-US,en;q=0.9"})
         (self.session_path / "fingerprint.json").write_text("{broken", encoding="utf-8")
-        self.assertEqual(fingerprint_headers(self.session_path), {})
+        self.assertEqual(fingerprint_headers(self.session_path), {"Accept-Language": "en-US,en;q=0.9"})
 
     async def test_request_looks_like_the_profile_firefox(self) -> None:
         future_ts = int(time.time() + 86400 * 30)
         self._create_mock_cookies_db([(".youtube.com", "LOGIN_INFO", "token123", future_ts)])
-        self._write_fingerprint({"userAgent": "Mozilla/5.0 Firefox/146.0", "languages": ["en-US", "en"]})
+        self._write_fingerprint({"userAgent": "Mozilla/5.0 Firefox/146.0", "languages": ["es-ES", "en"]})
         mock_resp = MagicMock(status_code=200, text='{"LOGGED_IN": true}')
         mock_session = AsyncMock()
         mock_session.get.return_value = mock_resp
         mock_session.__aenter__.return_value = mock_session
 
-        with patch("modules.session_heartbeat.AsyncSession", return_value=mock_session) as session_cls:
+        with patch("modules.session_heartbeat.AsyncSession", return_value=mock_session) as session_cls, \
+             patch("modules.session_heartbeat._installed_firefox_major", return_value="156"):
             await check_session_heartbeat(self.session_path, account_name="acc", proxy="http://1.2.3.4:80")
 
         kwargs = session_cls.call_args.kwargs
-        self.assertEqual(kwargs["impersonate"], "firefox133")
+        self.assertEqual(kwargs["impersonate"], "firefox155")
         self.assertEqual(kwargs["proxy"], "http://1.2.3.4:80")
-        self.assertEqual(kwargs["headers"], {"User-Agent": "Mozilla/5.0 Firefox/146.0", "Accept-Language": "en-US,en;q=0.5"})
+        self.assertEqual(kwargs["headers"], {"User-Agent": "Mozilla/5.0 Firefox/156.0", "Accept-Language": "en-US,en;q=0.9"})
         self.assertNotIn("Chrome", json.dumps(kwargs["headers"]))
         mock_session.get.assert_awaited_once()
         self.assertEqual(mock_session.get.await_args.args[0], "https://www.youtube.com/")
@@ -230,6 +240,7 @@ class TestSessionHeartbeat(unittest.IsolatedAsyncioTestCase):
                 account_name="acc1",
                 proxy="http://user:pass@1.2.3.4:8080",
                 timeout=15.0,
+                locale="en-US",
             )
 
 

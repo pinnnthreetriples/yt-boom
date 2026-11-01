@@ -186,6 +186,11 @@ class TestAccountsMigration(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFingerprintManager(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("modules.fingerprint_manager.host_gpu", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_generated_once_then_reused(self):
         with tempfile.TemporaryDirectory() as temp:
             session = Path(temp) / "acc"

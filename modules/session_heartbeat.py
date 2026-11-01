@@ -16,7 +16,7 @@ from database import AccountRecord
 from modules.fingerprint_manager import load_fingerprint
 
 # Sessions are made by Camoufox (Firefox): the request must look like Firefox, not like a Chrome replaying the cookies.
-HEARTBEAT_IMPERSONATE = "firefox133"
+HEARTBEAT_IMPERSONATE = "firefox155"  # closest curl_cffi TLS profile to the installed Firefox 156
 
 
 @dataclass(frozen=True)
@@ -107,25 +107,38 @@ def check_session_offline(session_dir: str | Path, account_name: str = "default"
     )
 
 
-def _firefox_languages_header(languages: list[str]) -> str:
-    """Accept-Language the way Firefox builds it: en-US,en;q=0.5 / es-ES,en-US;q=0.7,en;q=0.3."""
-    parts = [languages[0]]
-    parts += [f"{lang};q={round(1 - index / len(languages), 1)}" for index, lang in enumerate(languages) if index]
-    return ",".join(parts)
+def _camoufox_accept_language(locale: str) -> str:
+    """Accept-Language the way Camoufox sends it for `locale=`: en-US -> en-US,en;q=0.9 (read off a real request)."""
+    language = locale.split("-")[0]
+    return locale if language == locale else f"{locale},{language};q=0.9"
 
 
-def fingerprint_headers(session_dir: str | Path) -> dict[str, str]:
-    """User-Agent and Accept-Language the profile's browser presents (from its pinned fingerprint.json).
+def _installed_firefox_major() -> str | None:
+    """Major version of the installed Camoufox build: the browser rewrites the pinned UA to it (fingerprints.py)."""
+    try:
+        from camoufox.pkgman import installed_verstr
 
-    Empty when the profile has no fingerprint: the impersonation defaults then apply.
+        return installed_verstr().split(".")[0] or None
+    except Exception as exc:
+        logger.debug("Could not read the installed Camoufox version: {}", exc)
+        return None
+
+
+def fingerprint_headers(session_dir: str | Path, locale: str = "en-US") -> dict[str, str]:
+    """User-Agent and Accept-Language the profile's browser really sends, not what fingerprint.json says.
+
+    Camoufox swaps the pinned UA's Firefox version for the installed build and takes the language from
+    `locale=`, ignoring the fingerprint's own languages. No fingerprint: the impersonation default UA applies.
     """
     navigator = (load_fingerprint(Path(session_dir)) or {}).get("navigator") or {}
-    headers: dict[str, str] = {}
-    if navigator.get("userAgent"):
-        headers["User-Agent"] = str(navigator["userAgent"])
-    languages = [lang for lang in navigator.get("languages") or [] if isinstance(lang, str) and lang]
-    if languages:
-        headers["Accept-Language"] = _firefox_languages_header(languages)
+    headers: dict[str, str] = {"Accept-Language": _camoufox_accept_language(locale)}
+    user_agent = str(navigator.get("userAgent") or "")
+    if user_agent:
+        major = _installed_firefox_major()
+        if major:
+            user_agent = re.sub(r"Firefox/\d+\.0", f"Firefox/{major}.0", user_agent)
+            user_agent = re.sub(r"rv:\d+\.0", f"rv:{major}.0", user_agent)
+        headers["User-Agent"] = user_agent
     return headers
 
 
@@ -134,6 +147,7 @@ async def check_session_heartbeat(
     account_name: str = "default",
     proxy: str | None = None,
     timeout: float = 15.0,
+    locale: str = "en-US",
 ) -> HeartbeatStatus:
     """Send lightweight HTTP request to YouTube to verify session validity without launching a browser.
 
@@ -162,7 +176,7 @@ async def check_session_heartbeat(
             impersonate=HEARTBEAT_IMPERSONATE,
             proxy=proxy,
             timeout=timeout,
-            headers=fingerprint_headers(session_dir),
+            headers=fingerprint_headers(session_dir, locale),
         ) as session:
             resp = await session.get("https://www.youtube.com/", cookies=cookies)
             if resp.status_code != 200:
@@ -214,6 +228,7 @@ async def check_account_heartbeat(
     account: AccountRecord,
     default_proxy: str | None = None,
     timeout: float = 15.0,
+    locale: str = "en-US",
 ) -> HeartbeatStatus:
     proxy = resolve_account_proxy(account.proxy_url, default_proxy)
     return await check_session_heartbeat(
@@ -221,4 +236,5 @@ async def check_account_heartbeat(
         account_name=account.name,
         proxy=proxy,
         timeout=timeout,
+        locale=locale,
     )

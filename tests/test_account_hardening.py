@@ -17,7 +17,7 @@ import youtube_bot
 from config import AccountSettings, BrowserSettings, TargetSettings, mask_proxy_url, parse_proxy, resolve_account_proxy
 from database import UNSET, AccountRecord, Database, Payload
 from modules.account_parser import ParsedAccount, parse_account_line
-from modules.fingerprint_manager import get_or_create_fingerprint, is_compatible
+from modules.fingerprint_manager import _probe_host_renderer, get_or_create_fingerprint, host_gpu, is_compatible
 from modules.google_authenticator import GoogleAuthError, read_session_owner, write_session_owner
 from modules.multi_account_orchestrator import MultiAccountOrchestrator
 from modules.totp_helper import generate_totp, normalize_secret, validate_totp_secret
@@ -528,6 +528,11 @@ class TestInteractiveLogin(_DbCase):
 
 
 class TestFingerprintOs(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("modules.fingerprint_manager.host_gpu", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _generate(self, os_name: str):
         ua = {"windows": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0)", "macos": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15)"}
         return {"navigator": {"userAgent": ua[os_name]}, "id": os_name}
@@ -566,11 +571,75 @@ class TestFingerprintOs(unittest.TestCase):
              patch("modules.fingerprint_manager.os.replace", side_effect=OSError("denied")):
             self.assertEqual(get_or_create_fingerprint(Path(temp), "windows"), {"v": 1})
 
+    def test_new_windows_fingerprint_takes_the_host_gpu(self):
+        gpu = {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, X Direct3D11), or similar"}
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("modules.fingerprint_manager.sys.platform", "win32"), \
+             patch("modules.fingerprint_manager.host_gpu", return_value=gpu) as detect, \
+             patch("camoufox.fingerprints.generate_fingerprint", return_value={"v": 1}) as generate:
+            session = Path(temp) / "acc"
+            get_or_create_fingerprint(session, "windows")
+            generate.assert_called_once_with(os="windows", gpu=gpu)
+            detect.assert_called_once_with(Path(temp))
+
+    def test_no_gpu_pin_for_another_os_or_a_non_windows_host(self):
+        gpu = {"vendor": "v", "renderer": "r"}
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("modules.fingerprint_manager.host_gpu", return_value=gpu) as detect, \
+             patch("camoufox.fingerprints.generate_fingerprint", return_value={"v": 1}) as generate:
+            with patch("modules.fingerprint_manager.sys.platform", "win32"):
+                get_or_create_fingerprint(Path(temp) / "mac", "macos")
+            with patch("modules.fingerprint_manager.sys.platform", "linux"):
+                get_or_create_fingerprint(Path(temp) / "win", "windows")
+            detect.assert_not_called()
+            self.assertEqual([call.kwargs for call in generate.call_args_list], [{"os": "macos"}, {"os": "windows"}])
+
+    def test_unmatched_host_gpu_falls_back_to_a_random_fingerprint(self):
+        gpu = {"vendor": "v", "renderer": "r"}
+
+        def generate(os, gpu=None):
+            if gpu:
+                raise ValueError("no fingerprint with this GPU")
+            return {"v": 1}
+
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("modules.fingerprint_manager.sys.platform", "win32"), \
+             patch("modules.fingerprint_manager.host_gpu", return_value=gpu), \
+             patch("camoufox.fingerprints.generate_fingerprint", side_effect=generate):
+            self.assertEqual(get_or_create_fingerprint(Path(temp) / "acc", "windows"), {"v": 1})
+
     def test_fingerprint_the_installed_camoufox_cannot_convert_is_not_compatible(self):
         with patch("camoufox.fingerprints.from_fpgen", side_effect=KeyError("screen")):
             self.assertFalse(is_compatible({"navigator": {}}))
         with patch("camoufox.fingerprints.from_fpgen", return_value={}):
             self.assertTrue(is_compatible({"navigator": {}}))
+
+
+class TestHostGpu(unittest.TestCase):
+    RENDERER = "ANGLE (NVIDIA, NVIDIA GeForce GTX 980 Direct3D11 vs_5_0 ps_5_0), or similar"
+
+    def test_probe_result_is_turned_into_a_gpu_condition_and_cached(self):
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("modules.fingerprint_manager._probe_host_renderer", return_value=self.RENDERER) as probe:
+            expected = {"vendor": "Google Inc. (NVIDIA)", "renderer": self.RENDERER}
+            self.assertEqual(host_gpu(Path(temp)), expected)
+            self.assertEqual(host_gpu(Path(temp)), expected)
+            probe.assert_called_once()
+            self.assertEqual(json.loads((Path(temp) / "_host_gpu.json").read_text(encoding="utf-8")), expected)
+
+    def test_unrecognised_or_failed_probe_gives_none_and_caches_nothing(self):
+        for renderer in (None, "Mesa llvmpipe"):
+            with tempfile.TemporaryDirectory() as temp, \
+                 patch("modules.fingerprint_manager._probe_host_renderer", return_value=renderer):
+                self.assertIsNone(host_gpu(Path(temp)))
+                self.assertFalse((Path(temp) / "_host_gpu.json").exists())
+
+    def test_probe_reads_the_last_stdout_line(self):
+        done = MagicMock(stdout=f'warning\n{json.dumps(self.RENDERER)}\n')
+        with patch("modules.fingerprint_manager.subprocess.run", return_value=done):
+            self.assertEqual(_probe_host_renderer(), self.RENDERER)
+        with patch("modules.fingerprint_manager.subprocess.run", side_effect=OSError("no python")):
+            self.assertIsNone(_probe_host_renderer())
 
 
 def _runner(root: Path) -> YouTubeRunner:
