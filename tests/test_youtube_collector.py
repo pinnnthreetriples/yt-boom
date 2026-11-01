@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 from config import CollectorEndpoint, CollectorSettings
+from modules.collector import Collector
 from modules.youtube_collector import (
     YouTubeCollector,
     YouTubeSubComment,
@@ -538,3 +540,49 @@ class TestYouTubeCollector(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCollectorProxy(unittest.IsolatedAsyncioTestCase):
+    """Collectors reach YouTube through a proxy when one is given, and directly (as before) when not."""
+
+    def setUp(self):
+        self.settings = CollectorSettings(
+            languages=["en"],
+            endpoints=[CollectorEndpoint(name="test", url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")],
+        )
+
+    async def _session_kwargs(self, module: str, collector) -> dict:
+        with patch(f"{module}.AsyncSession") as session_cls:
+            await collector.open()
+        return session_cls.call_args.kwargs
+
+    async def test_youtube_collector_uses_the_proxy_as_a_curl_url(self):
+        collector = YouTubeCollector(self.settings, "http://us er:p@ss@1.2.3.4:1080")
+        kwargs = await self._session_kwargs("modules.youtube_collector", collector)
+        self.assertEqual(kwargs["proxy"], "http://us%20er:p%40ss@1.2.3.4:1080")
+
+    async def test_socks5_proxy_resolves_dns_on_the_proxy(self):
+        collector = YouTubeCollector(self.settings, "socks5://u:p@1.2.3.4:1080")
+        kwargs = await self._session_kwargs("modules.youtube_collector", collector)
+        self.assertEqual(kwargs["proxy"], "socks5h://u:p@1.2.3.4:1080")
+
+    async def test_youtube_collector_without_a_proxy_goes_direct(self):
+        for proxy in ("default", None, ""):
+            with self.subTest(proxy=proxy):
+                collector = YouTubeCollector(self.settings) if proxy == "default" else YouTubeCollector(self.settings, proxy)
+                kwargs = await self._session_kwargs("modules.youtube_collector", collector)
+                self.assertIsNone(kwargs["proxy"])
+
+    async def test_generic_collector_uses_the_proxy(self):
+        kwargs = await self._session_kwargs("modules.collector", Collector(self.settings, "socks5://1.2.3.4:1080"))
+        self.assertEqual(kwargs["proxy"], "socks5h://1.2.3.4:1080")
+        kwargs = await self._session_kwargs("modules.collector", Collector(self.settings))
+        self.assertIsNone(kwargs["proxy"])
+
+    async def test_generic_collector_hands_its_proxy_to_the_youtube_collector(self):
+        collector = Collector(self.settings, "socks5://1.2.3.4:1080")
+        collector.open = AsyncMock()
+        with patch("modules.youtube_collector.YouTubeCollector") as youtube_collector:
+            youtube_collector.return_value.collect_from_videos = AsyncMock(return_value=[])
+            await collector.collect()
+        youtube_collector.assert_called_once_with(self.settings, "socks5://1.2.3.4:1080")

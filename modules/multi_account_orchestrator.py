@@ -66,7 +66,7 @@ class MultiAccountOrchestrator:
         self._dry_run = dry_run
         self._account_mode = account_mode or self._cfg.limits.account_mode
         self._rng = rng or random.Random()
-        self._collector = collector or YouTubeCollector(self._cfg.collector)
+        self._collector = collector or YouTubeCollector(self._cfg.collector, self._cfg.browser.proxy)
         self._processor = processor or (
             DeepSeekProcessor(self._cfg.deepseek, self._cfg.processor, rng=self._rng)
             if getattr(self._cfg.processor, "reply_mode", "ai") == "ai"

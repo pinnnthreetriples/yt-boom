@@ -46,9 +46,11 @@ class UITestRunner:
         simulator: InteractionSimulator | None = None,
         artifacts_dir: Path | None = None,
         rng: random.Random | None = None,
+        locale: str | None = None,
     ) -> None:
         self._cfg = browser_settings
         self._target = target
+        self._locale = locale or browser_settings.locale  # the account's own locale, else browser.locale
         self._rng = rng or random.Random()
         self._simulator = simulator or InteractionSimulator(rng=self._rng)
         self._session_dir = browser_settings.session_root / target.name
@@ -77,6 +79,7 @@ class UITestRunner:
                 simulator=self._simulator,
                 artifacts_dir=self._artifacts_dir,
                 rng=self._rng,
+                locale=self._locale,
             )
             try:
                 return await yt_runner.run(
@@ -139,7 +142,7 @@ class UITestRunner:
             "os": self._cfg.os,
             "geoip": self._cfg.geoip,
             "humanize": self._cfg.humanize,
-            "locale": self._cfg.locale,
+            "locale": self._locale,
             "persistent_context": True,
             "user_data_dir": str(self._session_dir),
             "firefox_user_prefs": dict(self._cfg.firefox_user_prefs),

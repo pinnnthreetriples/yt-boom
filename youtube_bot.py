@@ -757,7 +757,7 @@ async def list_sub_comments(video_url: str, config_path: str = "config.yaml", li
     """Fetch and list comments under comments for a YouTube video."""
     cfg = load_config(config_path)
     try:
-        async with YouTubeCollector(cfg.collector) as collector:
+        async with YouTubeCollector(cfg.collector, cfg.browser.proxy) as collector:
             sub_comments = await collector.fetch_video_sub_comments(video_url, max_sub_comments=limit)
     except CollectorError as exc:
         logger.error("Не удалось получить ответы под комментариями: {}", exc)
@@ -826,7 +826,6 @@ async def run_reply_bot(
 
     node = await db.upsert_test_node(yt_target.name, yt_target.base_url)
 
-    collector = YouTubeCollector(cfg.collector)
     processor = (
         DeepSeekProcessor(cfg.deepseek, cfg.processor, rng=rng)
         if effective_mode == "ai" or should_paraphrase(cfg.deepseek, cfg.processor)
@@ -861,6 +860,9 @@ async def run_reply_bot(
             session_dir = acc_record.session_path
             proxy_url = acc_record.proxy_url
             resolved_acc_name = acc_record.name
+
+    # comments are fetched through the proxy the account posts from; no proxy anywhere: direct, as before
+    collector = YouTubeCollector(cfg.collector, resolve_account_proxy(proxy_url, cfg.browser.proxy))
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
@@ -1149,7 +1151,6 @@ async def run_multi_video_pipeline(
 
     node = await db.upsert_test_node(yt_target.name, yt_target.base_url)
 
-    collector = YouTubeCollector(cfg.collector)
     processor = (
         DeepSeekProcessor(cfg.deepseek, cfg.processor, rng=rng)
         if effective_mode == "ai" or should_paraphrase(cfg.deepseek, cfg.processor)
@@ -1184,6 +1185,9 @@ async def run_multi_video_pipeline(
             session_dir = acc_record.session_path
             proxy_url = acc_record.proxy_url
             resolved_acc_name = acc_record.name
+
+    # comments are fetched through the proxy the account posts from; no proxy anywhere: direct, as before
+    collector = YouTubeCollector(cfg.collector, resolve_account_proxy(proxy_url, cfg.browser.proxy))
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,

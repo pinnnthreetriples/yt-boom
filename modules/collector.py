@@ -13,6 +13,7 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
 from config import CollectorEndpoint, CollectorSettings
+from modules.session_heartbeat import curl_proxy_url
 
 _WHITESPACE = re.compile(r"\s+")
 
@@ -42,8 +43,9 @@ class CollectedItem(BaseModel):
 class Collector:
     """Fetches candidate fixtures from public endpoints and filters them by metrics and language."""
 
-    def __init__(self, settings: CollectorSettings) -> None:
+    def __init__(self, settings: CollectorSettings, proxy: str | None = None) -> None:
         self._cfg = settings
+        self._proxy = proxy  # None: requests go out directly
         self._session: AsyncSession | None = None
         self._languages = set(settings.languages)
         self._detector = self._build_detector(settings.languages)
@@ -66,6 +68,7 @@ class Collector:
             return
         self._session = AsyncSession(
             impersonate=self._cfg.impersonate,
+            proxy=curl_proxy_url(self._proxy),
             timeout=self._cfg.timeout_seconds,
             headers={"Accept": "application/json"},
         )
@@ -92,7 +95,7 @@ class Collector:
         for endpoint in self._cfg.endpoints:
             if "youtube.com" in endpoint.url or "youtu.be" in endpoint.url:
                 from modules.youtube_collector import YouTubeCollector
-                yt_col = YouTubeCollector(self._cfg)
+                yt_col = YouTubeCollector(self._cfg, self._proxy)
                 yt_items = await yt_col.collect_from_videos([endpoint.url], max_items=self._cfg.max_items_per_endpoint)
                 for item in yt_items:
                     if item.external_id not in seen:

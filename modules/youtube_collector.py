@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from config import CollectorSettings
 from modules.collector import CollectedItem, CollectorError
+from modules.session_heartbeat import curl_proxy_url
 
 _WHITESPACE = re.compile(r"\s+")
 _VIDEO_ID_REGEX = re.compile(r"(?:v=|\/shorts\/|youtu\.be\/|embed\/)([A-Za-z0-9_-]{11})")
@@ -247,8 +248,9 @@ def parse_like_count(like_val: Any) -> int:
 class YouTubeCollector:
     """Fetches YouTube comments and nested replies (comments under comments) via InnerTube and HTTP."""
 
-    def __init__(self, settings: CollectorSettings) -> None:
+    def __init__(self, settings: CollectorSettings, proxy: str | None = None) -> None:
         self._cfg = settings
+        self._proxy = proxy  # None: requests go out directly
         self._session: AsyncSession | None = None
         self._languages = set(settings.languages)
         self._detector = self._build_detector(settings.languages)
@@ -273,6 +275,7 @@ class YouTubeCollector:
             return
         self._session = AsyncSession(
             impersonate=self._cfg.impersonate,
+            proxy=curl_proxy_url(self._proxy),
             timeout=self._cfg.timeout_seconds,
             headers={
                 "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",

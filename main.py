@@ -35,7 +35,7 @@ class Orchestrator:
         self._cfg = config
         self._rng = random.Random()
         self._db = Database(config.app.db_path)
-        self._collector = Collector(config.collector)
+        self._collector = Collector(config.collector, config.browser.proxy)
         self._processor = DeepSeekProcessor(config.deepseek, config.processor, rng=self._rng)
         self._validator = DeliveryValidator(config.validator)
         self._simulator = InteractionSimulator(rng=self._rng)
