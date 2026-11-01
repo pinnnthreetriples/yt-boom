@@ -15,12 +15,14 @@ from config import AppConfig, load_config, mask_proxy_url, resolve_account_proxy
 from database import AccountRecord, ActivityLogCreate, Database, RecordNotFoundError
 from modules.collector import CollectorError
 from modules.account_parser import looks_like_credentials, parse_account_line
+from modules.account_menu_logic import format_profile_summary, profile_pending_fields
 from modules.account_warmer import AccountWarmer, WarmUpResult
 from modules.geo_guard import check_account_exit, normalize_country, normalize_locale, resolve_exit_country, warn_if_exit_mismatch
 from modules.google_authenticator import GoogleAuthenticator, GoogleAuthError, read_session_owner, write_session_owner
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.process_guard import bind_to_kill_on_close_job
+from modules.profile_manager import ProfileEditor
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.session_heartbeat import check_account_heartbeat, check_session_offline, HeartbeatStatus
 from modules.youtube_collector import YouTubeCollector, extract_video_id
@@ -541,6 +543,28 @@ async def warm_up_cli(
         warmer = AccountWarmer(cfg.browser)
         res = await warmer.warm_up(account, duration_seconds=duration, target_video_url=target_video, db=db)
         print(f"[{'OK' if res.success else 'FAILED'}] {res.account_name}: {res.details}")
+        return res.success
+
+
+async def apply_profile_cli(identifier: str, config_path: str = "config.yaml", headless: bool | None = None) -> bool:
+    """`--apply-profile <name_or_email>`: publish the channel profile saved in the wizard (nickname, description, avatar)."""
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    async with Database(cfg.app.db_path) as db:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
+            return False
+        if account.auth_status != "authenticated":
+            print(f"[ERROR] Account {account.name!r} is not signed in: run --auth-account {account.name} first.", file=sys.stderr)
+            return False
+        if not profile_pending_fields(account):
+            print(f"[OK] {account.name}: nothing to apply (set the profile in the wizard: Accounts -> Channel profile).")
+            return True
+        res = await ProfileEditor(cfg.browser).apply(account, db)
+        kind, text = format_profile_summary(res.account_name, res.success, res.changed_fields, res.details)
+        print(f"[{'OK' if res.success else 'FAILED'}] {text}")
         return res.success
 
 
@@ -1589,6 +1613,7 @@ def main() -> None:
     parser.add_argument("--heartbeat-online", action="store_true", help="With --heartbeat: also verify the session with an HTTP request to YouTube (Firefox-like, through the account proxy)")
     parser.add_argument("--warm-up", type=str, default=None, metavar="NAME_OR_EMAIL", help="Run humanized browser warm-up for an account (natural watch, mouse movement, comments scroll)")
     parser.add_argument("--warm-up-duration", type=float, default=45.0, help="Duration in seconds for warm-up viewing (default: 45.0)")
+    parser.add_argument("--apply-profile", type=str, default=None, metavar="NAME_OR_EMAIL", help="Publish the channel profile saved in the wizard (nickname, description, avatar) to the account's YouTube channel")
     parser.add_argument("--lifecycle", action="store_true", help="Show account ages, lifecycle stages, quarantine hours left and daily comment quota")
     parser.add_argument("--warm-quarantined", action="store_true", help="Run organic warm-up, one account after another, for every account in quarantine or aging (uses --warm-up-duration)")
     parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
@@ -1619,6 +1644,10 @@ def main() -> None:
                 headless=args.headless or None,
             )
         )
+        sys.exit(0 if ok else 1)
+
+    if args.apply_profile:
+        ok = asyncio.run(apply_profile_cli(args.apply_profile, args.config, headless=args.headless or None))
         sys.exit(0 if ok else 1)
 
     if args.lifecycle:

@@ -19,6 +19,7 @@ An automated Python 3.11+ web testing and telemetry pipeline driving persistent 
 ## Commands
 - Run all tests: `python run_tests.py`
 - Launch interactive wizard: `python youtube_bot.py` (or `python youtube_bot.py --wizard`); stage 1 «Аккаунты» also imports accounts (file / paste), warms up and shows the lifecycle table
+- Publish the saved channel profile (nickname, description, avatar): `python youtube_bot.py --apply-profile <name>`; edit it in the wizard, stage 1 «Аккаунты» → `9` «Профиль канала»
 - Authenticate single account: `python youtube_bot.py --auth-account <name>`
 - Batch import accounts: `python youtube_bot.py --import-accounts-file <path>`
 - List accounts: `python youtube_bot.py --list-accounts`

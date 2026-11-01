@@ -356,6 +356,9 @@ _THEME_BY_CLR = {
 }
 
 
+_CLR_BY_THEME = {"ok": CLR_GREEN, "warn": CLR_YELLOW, "err": CLR_RED, "accent": CLR_CYAN, "dim": CLR_DIM}
+
+
 def _use_arrow_keys() -> bool:
     """Arrow navigation needs a real console on both ends."""
     return tui.is_interactive()
@@ -550,6 +553,7 @@ def step_account(config_path: Path, session_root: Path) -> bool:
         ("5", "Импорт аккаунтов", "файл или вставка строк", CLR_DIM),
         ("6", "Прогрев", "карантин и aging одним кликом", CLR_DIM),
         ("8", "Жизненный цикл", "стадии, квоты, heartbeat", CLR_DIM),
+        ("9", "Профиль канала", "аватарка, описание, никнейм", CLR_DIM),
         None,
         ("4", "Продолжить →", "", ""),
         ("0", "← Назад", "", ""),
@@ -602,6 +606,11 @@ def step_account(config_path: Path, session_root: Path) -> bool:
 
         if choice == "8":
             _setup_lifecycle(config_path)
+            redraw = True
+            continue
+
+        if choice == "9":
+            notice = _setup_profile(config_path, accounts) if accounts else ("warn", "Аккаунтов нет")
             redraw = True
             continue
 
@@ -670,11 +679,18 @@ def _setup_accounts_table(accounts: list[tuple[Any, bool]]) -> None:
         safe_print(color(f"   … ещё {len(accounts) - _SETUP_MAX_ACCOUNTS}", CLR_DIM))
 
 
-def _setup_pick_account(accounts: list[tuple[Any, bool]], question: str) -> Any:
-    """Arrow picker of an account; None = cancelled."""
+def _setup_pick_account(
+    accounts: list[tuple[Any, bool]], question: str, status: Callable[[Any], tuple[str, str]] | None = None
+) -> Any:
+    """Arrow picker of an account; None = cancelled. `status(account)` → (text, theme style) replaces the login column."""
+    def state(acc: Any, ok: bool) -> tuple[str, str]:
+        if status is None:
+            return ("● вошёл" if ok else "○ нет входа"), (CLR_GREEN if ok else CLR_YELLOW)
+        text, style = status(acc)
+        return text, _CLR_BY_THEME.get(style, CLR_DIM)
+
     picks: list[MenuRow | None] = [
-        (str(i), _fit(acc.name, 24), "● вошёл" if ok else "○ нет входа", CLR_GREEN if ok else CLR_YELLOW)
-        for i, (acc, ok) in enumerate(accounts, 1)
+        (str(i), _fit(acc.name, 24), *state(acc, ok)) for i, (acc, ok) in enumerate(accounts, 1)
     ]
     picks += [None, ("0", "← Отмена", "", "")]
     pick, _ = arrow_menu(
@@ -807,6 +823,159 @@ def _setup_register(config_path: Path, lines: list[str]) -> Any:
 
     cfg = load_config(config_path)
     return _pools_db(config_path, lambda db: register_account_lines(db, cfg, lines, skip_existing=True))
+
+
+def _setup_profile(config_path: Path, accounts: list[tuple[Any, bool]]) -> tuple[str, str] | None:
+    """«Профиль канала»: pick an account (Space/Enter), then edit its card; back in the picker for the next one.
+
+    Returns the last notice to show on the accounts screen, or None.
+    """
+    from modules.account_menu_logic import profile_status_label
+
+    notice: tuple[str, str] | None = None
+    while True:
+        if len(accounts) == 1:
+            account = accounts[0][0]
+        else:
+            account = _setup_pick_account(accounts, "Профиль канала — какой аккаунт?", profile_status_label)
+        if account is None:
+            return notice
+        notice = _profile_card(config_path, account.name) or notice
+        if len(accounts) == 1:
+            return notice
+        accounts = _setup_accounts(config_path)
+
+
+def _profile_card(config_path: Path, account_name: str) -> tuple[str, str] | None:
+    """Card of one account's channel profile: current values, edit rows, «Применить на YouTube». Esc/«0» leaves."""
+    from modules.account_menu_logic import (
+        plural_changes,
+        profile_action_label,
+        profile_card_lines,
+        profile_pending_fields,
+    )
+
+    selected = 0
+    notice: tuple[str, str] | None = None
+    last: tuple[str, str] | None = None
+    while True:
+        account = _pools_db(config_path, lambda db: db.get_account(account_name))
+        if account is None:
+            return "err", f"Аккаунт «{account_name}» не найден"
+        signed_in = account.auth_status == "authenticated"
+        pending = profile_pending_fields(account)
+        clear_terminal()
+        tui.section_header(f"Профиль канала · {account.name}", "● вошёл" if signed_in else "○ нет входа — применить нельзя")
+        label_w = max(len(label) for label, *_ in profile_card_lines(account))
+        for label, value, hint, style in profile_card_lines(account):
+            safe_print(f"   {label:<{label_w}}  {_fit(value, 30):<30}  {color(hint, _CLR_BY_THEME.get(style, CLR_DIM))}")
+        if notice:
+            safe_print()
+            tui.status_line(*notice)
+        rows: list[MenuRow | None] = [
+            ("1", profile_action_label(account, "name"), "", ""),
+            ("2", profile_action_label(account, "description"), "", ""),
+            ("3", profile_action_label(account, "avatar"), "", ""),
+            None,
+            ("4", "Применить на YouTube", plural_changes(len(pending)) if pending else "нет правок", CLR_YELLOW if pending else CLR_DIM),
+            ("0", "← Назад", "", ""),
+        ]
+        choice, selected = _setup_menu(lambda: rows, selected)
+        notice = None
+        if choice == "0":
+            return last
+        edit = {"1": _profile_edit_name, "2": _profile_edit_description, "3": _profile_edit_avatar}.get(choice)
+        if edit is not None:
+            notice = edit(config_path, account)
+        elif choice == "4":
+            notice = _profile_apply(config_path, account, pending)
+        if notice and notice[0] in {"ok", "err"}:
+            last = notice
+
+
+def _profile_edit_name(config_path: Path, account: Any) -> tuple[str, str] | None:
+    from modules.account_menu_logic import NICKNAME_MAX, validate_nickname
+
+    try:
+        text = prompt_user(f"Никнейм канала (до {NICKNAME_MAX} символов, пусто — отмена)")
+    except WizardBack:
+        return None
+    if not text:
+        return None
+    try:
+        name = validate_nickname(text)
+    except ValueError as exc:
+        return "warn", str(exc)
+    _pools_db(config_path, lambda db: db.set_account_profile_draft(account.id, name=name))
+    return "ok", "Никнейм сохранён — «Применить на YouTube», когда всё готово"
+
+
+def _profile_edit_description(config_path: Path, account: Any) -> tuple[str, str] | None:
+    from modules.account_menu_logic import DESCRIPTION_MAX, validate_description
+
+    safe_print(color(f" Описание: вводите строки, пустая строка — конец, «-» — очистить (до {DESCRIPTION_MAX} символов)", CLR_DIM))
+    lines: list[str] = []
+    try:
+        while True:
+            line = input("   ")
+            if not line.strip():
+                break
+            lines.append(line)
+    except (KeyboardInterrupt, EOFError):
+        return None
+    if not lines:
+        return None
+    try:
+        description = validate_description(lines)
+    except ValueError as exc:
+        return "warn", str(exc)
+    _pools_db(config_path, lambda db: db.set_account_profile_draft(account.id, description=description))
+    return "ok", "Описание сохранено — «Применить на YouTube», когда всё готово"
+
+
+def _profile_edit_avatar(config_path: Path, account: Any) -> tuple[str, str] | None:
+    from modules.account_menu_logic import applied_snapshot, clean_path_input
+    from modules.profile_manager import AvatarError, forget_avatar, import_avatar
+
+    try:
+        text = prompt_user("Путь к картинке (png/jpg/gif/bmp до 4 МБ, можно перетащить файл в окно; пусто — отмена)")
+    except WizardBack:
+        return None
+    if not text:
+        return None
+    try:
+        stored = import_avatar(clean_path_input(text), account.name)
+    except (AvatarError, OSError) as exc:
+        return "warn", str(exc) if isinstance(exc, AvatarError) else f"Файл не прочитан: {exc.__class__.__name__}"
+    _pools_db(config_path, lambda db: db.set_account_profile_draft(account.id, avatar=stored))
+    forget_avatar(account.profile_avatar, keep=(stored, applied_snapshot(account).get("avatar")))
+    return "ok", "Аватарка сохранена — «Применить на YouTube», когда всё готово"
+
+
+def _profile_apply(config_path: Path, account: Any, pending: list[str]) -> tuple[str, str] | None:
+    """Publish the draft in one browser session; returns the notice (None = cancelled)."""
+    from config import load_config
+    from modules.account_menu_logic import format_profile_summary, plural_changes
+    from modules.profile_manager import ProfileEditor
+
+    if not pending:
+        return "info", "Нет правок для применения"
+    if account.auth_status != "authenticated":
+        return "warn", "Сначала войдите в аккаунт (пункт «Войти в аккаунт»)"
+    try:
+        question = f"Применить на YouTube: {plural_changes(len(pending))} (откроется браузер, ~1–2 мин)? (y/N)"
+        if not _yes(prompt_user(question, "n")):
+            return None
+        cfg = load_config(config_path)
+        tui.status_line("info", "Применяю профиль — не закрывайте окно браузера")
+        result = _pools_db(config_path, lambda db: ProfileEditor(cfg.browser).apply(account, db))
+    except WizardBack:
+        return "info", "Отменено"
+    except KeyboardInterrupt:
+        return "warn", "Применение прервано"
+    except Exception as exc:
+        return "err", f"Не удалось применить: {exc.__class__.__name__} (подробности в логе)"
+    return format_profile_summary(result.account_name, result.success, result.changed_fields, result.details)
 
 
 def _setup_pick_warmup(added: list[Any]) -> list[str]:

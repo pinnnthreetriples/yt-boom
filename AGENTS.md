@@ -36,7 +36,8 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/account_warmer.py` — organic warm-up runner (home-feed video discovery, player telemetry, comments reading, rare likes)
 - `modules/lifecycle_engine.py` — 4-day account ageing state machine (quarantine → aging → probation → mature) with daily quota, cooldown and circuit breaker
 - `modules/account_menu_logic.py` — pure helpers of the wizard «Аккаунты» screen (warm-up pick, import/warm-up summaries, lifecycle table rows)
-- `tests/` — comprehensive automated test suite (522 unit and integration tests)
+- `modules/profile_manager.py` — channel profile: avatar file checks/copies (`profiles/avatars/`) and the YouTube Studio editor (nickname, description, avatar) that publishes the draft stored in the DB
+- `tests/` — comprehensive automated test suite (563 unit and integration tests)
 - `run_tests.py` — test discovery and test suite runner
 - `test_sessions/` — local browser session storage directories
 
@@ -60,6 +61,7 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - List all stored accounts: `python youtube_bot.py --list-accounts`
 - Check account session heartbeat (lightweight HTTP): `python youtube_bot.py --heartbeat [account]`
 - Run account warm-up: `python youtube_bot.py --warm-up <name> [--warm-up-duration 45]`
+- Publish the saved channel profile: `python youtube_bot.py --apply-profile <name>` (the draft is edited in the wizard: Accounts → Channel profile)
 - Multi-video search & reply: `python youtube_bot.py --search "python" --min-views 10000 --max-views 500000 --comments-per-video 10 --dry-run`
 - View activity history / audit log: `python youtube_bot.py --history`
 - List YouTube sub-comments: `python youtube_bot.py --video "https://www.youtube.com/watch?v=..." --list-replies --limit 5`

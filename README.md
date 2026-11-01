@@ -52,10 +52,13 @@ python youtube_bot.py --wizard
 | `python youtube_bot.py --list-accounts` | Список аккаунтов |
 | `python youtube_bot.py --lifecycle` | Таблица стадий жизненного цикла |
 | `python youtube_bot.py --warm-quarantined` | Прогрев карантинных аккаунтов |
+| `python youtube_bot.py --apply-profile <имя>` | Применить к каналу сохранённые никнейм, описание и аватарку |
 | `python youtube_bot.py --search "<тема>" --min-views 10000 --max-views 500000 --dry-run` | Поиск видео и ответы (пробный запуск) |
 | `python youtube_bot.py --status` | Состояние базы данных |
 
 Формат строки при импорте: `логин:пароль:TOTP-секрет`, по одной на аккаунт.
+
+Профиль канала (аватарка, описание, никнейм) задаётся в мастере: `python youtube_bot.py` → «Аккаунты» → `9` «Профиль канала» → аккаунт (Пробел) → нужное поле → «Применить на YouTube». Имя канала YouTube разрешает менять 2 раза за 14 дней.
 
 ## Разработка
 
