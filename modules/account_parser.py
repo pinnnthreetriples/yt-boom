@@ -5,6 +5,7 @@ import re
 from pydantic import BaseModel, ConfigDict, Field
 
 from config import parse_proxy
+from modules.geo_guard import normalize_country, normalize_locale
 from modules.totp_helper import validate_totp_secret
 
 _HOST = r"(?:\[[0-9A-Fa-f:.]+\]|[^:/@\s\[\]]+)"
@@ -20,6 +21,7 @@ _PROXY_TAIL = re.compile(
     re.IGNORECASE,
 )
 _EMAIL_PREFIX = re.compile(r"^[^:@\s]+@[^:\s]+:")
+_GEO_TAIL = re.compile(r":(country|locale)=([^:\s]*)$", re.IGNORECASE)  # `...:country=PL:locale=pl-PL`, the very end of the line
 
 
 class ParsedAccount(BaseModel):
@@ -30,6 +32,8 @@ class ParsedAccount(BaseModel):
     totp_secret: str = Field(repr=False, exclude=True)
     recovery_email: str | None = None
     proxy: str | None = None
+    expected_country: str | None = None
+    locale: str | None = None
 
     @property
     def default_name(self) -> str:
@@ -62,13 +66,28 @@ def _split_credentials(rest: str) -> tuple[str, str, str | None]:
     return password, totp_secret, recovery_email
 
 
-def parse_account_line(line: str, proxy: str | None = None) -> ParsedAccount:
-    """Parse `email:password:totp_secret[:recovery_email][:proxy]`.
+def _geo_fields(country: str | None, locale: str | None) -> tuple[str | None, str | None]:
+    """Validated ISO country and `ll-RR` locale; a value that is set but not recognised is a ValueError."""
+    iso = normalize_country(country) if country and country.strip() else None
+    if country and country.strip() and iso is None:
+        raise ValueError("country: страна не распознана (ожидается код ISO, например PL, или название, например Poland)")
+    tag = normalize_locale(locale) if locale and locale.strip() else None
+    if locale and locale.strip() and tag is None:
+        raise ValueError("locale: неверный формат, ожидается язык-СТРАНА, например pl-PL")
+    return iso, tag
+
+
+def parse_account_line(
+    line: str, proxy: str | None = None, country: str | None = None, locale: str | None = None
+) -> ParsedAccount:
+    """Parse `email:password:totp_secret[:recovery_email][:proxy][:country=PL][:locale=pl-PL]`.
 
     The password may contain colons: the email is everything before the first colon, the TOTP secret is the last
     piece before the optional recovery email (the only piece with '@') and the optional proxy. The secret must be
     valid Base32, so a mis-split line (a proxy mistaken for the secret) is rejected instead of stored.
     The proxy is `scheme://...`, `host:port`, `user:pass@host:port` or `host:port:user:pass` (IPv6 in brackets).
+    `country` (the account's expected country: ISO code or name) and `locale` are the last `key=value` pieces of the
+    line; the `country` / `locale` arguments are the defaults when the line has none.
     """
     text = line.strip()
     if not text:
@@ -77,6 +96,12 @@ def parse_account_line(line: str, proxy: str | None = None) -> ParsedAccount:
     email = email.strip()
     if not separator or "@" not in email:
         raise ValueError("формат: email:password:totp_secret[:recovery_email][:proxy]")
+
+    geo = {"country": country, "locale": locale}
+    while (geo_tail := _GEO_TAIL.search(rest)) is not None:
+        geo[geo_tail.group(1).lower()] = geo_tail.group(2)
+        rest = rest[: geo_tail.start()]
+    expected_country, account_locale = _geo_fields(geo["country"], geo["locale"])
 
     candidates: list[tuple[str, str | None]] = []
     tail = _PROXY_TAIL.search(rest)
@@ -100,6 +125,8 @@ def parse_account_line(line: str, proxy: str | None = None) -> ParsedAccount:
             totp_secret=totp_secret,
             recovery_email=recovery_email,
             proxy=effective_proxy,
+            expected_country=expected_country,
+            locale=account_locale,
         )
     assert first_error is not None
     raise first_error

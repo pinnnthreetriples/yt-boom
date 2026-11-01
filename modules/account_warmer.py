@@ -84,6 +84,7 @@ class AccountWarmer:
             proxy=proxy,
             account_name=account.name,
             simulator=self._simulator,
+            locale=account.locale,
         )
         start_time = time.monotonic()
         chosen_video: str | None = target_video_url
