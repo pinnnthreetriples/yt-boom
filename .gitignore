@@ -22,6 +22,22 @@ _artifacts/
 logs/
 *.log
 
+# Local config and secrets (copy config.example.yaml to config.yaml)
+config.yaml
+.env
+.env.*
+accounts*.txt
+*.local.yaml
+
+# Tool / editor local state
+.serena/
+.idea/
+.vscode/
+.claude/worktrees/
+.claude/settings.local.json
+.coverage
+htmlcov/
+
 # Windows / OS files
 Thumbs.db
 desktop.ini

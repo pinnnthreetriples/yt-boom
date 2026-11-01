@@ -1,0 +1,137 @@
+# Шаблон конфигурации. Скопируйте в config.yaml и заполните (config.yaml в git не хранится).
+# Ключ DeepSeek можно ввести и в мастере: python youtube_bot.py --wizard
+
+app:
+  name: youtube-comment-replier
+  db_path: test_metrics.db
+  log_level: INFO
+  log_file: logs/framework.log
+  poll_interval_seconds: 5
+  acquire_timeout_seconds: 120
+  shutdown_timeout_seconds: 30
+  drain_timeout_seconds: 1200
+deepseek:
+  api_key: sk-your-deepseek-key
+  base_url: https://api.deepseek.com
+  model: deepseek-chat
+  temperature: 1.1
+  max_tokens: 256
+  timeout_seconds: 60
+  max_retries: 3
+collector:
+  impersonate: chrome
+  timeout_seconds: 30
+  max_retries: 3
+  retry_backoff_seconds: 2
+  max_items_per_endpoint: 10
+  comments_per_video: 3
+  languages:
+  - en
+  - ru
+  minimum_confidence: 0.7
+  min_text_length: 5
+  max_text_length: 600
+  require_any_keywords: []
+  block_keywords:
+  - unsubscribe
+  - casino
+  - 1xbet
+  endpoints:
+  - name: youtube-feed
+    url: https://www.youtube.com/watch?v=Ghz0xr7IRQk
+    items_path: ''
+    id_field: id
+    text_field: text
+    url_field: permalink
+  search_query: null
+  min_views: 500000
+  max_views: 5000000
+  target_mode: first_reply
+processor:
+  system_prompt: 'You are an active YouTube user participating in comment discussions.
+
+    Write short, engaging, natural replies (1-2 sentences) directly responding to
+    the user''s comment under a comment.
+
+    Do not mention that you are an AI. Do not use hashtags, links, or excessive punctuation.
+
+    Match the language of the comment.
+
+    '
+  user_prompt_template: 'Parent Comment: {parent_text}
+
+    Sub-Comment to reply to: {text}
+
+    Language: {language}
+
+    Tone/Style: {style}
+
+    Write a single short reply to this sub-comment in the same language.
+
+    '
+  styles:
+  - friendly agreement and encouragement
+  - thoughtful and insightful follow-up question
+  - humorous, witty remark or light banter
+  - concise acknowledgement or brief nod
+  - relatable personal reaction or perspective
+  reply_mode: custom
+  custom_replies: &id001
+  - Спасибо за подробный разбор, очень полезно и наглядно
+  drop_trailing_period_probability: 0.8
+  lowercase_initial_probability: 0.2
+  max_output_length: 400
+  paraphrase_custom: true
+browser:
+  headless: false
+  os: windows
+  geoip: true
+  humanize: false
+  locale: en-US
+  proxy: null
+  session_root: test_sessions
+  navigation_timeout_ms: 45000
+  render_min_seconds: 10
+  render_max_seconds: 30
+  firefox_user_prefs:
+    media.peerconnection.enabled: true
+    network.http.http3.enable: false
+  targets:
+  - name: youtube
+    base_url: https://www.youtube.com
+    item_url_template: https://www.youtube.com/watch?v={external_id}
+    search_input_selector: input#search
+    search_button_selector: button#search-icon-legacy
+    result_item_selector: ytd-video-renderer
+    submit_form_selector: ytd-comment-reply-dialog-renderer
+    submit_input_selector: '#reply-dialog #contenteditable-root'
+    submit_button_selector: '#reply-dialog #submit-button button'
+    confirmation_selector: ytd-comment-view-model
+    remote_id_selector: null
+    remote_id_url_regex: (?:v=([a-zA-Z0-9_-]{11}))
+    wait_timeout_ms: 30000
+  accounts:
+  - name: example
+    session_path: test_sessions/example
+    proxy_url: null
+    is_active: true
+limits:
+  total_iterations: 3
+  max_concurrent_sessions: 1
+  max_iterations_per_session: 3
+  session_cooldown_seconds: 120
+  video_cooldown_seconds: 120
+  pause_min_seconds: 15
+  pause_max_seconds: 45
+  retry_backoff_seconds: 30
+  max_queue_attempts: 3
+validator:
+  delay_seconds: 300
+  timeout_seconds: 30
+  impersonate: chrome
+  poll_interval_seconds: 15
+  max_attempts: 3
+  endpoint_template: https://www.youtube.com/watch?v={remote_id}
+  success_marker: null
+reply_mode: custom
+custom_replies: *id001
