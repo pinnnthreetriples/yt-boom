@@ -14,11 +14,11 @@ An automated Python 3.11+ web testing and telemetry pipeline driving persistent 
 - Never store raw passwords or TOTP secrets in SQLite — all credentials must be encrypted via Windows DPAPI (`secret_store.protect_secret()`).
 - Never force single-process Gecko (`dom.ipc.processCount: 1`) or disable Fission in Camoufox — multi-process is strictly required for YouTube Polymer rendering.
 - Always use asynchronous APIs (`aiosqlite`, `AsyncCamoufox`, `asyncio`) — blocking calls in the main event loop are prohibited.
-- Always verify all 475 project unit and integration tests pass (`python run_tests.py`) before completing tasks.
+- Always verify all 510 project unit and integration tests pass (`python run_tests.py`) before completing tasks.
 
 ## Commands
 - Run all tests: `python run_tests.py`
-- Launch interactive wizard: `python youtube_bot.py` (or `python youtube_bot.py --wizard`)
+- Launch interactive wizard: `python youtube_bot.py` (or `python youtube_bot.py --wizard`); stage 1 «Аккаунты» also imports accounts (file / paste), warms up and shows the lifecycle table
 - Authenticate single account: `python youtube_bot.py --auth-account <name>`
 - Batch import accounts: `python youtube_bot.py --import-accounts-file <path>`
 - List accounts: `python youtube_bot.py --list-accounts`

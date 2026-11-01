@@ -4,9 +4,10 @@ import argparse
 import asyncio
 import random
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from loguru import logger
 
@@ -317,6 +318,40 @@ def _pause_between_accounts(account: AccountRecord) -> float:
     return random.uniform(20.0, 45.0) if account.proxy_url is None else random.uniform(5.0, 15.0)
 
 
+@dataclass
+class AccountImportResult:
+    """Outcome of registering a batch of `email:password:totp` lines; line numbers are 1-based, secrets never stored here."""
+
+    added: list[AccountRecord] = field(default_factory=list)
+    skipped: list[tuple[int, str]] = field(default_factory=list)  # (line number, reason): the account already exists
+    errors: list[tuple[int, str]] = field(default_factory=list)  # (line number, reason): the line was not accepted
+
+
+async def register_account_lines(
+    db: Database, cfg: AppConfig, lines: Iterable[str], skip_existing: bool = False
+) -> AccountImportResult:
+    """Register every account line (blank lines and `#` comments are ignored); one bad line never stops the rest.
+
+    With `skip_existing` a line whose account is already in the database (or repeated earlier in the batch) is
+    reported as skipped instead of overwriting its credentials.
+    """
+    result = AccountImportResult()
+    for number, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            if skip_existing:
+                name = parse_account_line(line).default_name
+                if await db.get_account(name) is not None:
+                    result.skipped.append((number, "аккаунт уже есть"))
+                    continue
+            result.added.append(await _register_credentials_account(db, cfg, line))
+        except (ValueError, RecordNotFoundError) as exc:
+            result.errors.append((number, str(exc)))  # the line itself holds a password: it is never echoed
+    return result
+
+
 async def import_accounts_file_cli(
     path: str, config_path: str = "config.yaml", headless: bool | None = None, force: bool = False
 ) -> bool:
@@ -332,19 +367,12 @@ async def import_accounts_file_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    registered: dict[int, AccountRecord] = {}
-    failed_lines = 0
     async with Database(cfg.app.db_path) as db:
-        for number, raw in enumerate(lines, start=1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            try:
-                account = await _register_credentials_account(db, cfg, line)
-                registered[account.id] = account
-            except (ValueError, RecordNotFoundError) as exc:
-                failed_lines += 1
-                print(f"[ERROR] line {number}: {exc}", file=sys.stderr)  # the line itself holds a password: not echoed
+        imported = await register_account_lines(db, cfg, lines)
+        registered = {account.id: account for account in imported.added}
+        failed_lines = len(imported.errors)
+        for number, reason in imported.errors:
+            print(f"[ERROR] line {number}: {reason}", file=sys.stderr)
         print(f"[OK] Registered {len(registered)} account(s), skipped {failed_lines} invalid line(s)")
 
         queue = [a for a in registered.values() if force or a.auth_status != "authenticated"]
@@ -432,30 +460,75 @@ async def warm_quarantined_cli(
     if headless is not None:
         cfg.browser.headless = headless
     async with Database(cfg.app.db_path) as db:
-        targets = [
-            a
-            for a in await db.list_active_accounts()
-            if a.auth_status == "authenticated"
-            and AccountLifecycleEngine.calculate_stage(a)[0] in ("quarantine", "aging")
-        ]
+        targets = warm_candidates(await db.list_active_accounts())
         if not targets:
             print("[INFO] No authenticated accounts in quarantine or aging.")
             return True
-        warmer = AccountWarmer(cfg.browser)
-        failed = 0
-        for index, account in enumerate(targets):
-            if index:
+        results = await warm_accounts(db, cfg, targets, duration)
+        return all(res.success for res in results)
+
+
+def warm_candidates(accounts: Iterable[AccountRecord], names: Iterable[str] | None = None) -> list[AccountRecord]:
+    """Authenticated accounts in quarantine or ageing (the ones a warm-up is for); `names` narrows the pick."""
+    wanted = None if names is None else set(names)
+    return [
+        a
+        for a in accounts
+        if (wanted is None or a.name in wanted)
+        and a.auth_status == "authenticated"
+        and AccountLifecycleEngine.calculate_stage(a)[0] in ("quarantine", "aging")
+    ]
+
+
+async def warm_accounts(
+    db: Database, cfg: AppConfig, targets: list[AccountRecord], duration: float = 45.0, report: Any = print
+) -> list[WarmUpResult]:
+    """Warm `targets` up one after another (a pause between them); `report` gets one line per account."""
+    warmer = AccountWarmer(cfg.browser)
+    results: list[WarmUpResult] = []
+    for index, account in enumerate(targets):
+        if index:
+            await asyncio.sleep(_pause_between_accounts(account))
+        res = await warmer.warm_up(account, duration_seconds=duration, db=db)
+        results.append(res)
+        report(f"[{'OK' if res.success else 'FAILED'}] {res.account_name}: {res.details}")
+    return results
+
+
+async def warm_selected_cli(
+    config_path: str,
+    names: list[str],
+    duration: float = 45.0,
+    headless: bool | None = None,
+    report: Any = print,
+) -> list[WarmUpResult]:
+    """Wizard «прогрев выбранных»: the accounts called `names`, in that order.
+
+    An account that has not signed in yet is signed in first (`_authenticate_account`, which also runs the 60 s
+    intro warm-up of a fresh account); the others go through the same `warm_accounts` as `--warm-quarantined`.
+    An account past ageing needs no warm-up and comes back as a successful "skipped" result.
+    """
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    results: list[WarmUpResult] = []
+    async with Database(cfg.app.db_path) as db:
+        for index, name in enumerate(names):
+            account = await db.get_account(name)
+            if account is not None and index and (account.auth_status != "authenticated" or warm_candidates([account])):
                 await asyncio.sleep(_pause_between_accounts(account))
-            res = await warmer.warm_up(account, duration_seconds=duration, db=db)
-            failed += not res.success
-            print(f"[{'OK' if res.success else 'FAILED'}] {res.account_name}: {res.details}")
-        return not failed
-
-
-def _quota_today(account: AccountRecord, limit: int, now: datetime) -> int:
-    """Comments counted for today: the stored counter restarts once the daily reset moment has passed."""
-    reset_at = AccountLifecycleEngine.parse_utc(account.daily_limit_reset_at)
-    return 0 if reset_at is None or now >= reset_at else account.daily_comments_done
+            if account is None:
+                results.append(WarmUpResult(name, False, None, 0.0, "account not found"))
+            elif account.auth_status != "authenticated":
+                ok = await _authenticate_account(db, cfg, account)
+                details = "signed in, intro warm-up done" if ok else "sign-in failed"
+                results.append(WarmUpResult(account.name, ok, None, 0.0, details))
+            elif warm_candidates([account]):
+                results.extend(await warm_accounts(db, cfg, [account], duration, report=lambda _line: None))
+            else:
+                results.append(WarmUpResult(account.name, True, None, 0.0, "skipped: past quarantine and ageing"))
+            report(f"[{'OK' if results[-1].success else 'FAILED'}] {results[-1].account_name}: {results[-1].details}")
+    return results
 
 
 async def lifecycle_cli(config_path: str = "config.yaml") -> None:
@@ -477,15 +550,14 @@ async def lifecycle_cli(config_path: str = "config.yaml") -> None:
             )
             print("-" * width)
             for acc in accounts:
-                if acc.auth_status != "authenticated":
-                    age, stage, left, quota = "-", "-", "-", "-"
+                view = AccountLifecycleEngine.summarize(acc, now)
+                stage = view.stage
+                if view.age_hours is None:
+                    age, left, quota = "-", "-", "-"
                 else:
-                    stage, limit = AccountLifecycleEngine.calculate_stage(acc, now)
-                    if acc.consecutive_errors >= 3:
-                        stage = "restricted"
-                    age = f"{AccountLifecycleEngine.age_hours(acc, now):.1f}h"
-                    left = f"{AccountLifecycleEngine.quarantine_hours_left(acc, now):.1f}h"
-                    quota = f"{_quota_today(acc, limit, now)}/{limit}"
+                    age = f"{view.age_hours:.1f}h"
+                    left = f"{view.quarantine_left:.1f}h"
+                    quota = f"{view.quota_done}/{view.quota_limit}"
                 print(
                     f"{acc.name:<16} | {acc.auth_status:<13} | {age:>7} | {stage:<11} | {left:>10} | "
                     f"{quota:>7} | {acc.consecutive_errors:>6} | {acc.warmup_sessions_done:>8}"

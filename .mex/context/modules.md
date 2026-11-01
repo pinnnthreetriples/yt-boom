@@ -16,7 +16,7 @@ edges:
   - target: context/conventions.md
     condition: when extending or modifying module code
 grounds_to: []
-last_updated: 2026-10-31
+last_updated: 2026-11-01
 mex:
   id: mx_01M69V83DQFH77W8JJ4KS4EWP9
   type: component
@@ -45,13 +45,13 @@ The `modules/` directory contains the core implementation layer of the YouTube c
 - **`youtube_collector.py` & `collector.py`**: High-performance HTTP-level InnerTube search and nested comment thread extraction.
 - **`processor.py` & `interaction_simulator.py`**: DeepSeek AI text payload generation, typography formatting, and human-like Bezier cursor/keyboard simulation.
 - **`multi_account_orchestrator.py` & `pool_manager.py`**: Target queue coordination across multiple browser contexts and accounts.
-- **`wizard.py` & `tui.py`**: Terminal UI and onboarding wizard for interactive workflow execution.
+- **`wizard.py`, `account_menu_logic.py` & `tui.py`**: Terminal UI and onboarding wizard for interactive workflow execution; `account_menu_logic.py` holds the pure parts of the «Аккаунты» screen (warm-up pick, import summary, lifecycle rows).
 
 <!-- mex:entity
 id: mx_01M69V83D1FY43YN45W86J7DN9
 type: fact
 status: promoted
-revision: 1
+revision: 2
 metadata:
   aliases:
     - reply button selector
@@ -71,8 +71,8 @@ provenance:
 grounds_to:
   - file: modules/youtube_runner.py
     node: class:85ef316144e0d4344be7913a9cee5599
-    fingerprint: mh2:64:-x0ACCC6AJLGjAAjMu0ANhf9AJ2IhwCJo2MAGsYCAILzvAANINUAZ2LrAEL38AA6Ly4BCbx_AGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgEiNqQAAFmgABAKDQCBl2sAcycWADZV3gBf6R4AoWVhAHY6tgAZISIAK97AAQwfWAAGsfkAKe9tAAonowAY3IcBJs3fAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QAy5ckAanIyAU1lUgDq91IACsL3ACEF6AB1baAAK2e3ABB75wD607UABo7jAIoZCgB-ffsAECwLAV1jqwAtEfoAPyvlAAA
-    bodyHash: 50e61b6bb6b7f03f620857b17884a9bc70b87cc33fbbb278308b20f7d8974630
+    fingerprint: mh2:64:8B0ACCC6AJLGjAAjMu0ANhf9AJ2IhwCJo2MAGsYCAILzvAANINUAZ2LrAEL38AA6Ly4BCbx_AGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgEiNqQAAFmgABAKDQCBl2sAcycWADZV3gBf6R4AoWVhAHY6tgAZISIAK97AAQwfWAAGsfkAKe9tAAonowAY3IcBJs3fAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QAy5ckAanIyAU1lUgDq91IACsL3ACEF6AB1baAAK2e3ABB75wD607UABo7jAIoZCgB-ffsAECwLAV1jqwAtEfoAPyvlAAA
+    bodyHash: 4add449f78da828b3cb9405beb660d06c31a6d764a966463648a29e2cc8aae79
 -->
 ## Dynamic Reply Button Structural Selector
 
@@ -82,7 +82,7 @@ YouTube renders a standard button tag inside #reply-button-end for accounts with
 id: mx_01M69V83EEQ4MW6R1704RH4P3T
 type: fact
 status: promoted
-revision: 1
+revision: 2
 metadata:
   aliases:
     - first reply modal
@@ -102,8 +102,8 @@ provenance:
 grounds_to:
   - file: modules/youtube_runner.py
     node: class:85ef316144e0d4344be7913a9cee5599
-    fingerprint: mh2:64:-x0ACCC6AJLGjAAjMu0ANhf9AJ2IhwCJo2MAGsYCAILzvAANINUAZ2LrAEL38AA6Ly4BCbx_AGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgEiNqQAAFmgABAKDQCBl2sAcycWADZV3gBf6R4AoWVhAHY6tgAZISIAK97AAQwfWAAGsfkAKe9tAAonowAY3IcBJs3fAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QAy5ckAanIyAU1lUgDq91IACsL3ACEF6AB1baAAK2e3ABB75wD607UABo7jAIoZCgB-ffsAECwLAV1jqwAtEfoAPyvlAAA
-    bodyHash: 50e61b6bb6b7f03f620857b17884a9bc70b87cc33fbbb278308b20f7d8974630
+    fingerprint: mh2:64:8B0ACCC6AJLGjAAjMu0ANhf9AJ2IhwCJo2MAGsYCAILzvAANINUAZ2LrAEL38AA6Ly4BCbx_AGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgEiNqQAAFmgABAKDQCBl2sAcycWADZV3gBf6R4AoWVhAHY6tgAZISIAK97AAQwfWAAGsfkAKe9tAAonowAY3IcBJs3fAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QAy5ckAanIyAU1lUgDq91IACsL3ACEF6AB1baAAK2e3ABB75wD607UABo7jAIoZCgB-ffsAECwLAV1jqwAtEfoAPyvlAAA
+    bodyHash: 4add449f78da828b3cb9405beb660d06c31a6d764a966463648a29e2cc8aae79
 -->
 ## In-Situ Channel Creation Dialog Confirmation
 
@@ -113,7 +113,7 @@ When an account without a channel triggers a reply, YouTube displays an in-situ 
 id: mx_01M69V83EVJS28SR4738FTRSWZ
 type: fact
 status: promoted
-revision: 1
+revision: 2
 metadata:
   aliases:
     - gecko multi-process
@@ -133,8 +133,8 @@ provenance:
 grounds_to:
   - file: modules/youtube_runner.py
     node: class:85ef316144e0d4344be7913a9cee5599
-    fingerprint: mh2:64:-x0ACCC6AJLGjAAjMu0ANhf9AJ2IhwCJo2MAGsYCAILzvAANINUAZ2LrAEL38AA6Ly4BCbx_AGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgEiNqQAAFmgABAKDQCBl2sAcycWADZV3gBf6R4AoWVhAHY6tgAZISIAK97AAQwfWAAGsfkAKe9tAAonowAY3IcBJs3fAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QAy5ckAanIyAU1lUgDq91IACsL3ACEF6AB1baAAK2e3ABB75wD607UABo7jAIoZCgB-ffsAECwLAV1jqwAtEfoAPyvlAAA
-    bodyHash: 50e61b6bb6b7f03f620857b17884a9bc70b87cc33fbbb278308b20f7d8974630
+    fingerprint: mh2:64:8B0ACCC6AJLGjAAjMu0ANhf9AJ2IhwCJo2MAGsYCAILzvAANINUAZ2LrAEL38AA6Ly4BCbx_AGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgEiNqQAAFmgABAKDQCBl2sAcycWADZV3gBf6R4AoWVhAHY6tgAZISIAK97AAQwfWAAGsfkAKe9tAAonowAY3IcBJs3fAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QAy5ckAanIyAU1lUgDq91IACsL3ACEF6AB1baAAK2e3ABB75wD607UABo7jAIoZCgB-ffsAECwLAV1jqwAtEfoAPyvlAAA
+    bodyHash: 4add449f78da828b3cb9405beb660d06c31a6d764a966463648a29e2cc8aae79
 -->
 ## Gecko Multi-Process and Background Performance Preferences
 
@@ -144,7 +144,7 @@ Camoufox browser launch options in _launch_options explicitly set dom.min_backgr
 id: mx_01M69V83F787NRQF2BY9CP7PFJ
 type: fact
 status: promoted
-revision: 1
+revision: 2
 metadata:
   aliases:
     - aria-live false error
@@ -164,8 +164,8 @@ provenance:
 grounds_to:
   - file: modules/google_authenticator.py
     node: class:c0c2d2ee349a3dee74942def60291483
-    fingerprint: mh2:64:phkAiTAnAJLGjAAjMu0ANhf9AJ2IhwAvuhQALxSOAM4iSgACLoYAU7PCAF6OnACr5c4ABd5_AI6e6QAnEbwAicbSAYxy0QAcio0Bu5WOABe5FgCDROgAAFmgABAKDQCV-t8Bi3h5ADZV3gBf6R4AoWVhABMbaAAZISIApav2AQwfWABDbkcAKe9tAD2wZQATjUcBnxoTAAz3cwACj6QAV0JzAPZ2egB73HoADJzBABNTjwBViK0ANKY-AIPpDgD9iq8AanIyAD5FVADNt_sAGNgkALsctAAHvq4A_vFbABB75wDmQScAGeHYAIoZCgELVL8AECwLAGgbXgAJHdYAhMkDAAA
-    bodyHash: 7491242c9bc7af8926a31fcda4da14c9a16df6ad921ca80cf9dcb80321b55031
+    fingerprint: mh2:64:5RsAiTAnAJLGjAAjMu0ANhf9AJ2IhwAvuhQAGsYCAILzvAACLoYAU7PCAF6OnACr5c4ABd5_AI6e6QAnEbwAicbSAYxy0QAcio0Bu5WOABe5FgCDROgAAFmgABAKDQCV-t8Bi3h5ADZV3gBf6R4AoWVhABMbaAAZISIApav2AQwfWAAoDkcAKe9tAD2wZQATjUcBnxoTAAz3cwACj6QAV0JzAPZ2egB73HoADJzBABNTjwBViK0ANKY-AIPpDgD9iq8AanIyAD5FVADNt_sAGNgkALsctAAHvq4AK2e3ABB75wAN8k0AGeHYAIoZCgELVL8AECwLAGgbXgAJHdYAHRaTAAA
+    bodyHash: a2bbbcbad5126a0b9e2f8d4e6c563776c537af6a1e4d9cabf0f44b93b3f4707e
 -->
 ## Material 3 Informative Banner Filtering
 
@@ -175,7 +175,7 @@ _visible_error_text checks aria-live=assertive and role=alert elements while fil
 id: mx_01M69V83FJG4PY67ZHZJJT34H9
 type: fact
 status: promoted
-revision: 1
+revision: 2
 metadata:
   aliases:
     - google passkey prompt
@@ -195,8 +195,8 @@ provenance:
 grounds_to:
   - file: modules/google_authenticator.py
     node: class:c0c2d2ee349a3dee74942def60291483
-    fingerprint: mh2:64:phkAiTAnAJLGjAAjMu0ANhf9AJ2IhwAvuhQALxSOAM4iSgACLoYAU7PCAF6OnACr5c4ABd5_AI6e6QAnEbwAicbSAYxy0QAcio0Bu5WOABe5FgCDROgAAFmgABAKDQCV-t8Bi3h5ADZV3gBf6R4AoWVhABMbaAAZISIApav2AQwfWABDbkcAKe9tAD2wZQATjUcBnxoTAAz3cwACj6QAV0JzAPZ2egB73HoADJzBABNTjwBViK0ANKY-AIPpDgD9iq8AanIyAD5FVADNt_sAGNgkALsctAAHvq4A_vFbABB75wDmQScAGeHYAIoZCgELVL8AECwLAGgbXgAJHdYAhMkDAAA
-    bodyHash: 7491242c9bc7af8926a31fcda4da14c9a16df6ad921ca80cf9dcb80321b55031
+    fingerprint: mh2:64:5RsAiTAnAJLGjAAjMu0ANhf9AJ2IhwAvuhQAGsYCAILzvAACLoYAU7PCAF6OnACr5c4ABd5_AI6e6QAnEbwAicbSAYxy0QAcio0Bu5WOABe5FgCDROgAAFmgABAKDQCV-t8Bi3h5ADZV3gBf6R4AoWVhABMbaAAZISIApav2AQwfWAAoDkcAKe9tAD2wZQATjUcBnxoTAAz3cwACj6QAV0JzAPZ2egB73HoADJzBABNTjwBViK0ANKY-AIPpDgD9iq8AanIyAD5FVADNt_sAGNgkALsctAAHvq4AK2e3ABB75wAN8k0AGeHYAIoZCgELVL8AECwLAGgbXgAJHdYAHRaTAAA
+    bodyHash: a2bbbcbad5126a0b9e2f8d4e6c563776c537af6a1e4d9cabf0f44b93b3f4707e
 -->
 ## Google Sign-in Security Speedbump Interstitial Dismissal
 
@@ -237,7 +237,7 @@ generate_fresh_totp checks remaining time in the current 30-second RFC 6238 wind
 id: mx_01M69V83G98FV8QFYQ5BZE6WZD
 type: fact
 status: promoted
-revision: 1
+revision: 2
 metadata:
   aliases:
     - session fingerprint reuse
@@ -257,8 +257,8 @@ provenance:
 grounds_to:
   - file: modules/fingerprint_manager.py
     node: function:395aae1edefb6a66fa1262fbd0678998
-    fingerprint: mh2:64:kwEEKNKHBREegQPBgCIAYcNMBSHQUgHL0vAAZUJaAQMmtQD7tsIDC6s3ARFMcAAIJ50ChJDOApdzOgBJZz0Bpv1yAYxy0QqFcwwCO9WzAVCoDQCmqrMB6BhkABuabACV-t8B2FU8A1kiEwNXNzwA_X64ATWQzQKaVlcAK97ACL61TQBDbkcCj9O4BSxNsgSEW3oClhKsAAz3cwNlL5kCcFWdAcS_ugSTL_0ADJzBBmcJtwBViK0AS7HsAP2N5gdaC_4CiqlrAV4XVQDq91IBpc_cALsctAB7AUYA_vFbASlVdwM68x0BbzVhB-dHXAMGFEgBCgpqBd3XXQOftmcAHRaTAghmdW5jdGlvbgZtZXRob2QKAFI7_AD1xGu1ykBN5eWjH8kAvRPowios1bJcnp0wq0nj8AE2r22M0pDtaOZ7mYOeObD0ATd7-2JUjajoE5OHNb9oI8UBR7W153LqyrmQeBB79O3bngFP56Z4crVh-dPy1ihvboQeAV0rdGzfMzq01c7pXHDKGS0BmNDEerDip-tl7pF_cAwckAHjmBjosmKTAlY3dnqFHNq3AeqpTR6Pl9b7K2rHcHInh_M
-    bodyHash: 0bd70e4369fc26a8f3f3c2c9379eb47f2a8f5ec4177c014d90042470638bf7f3
+    fingerprint: mh2:64:4AEBETRmA1BViQPBgCIAYcNMADitfwHL0vAAZUJaAQMmtQD7tsIDC6s3ARFMcAAIJ50ChJDOApdzOgBJZz0Bpv1yALJDigEWGqoCO9WzAVCoDQCmqrMB6BhkABuabACV-t8B2FU8A1kiEwLwxawA_X64ATWQzQFmOe4AK97ABQI_eABDbkcCj9O4AFsP2AFioVwClhKsAAz3cwNlL5kAV0JzAcS_ugQ6czoADJzBBjc6wABViK0AS7HsAP2N5gKCzWUBKHU_AV4XVQDq91IBpc_cALsctAB7AUYA_vFbASlVdwM68x0AG33ZAMpWpQMGFEgBCgpqAXsehAFfY3kAHRaTAghmdW5jdGlvbgZtZXRob2QOAD_MefwjYjq5gXgNwiu1zTgAUjv8APXEa7XKQE3l5aMfyQC9E-jCKizVslyenTCrSePwATavbYzSkO1o5nuZg545sPQBN3v7YlSNqOgTk4c1v2gjxQFHtbXncurKuZB4EHv07dueAU_npnhytWH50_LWKG9uhB4BXSt0bN8zOrTVzulccMoZLQFiIo_en1e4B-jiVOsSmFOMAZjQxHqw4qfrZe6Rf3AMHJAB45gY6LJikwJWN3Z6hRzatwHqqU0ej5fW-ytqx3ByJ4fzAfnvR87WP8dNwIAET5_maDUB-t0XXX7HzXlA4EO600xEtA
+    bodyHash: 31b0556c265976798c91866abe9060cb872167237769caeaa5d6871f71c28136
 -->
 ## Persistent Hardware Fingerprint Pinning
 
@@ -392,7 +392,7 @@ normalize_text transforms AI-generated reply payloads by replacing em/en-dashes 
 id: mx_01M69V83JBDF0G7P1FQ3N7GYYT
 type: fact
 status: promoted
-revision: 1
+revision: 2
 metadata:
   aliases:
     - multi account concurrency
@@ -412,8 +412,8 @@ provenance:
 grounds_to:
   - file: modules/multi_account_orchestrator.py
     node: class:9f36d77b1dd835ea96e34e5417aa8189
-    fingerprint: mh2:64:oxcAI1FRAJLGjAB8NIgANhf9AfI7vAAjdmUAGsYCAKvVAQACLoYAU7PCAInIMAA6Ly4ABd5_AI6e6QBJZz0AicbSADgz6wBmH7wBFGhLABe5FgC4L80AU7KSABAKDQBXiaIA74jRAEISzwBf6R4AoWVhALue2QAVlAMAK97AAW5k4wBDbkcAKe9tAFsP2AFioVwAFbWSAAz3cwE3jLwAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QJ9JbYAeSW1AN6XYADq91IBEhruALsctACMdGUAK2e3AFkUCwAaD6UAG33ZADNBbAClF9cAH2ByAXsehAAtEfoAhMkDAAA
-    bodyHash: 5191a1afaf178c8f7bde6d23c538f878542ea008eb1cf9dbfdd7f95becf7c44d
+    fingerprint: mh2:64:qx4ACCC6AJLGjAB8NIgANhf9AJ2IhwAjdmUAGsYCAILzvAACLoYAU7PCAInIMAA6Ly4ABd5_AI6e6QBJZz0AicbSADgz6wBmH7wBFGhLABe5FgC4L80AU7KSABAKDQBXiaIAcycWAEISzwBf6R4AoWVhALXd3QAVlAMAK97AAW5k4wBDbkcAKe9tAA2ThQFioVwAFbWSAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwA6M2gAS7HsADim4QD9iq8AeSW1AGQeYADq91IBEhruALsctAB1baAAK2e3AFkUCwAaD6UAG33ZADNBbAClF9cAH2ByAHex5gAtEfoAhMkDAAA
+    bodyHash: a75fc99182321442bf4b9a472bc85f200bd3b8ba2b3aec25f8143d1c50b6f6b3
 -->
 ## Multi-Account Parallel Execution Modes
 

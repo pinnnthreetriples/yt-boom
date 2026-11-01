@@ -36,6 +36,21 @@ class EligibilityResult:
     retry_after_sec: float | None = None
 
 
+@dataclass(frozen=True)
+class LifecycleView:
+    """What `--lifecycle` and the wizard show for one account; the numbers are None until it has signed in."""
+
+    stage: str  # a LifecycleStageName, or "-" for an account that is not authenticated
+    age_hours: float | None = None
+    quarantine_left: float | None = None
+    quota_done: int | None = None
+    quota_limit: int | None = None
+
+    @property
+    def restricted(self) -> bool:
+        return self.stage == "restricted"
+
+
 def _parse_utc(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -91,6 +106,29 @@ class AccountLifecycleEngine:
     @classmethod
     def quarantine_hours_left(cls, account: AccountRecord, now: datetime | None = None) -> float:
         return max(0.0, cls.STAGE_RULES["quarantine"].end_hour - cls.age_hours(account, now))
+
+    @classmethod
+    def quota_today(cls, account: AccountRecord, now: datetime | None = None) -> int:
+        """Comments counted for today: the stored counter restarts once the daily reset moment has passed."""
+        reset_at = _parse_utc(account.daily_limit_reset_at)
+        return 0 if reset_at is None or cls._now(now) >= reset_at else account.daily_comments_done
+
+    @classmethod
+    def summarize(cls, account: AccountRecord, now: datetime | None = None) -> LifecycleView:
+        """Stage, age, quarantine hours left and today's quota of `account` (circuit breaker shows as "restricted")."""
+        if account.auth_status != "authenticated":
+            return LifecycleView("-")
+        now = cls._now(now)
+        stage, limit = cls.calculate_stage(account, now)
+        if account.consecutive_errors >= CIRCUIT_BREAKER_ERRORS:
+            stage = "restricted"
+        return LifecycleView(
+            stage,
+            cls.age_hours(account, now),
+            cls.quarantine_hours_left(account, now),
+            cls.quota_today(account, now),
+            limit,
+        )
 
     @classmethod
     def cooldown_sec(cls, stage: str, last_comment_at: str | None) -> float | None:
@@ -169,5 +207,6 @@ __all__ = [
     "CIRCUIT_BREAKER_ERRORS",
     "EligibilityResult",
     "LifecycleStageName",
+    "LifecycleView",
     "StageRule",
 ]

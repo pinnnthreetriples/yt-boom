@@ -547,6 +547,9 @@ def step_account(config_path: Path, session_root: Path) -> bool:
         ("2", "Проверить вход", "", ""),
         ("7", "Переименовать", "имя для вас: ник или почта", CLR_DIM),
         ("3", "Выйти из аккаунта", "удалить сохранённую сессию", CLR_DIM),
+        ("5", "Импорт аккаунтов", "файл или вставка строк", CLR_DIM),
+        ("6", "Прогрев", "карантин и aging одним кликом", CLR_DIM),
+        ("8", "Жизненный цикл", "стадии, квоты, heartbeat", CLR_DIM),
         None,
         ("4", "Продолжить →", "", ""),
         ("0", "← Назад", "", ""),
@@ -586,6 +589,19 @@ def step_account(config_path: Path, session_root: Path) -> bool:
 
         if choice == "7":
             notice = _setup_rename(config_path, accounts) if accounts else ("warn", "Аккаунтов нет")
+            redraw = True
+            continue
+
+        if choice == "5":
+            notice, redraw = _setup_import(config_path), True
+            continue
+
+        if choice == "6":
+            notice, redraw = _setup_warmup_all(config_path), True
+            continue
+
+        if choice == "8":
+            _setup_lifecycle(config_path)
             redraw = True
             continue
 
@@ -729,6 +745,201 @@ def _setup_clear_session(session_root: Path, account: Any) -> tuple[bool, str]:
         return True, f"Сессия «{account.name}» удалена"
     except Exception as exc:
         return False, f"Не удалось удалить сессию (закройте окно браузера): {exc}"
+
+
+WARM_UP_SECONDS = 45.0  # same default as `--warm-up-duration`
+_LIFECYCLE_MAX_ROWS = 15
+
+
+def _read_secret_line(prompt: str) -> str:
+    """One line typed or pasted without echo (the lines hold passwords); Ctrl+C / EOF cancel like prompt_user."""
+    import getpass
+
+    try:
+        return getpass.getpass(prompt)
+    except (KeyboardInterrupt, EOFError):
+        safe_print(f"\n{color('[!]', CLR_YELLOW)} Операция отменена.")
+        raise WizardBack()
+
+
+def _read_account_paste() -> list[str]:
+    """Pasted `login:password:TOTP_SECRET` lines, one per account, until an empty line; nothing is echoed back."""
+    safe_print(color(" Вставьте строки login:password:TOTP_SECRET — по одной на аккаунт.", CLR_DIM))
+    safe_print(color(" Ввод не отображается. Пустая строка — конец.", CLR_DIM))
+    lines: list[str] = []
+    while True:
+        line = _read_secret_line(f" {len(lines) + 1:>3} › ")
+        if not line.strip():
+            return lines
+        lines.append(line)
+
+
+def _read_accounts_file() -> list[str] | None:
+    """Ask for a path (default accounts.txt) and read it; None = cancelled or unreadable (the reason is shown)."""
+    path = prompt_user("Путь к файлу с аккаунтами (login:password:TOTP_SECRET в строке)", "accounts.txt").strip("\"' ")
+    if not path:
+        return None
+    try:
+        return Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        tui.status_line("err", f"Не удалось прочитать файл: {exc.strerror or exc.__class__.__name__}")
+        return None
+
+
+def _setup_register(config_path: Path, lines: list[str]) -> Any:
+    """Register the account lines through the CLI importer (existing accounts are skipped, not overwritten)."""
+    from config import load_config
+    from youtube_bot import register_account_lines
+
+    cfg = load_config(config_path)
+    return _pools_db(config_path, lambda db: register_account_lines(db, cfg, lines, skip_existing=True))
+
+
+def _setup_pick_warmup(added: list[Any]) -> list[str]:
+    """Numbered list of the fresh accounts and the question who to warm up; returns their names (may be empty)."""
+    from modules.account_menu_logic import parse_warm_selection
+
+    safe_print()
+    for number, acc in enumerate(added, 1):
+        safe_print(f"   {color(f'{number:>2}.', CLR_YELLOW)} {_fit(acc.name, MENU_WIDTH - 8)}")
+    while True:
+        try:
+            answer = prompt_user("В прогрев: a — всех, n — никого, или номера через пробел (1 3 5)", "n")
+        except WizardBack:
+            return []
+        try:
+            return [added[i].name for i in parse_warm_selection(answer, len(added))]
+        except ValueError as exc:
+            tui.status_line("warn", str(exc))
+
+
+def _setup_import(config_path: Path) -> tuple[str, str] | None:
+    """«Импорт аккаунтов»: a file or a pasted list → register → optional warm-up of the fresh accounts.
+
+    Prints the summary itself (the screen is redrawn afterwards) and returns a one-line notice.
+    """
+    from modules.account_menu_logic import clean_pasted_lines, count_account_lines, format_import_summary
+
+    rows: list[MenuRow | None] = [
+        ("1", "Из файла", "accounts.txt — строка на аккаунт", CLR_DIM),
+        ("2", "Вставить строки", "login:password:TOTP, пустая строка — конец", CLR_DIM),
+        None,
+        ("0", "← Отмена", "", ""),
+    ]
+    choice = _pools_choice(rows, [color(" Импорт аккаунтов", CLR_BOLD)])
+    try:
+        lines = _read_accounts_file() if choice == "1" else _read_account_paste() if choice == "2" else None
+    except WizardBack:
+        lines = None
+    if lines is None:
+        return None
+    lines = clean_pasted_lines(lines)
+    account_lines = count_account_lines(lines)
+    if not account_lines:
+        for kind, text in format_import_summary(0, [], [], 0):
+            tui.status_line(kind, text)
+        _pause()
+        return None
+
+    try:
+        result = _setup_register(config_path, lines)
+    except Exception as exc:  # a broken DB or config: the lines are not in the message
+        return "err", f"Импорт не выполнен: {exc.__class__.__name__}"
+    safe_print()
+    for kind, text in format_import_summary(len(result.added), result.skipped, result.errors, account_lines):
+        tui.status_line(kind, text)
+
+    if result.added:
+        names = _setup_pick_warmup(result.added)
+        if names:
+            tui.status_line("info", f"Прогрев: {len(names)} акк. — не закрывайте окна браузера")
+            tui.status_line(*_setup_run_warmup(config_path, names))
+    _pause()
+    return ("ok" if result.added else "warn"), f"Импорт: добавлено {len(result.added)} из {account_lines}"
+
+
+def _setup_run_warmup(config_path: Path, names: list[str] | None = None) -> tuple[str, str]:
+    """Run the warm-up and return its (kind, summary); the per-account lines are printed as they come.
+
+    `names` None: every signed-in account in quarantine or ageing (like `--warm-quarantined`); otherwise the picked
+    accounts — a not yet signed-in one is signed in first. Both go through the CLI's `warm_accounts`.
+    """
+    from config import load_config
+    from modules.account_menu_logic import format_warm_summary
+    from youtube_bot import warm_accounts, warm_candidates, warm_selected_cli
+
+    def report(line: str) -> None:
+        safe_print(f" {line}")
+
+    try:
+        if names is None:
+            targets = warm_candidates(_pools_db(config_path, lambda db: db.list_active_accounts()))
+            if not targets:
+                return "warn", "Нет вошедших аккаунтов в карантине или aging"
+            question = f"Прогреть аккаунтов: {len(targets)} (~{WARM_UP_SECONDS:.0f} с каждый, откроется браузер)? (y/N)"
+            if not _yes(prompt_user(question, "n")):
+                return "info", "Отменено"
+            cfg = load_config(config_path)
+            results = _pools_db(config_path, lambda db: warm_accounts(db, cfg, targets, WARM_UP_SECONDS, report=report))
+        else:
+            results = asyncio.run(warm_selected_cli(str(config_path), names, WARM_UP_SECONDS, report=report))
+    except WizardBack:
+        return "info", "Отменено"
+    except KeyboardInterrupt:
+        return "warn", "Прогрев прерван"
+    except Exception as exc:
+        return "err", f"Прогрев не удался: {exc.__class__.__name__}: {exc}"
+    return format_warm_summary(results)
+
+
+def _setup_warmup_all(config_path: Path) -> tuple[str, str]:
+    """«Прогрев»: all signed-in quarantine/aging accounts after a short confirmation; summary stays until Enter."""
+    kind, text = _setup_run_warmup(config_path)
+    tui.status_line(kind, text)
+    _pause()
+    return kind, text
+
+
+def _setup_lifecycle(config_path: Path) -> None:
+    """«Жизненный цикл»: read-only table of stage, today's quota, heartbeat and pause/breaker per account."""
+    from modules.account_menu_logic import lifecycle_rows
+    from modules.session_heartbeat import check_session_offline
+
+    try:
+        accounts = _pools_db(config_path, lambda db: db.list_accounts())
+    except Exception as exc:
+        tui.status_line("err", f"Не удалось прочитать аккаунты: {exc.__class__.__name__}")
+        _pause()
+        return
+    clear_terminal()
+    tui.section_header("Жизненный цикл", "стадия · квота за сутки · heartbeat · пауза")
+    if not accounts:
+        tui.status_line("warn", "Аккаунтов нет — добавьте или импортируйте")
+        _pause()
+        return
+    rows = lifecycle_rows(accounts, lambda a: check_session_offline(a.session_path, a.name).is_alive)
+    shown = rows[:_LIFECYCLE_MAX_ROWS]
+    stage_w, quota_w, beat_w = 10, 5, 15
+    name_w = min(18, max(len("Аккаунт"), *(len(row.name) for row in shown)))  # accounts are often named by e-mail
+    pause_w = MENU_WIDTH - 3 - name_w - stage_w - quota_w - beat_w - 8
+    styles = {"ok": CLR_GREEN, "warn": CLR_YELLOW, "err": CLR_RED, "accent": CLR_CYAN, "dim": CLR_DIM, "": ""}
+
+    def cell(text: str, width: int, style: str = "") -> str:
+        padded = f"{_fit(text, width):<{width}}"
+        return color(padded, styles.get(style, "")) if styles.get(style) else padded
+
+    safe_print(color(
+        f"   {'Аккаунт':<{name_w}}  {'Стадия':<{stage_w}}  {'Квота':<{quota_w}}  {'Heartbeat':<{beat_w}}  Пауза", CLR_DIM,
+    ))
+    for row in shown:
+        safe_print(
+            f"   {cell(row.name, name_w, '')}  {cell(row.stage, stage_w, row.stage_style)}  {cell(row.quota, quota_w)}"
+            f"  {cell(row.heartbeat, beat_w, row.heartbeat_style)}  {cell(row.pause, pause_w, row.pause_style)}".rstrip()
+        )
+    if len(rows) > len(shown):
+        safe_print(color(f"   … ещё {len(rows) - len(shown)}", CLR_DIM))
+    safe_print(color("   Квота — комментарии за сутки / лимит стадии. Heartbeat: сессия · последний прогрев.", CLR_DIM))
+    _pause()
 
 
 def step_deepseek(config_path: Path, current_key: str, base_url: str) -> str:
