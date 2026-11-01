@@ -15,6 +15,7 @@ from modules.account_parser import parse_account_line
 from modules.google_authenticator import GoogleAuthError
 from modules.multi_account_orchestrator import MultiAccountOrchestrator
 from modules.session_heartbeat import check_account_heartbeat
+from modules.ui_test_runner import UITestRunner
 from modules.youtube_runner import YouTubeRunner
 
 SECRET = "JBSWY3DPEHPK3PXP"
@@ -23,6 +24,13 @@ SECRET = "JBSWY3DPEHPK3PXP"
 def _target() -> TargetSettings:
     return TargetSettings(
         name="youtube", base_url="https://www.youtube.com", submit_input_selector="i",
+        submit_button_selector="b", confirmation_selector="c",
+    )
+
+
+def _other_target() -> TargetSettings:
+    return TargetSettings(
+        name="staging", base_url="https://staging.example.test", submit_input_selector="i",
         submit_button_selector="b", confirmation_selector="c",
     )
 
@@ -356,6 +364,22 @@ class TestLocaleOverride(_DbCase):
         account = AccountRecord(id=1, name="a", session_path=str(self.root / "a"), created_at="now", locale="pl-PL")
         runner = MultiAccountOrchestrator.create_runner(orchestrator, account)
         self.assertEqual(self._options(runner)["locale"], "pl-PL")
+
+    def test_ui_test_runner_uses_the_account_locale(self):
+        def options(**kwargs) -> dict:
+            return UITestRunner(_browser(self.root, locale="en-US"), _other_target(), **kwargs)._launch_options()
+
+        self.assertEqual(options(locale="pl-PL")["locale"], "pl-PL")
+        self.assertEqual(options()["locale"], "en-US")
+        self.assertEqual(options(locale=None)["locale"], "en-US")
+
+    async def test_ui_test_runner_hands_the_account_locale_to_the_youtube_runner(self):
+        runner = UITestRunner(_browser(self.root, locale="en-US"), _target(), locale="pl-PL")
+        with patch("modules.youtube_runner.YouTubeRunner") as youtube_runner:
+            youtube_runner.return_value.run = AsyncMock()
+            youtube_runner.return_value.close = AsyncMock()
+            await runner.run("text")
+        self.assertEqual(youtube_runner.call_args.kwargs["locale"], "pl-PL")
 
     async def test_heartbeat_uses_the_account_locale_for_accept_language(self):
         account = AccountRecord(id=1, name="a", session_path=str(self.root / "a"), created_at="now", locale="pl-PL")

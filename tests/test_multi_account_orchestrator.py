@@ -809,6 +809,15 @@ class TestVisibilityHook(TestLifecyclePacing):
             self.assertEqual(log.info.call_count, expected)
             self.assertIn(account.id, orchestrator._gated_accounts)
 
+    async def test_default_collector_uses_the_global_proxy(self) -> None:
+        """Without an injected collector the pool collects through `browser.proxy`; no proxy means direct."""
+        for proxy in ("socks5://1.2.3.4:1080", None):
+            with self.subTest(proxy=proxy):
+                self.config.browser.proxy = proxy
+                with patch("modules.multi_account_orchestrator.YouTubeCollector") as collector_cls:
+                    MultiAccountOrchestrator(self.config, db=self.db, processor=MagicMock())
+                collector_cls.assert_called_once_with(self.config.collector, proxy)
+
 
 if __name__ == "__main__":
     unittest.main()
