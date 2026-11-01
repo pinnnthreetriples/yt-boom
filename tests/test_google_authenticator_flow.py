@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import Error as PlaywrightError
 
@@ -26,6 +27,8 @@ class Screen:
     error: str | None = None
     on_enter: list | None = None  # [(delay_seconds, screen_name)] timeline started by Enter
     on_click: dict = field(default_factory=dict)  # selector substring -> screen_name
+    href: str | None = None  # href attribute of every visible element
+    html: str = ""  # page.content()
 
 
 class FakeLocator:
@@ -53,12 +56,15 @@ class FakeLocator:
     async def is_checked(self):
         return True
 
+    async def get_attribute(self, name):
+        return self.page.screen.href if name == "href" else None
+
 
 class FakePage:
     def __init__(self, screens, start):
         self.screens, self.name = screens, start
         self.timeline = []
-        self.typed, self.typed_into, self.clicks, self.gotos = [], [], [], []
+        self.typed, self.typed_into, self.clicks, self.gotos, self.goto_kwargs = [], [], [], [], []
         self.field_text, self.fills, self.loaded = "", 0, 0
         self.ytcfg = []
         self.keyboard = SimpleNamespace(press=self._press)
@@ -105,6 +111,10 @@ class FakePage:
 
     async def goto(self, url, **kwargs):
         self.gotos.append(url)
+        self.goto_kwargs.append(kwargs)
+
+    async def content(self):
+        return self.screen.html
 
     async def evaluate(self, script):
         result = self.ytcfg.pop(0)
@@ -351,6 +361,121 @@ class TestScreens(_FlowCase):
         page.visible = flaky
         await self.run_form(page)
         self.assertEqual(page.typed, ["pw"])
+
+
+SIGN_IN_HREF = (
+    "https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true"
+    "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26hl%3Dru%26next%3Dx&hl={hl}&ec=65620"
+)
+
+
+class TestSignInLanguage(_FlowCase):
+    def test_hl_en_is_added_and_every_other_parameter_is_kept(self):
+        original = SIGN_IN_HREF.format(hl="ru")
+        url = ga.with_hl_en(original)
+        before, after = parse_qs(urlparse(original).query), parse_qs(urlparse(url).query)
+        self.assertEqual(after.pop("hl"), ["en"])
+        before.pop("hl")
+        self.assertEqual(after, before)  # service, continue (still carrying its own hl=ru), ec...
+        self.assertEqual((urlparse(url).hostname, urlparse(url).path), ("accounts.google.com", "/ServiceLogin"))
+
+    def test_url_without_hl_and_with_a_duplicate_hl(self):
+        plain = parse_qs(urlparse(ga.with_hl_en("https://accounts.google.com/ServiceLogin?service=youtube")).query)
+        self.assertEqual(plain, {"service": ["youtube"], "hl": ["en"]})
+        twice = parse_qs(urlparse(ga.with_hl_en("https://accounts.google.com/x?hl=pl&a=1&hl=de")).query)
+        self.assertEqual(twice, {"a": ["1"], "hl": ["en"]})
+
+    async def _open(self, href):
+        page = FakePage({"home": Screen(HOME_URL, exact=frozenset({ga.SIGN_IN_LINK}), href=href)}, "home")
+        with patch.object(self.auth, "_dismiss_consent", AsyncMock()):
+            await self.auth._open_sign_in(page)
+        return page
+
+    async def test_a_non_english_sign_in_link_is_opened_with_hl_en_instead_of_clicked(self):
+        page = await self._open(SIGN_IN_HREF.format(hl="pl"))
+        self.assertEqual(page.gotos, [ga.YOUTUBE_HOME_URL, ga.with_hl_en(SIGN_IN_HREF.format(hl="pl"))])
+        self.assertEqual(parse_qs(urlparse(page.gotos[1]).query)["hl"], ["en"])
+        self.assertEqual(page.goto_kwargs[1]["referer"], HOME_URL)  # arrives from youtube.com like a click would
+        self.assertEqual(page.clicks, [])
+
+    async def test_an_english_sign_in_link_is_still_clicked(self):
+        page = await self._open(SIGN_IN_HREF.format(hl="en"))
+        self.assertEqual(page.gotos, [ga.YOUTUBE_HOME_URL])
+        self.assertEqual(page.clicks, [ga.SIGN_IN_LINK])
+
+    async def test_missing_or_foreign_href_falls_back_to_the_click(self):
+        for href in (None, "", "https://evil.example/ServiceLogin?service=youtube&hl=ru", "/ServiceLogin?hl=ru"):
+            with self.subTest(href=href):
+                page = await self._open(href)
+                self.assertEqual(page.gotos, [ga.YOUTUBE_HOME_URL])
+                self.assertEqual(page.clicks, [ga.SIGN_IN_LINK])
+
+
+UNKNOWN_URL = "https://accounts.google.com/v3/signin/weird?TL=SECRET_TOKEN&continue=https%3A%2F%2Fwww.youtube.com"
+UNKNOWN_HTML = """<html><body><h1 id="headingText">Choose how to verify</h1>
+<script>var t = "SECRET_TOKEN";</script>
+<input id="phone" name="phoneNumber" type="tel" value="+1 555 0100"><div data-email="alice@example.com">alice@example.com</div>
+<button id="x" jsname="abc">Continue</button></body></html>"""
+
+
+class TestUnknownScreenDump(_FlowCase):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.artifacts = Path(self.tmp.name) / "_artifacts"
+        self.auth = ga.GoogleAuthenticator(FakeSimulator(), artifacts_dir=self.artifacts)
+
+    def dumps(self):
+        return sorted(self.artifacts.glob("google_unknown_screen_*.html")) if self.artifacts.exists() else []
+
+    async def test_unknown_screen_writes_a_sanitized_snapshot_without_the_query(self):
+        page = FakePage({"x": Screen(UNKNOWN_URL, html=UNKNOWN_HTML)}, "x")
+        with self.assertRaisesRegex(ga.GoogleAuthError, "неизвестный экран"):
+            await self.run_form(page)
+        (dump,) = self.dumps()
+        text = dump.read_text(encoding="utf-8")
+        self.assertIn("accounts.google.com/v3/signin/weird", text)
+        self.assertIn('<button id="x" jsname="abc">', text)
+        self.assertIn("Choose how to verify", text)
+        self.assertIn('name="phoneNumber"', text)
+        for secret in ("SECRET_TOKEN", "alice", "555", "continue=", "?"):
+            self.assertNotIn(secret, text, secret)
+
+    async def test_no_dump_without_an_artifacts_dir_and_the_error_is_unchanged(self):
+        page = FakePage({"x": Screen(UNKNOWN_URL, html=UNKNOWN_HTML)}, "x")
+        auth = ga.GoogleAuthenticator(FakeSimulator())
+        with self.assertRaisesRegex(ga.GoogleAuthError, "неизвестный экран"):
+            await auth._run_form(page, "a@b.c", "pw", None, None, 10.0)
+        self.assertEqual(self.dumps(), [])
+
+    async def test_a_failing_dump_never_hides_the_auth_error(self):
+        blocked = Path(self.tmp.name) / "file"
+        blocked.write_text("not a directory", encoding="utf-8")
+        auth = ga.GoogleAuthenticator(FakeSimulator(), artifacts_dir=blocked / "_artifacts")
+        page = FakePage({"x": Screen(UNKNOWN_URL, html=UNKNOWN_HTML)}, "x")
+        with self.assertRaisesRegex(ga.GoogleAuthError, "неизвестный экран"):
+            await auth._run_form(page, "a@b.c", "pw", None, None, 10.0)
+
+    async def test_other_outcomes_write_nothing(self):
+        stuck_url = "https://accounts.google.com/v3/signin/speedbump/sticky"
+        wrong = Screen(
+            PWD_URL, exact=frozenset({ga.PASSWORD_INPUT[0], ga.ERROR_BLOCKS[0]}), error="Wrong password", html=UNKNOWN_HTML
+        )
+        cases = {
+            "captcha": (FakePage({"c": Screen(PWD_URL, exact=frozenset({ga.CAPTCHA_MARKERS[0]}), html=UNKNOWN_HTML)}, "c"), "капч"),
+            "stuck": (FakePage({"s": Screen(stuck_url, contains=('has-text("Skip")',), html=UNKNOWN_HTML)}, "s"), "застряли"),
+            "wrong password": (
+                FakePage({"pwd": Screen(PWD_URL, exact=PWD.exact, on_enter=[(0.05, "wrong")], html=UNKNOWN_HTML), "wrong": wrong}, "pwd"),
+                "неверный пароль",
+            ),
+        }
+        for name, (page, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ga.GoogleAuthError, message):
+                await self.run_form(page)
+        success = FakePage({"pwd": Screen(PWD_URL, exact=PWD.exact, on_enter=[(0.05, "home")], html=UNKNOWN_HTML), "home": HOME}, "pwd")
+        await self.run_form(success)
+        self.assertEqual(self.dumps(), [])
 
 
 class TestFirstVisible(unittest.IsolatedAsyncioTestCase):

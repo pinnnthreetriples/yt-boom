@@ -324,7 +324,7 @@ async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRe
     new_status: str | None = None
     try:
         await runner.start()
-        authenticator = GoogleAuthenticator(simulator)
+        authenticator = GoogleAuthenticator(simulator, artifacts_dir=cfg.browser.session_root / "_artifacts")
         authenticated = await authenticator.authenticate(
             runner.context,
             account.email,
