@@ -563,9 +563,10 @@ async def apply_profile_cli(identifier: str, config_path: str = "config.yaml", h
             print(f"[OK] {account.name}: nothing to apply (set the profile in the wizard: Accounts -> Channel profile).")
             return True
         res = await ProfileEditor(cfg.browser).apply(account, db)
-        kind, text = format_profile_summary(res.account_name, res.success, res.changed_fields, res.details)
-        print(f"[{'OK' if res.success else 'FAILED'}] {text}")
-        return res.success
+        _, text = format_profile_summary(res.account_name, res.success, res.changed_fields, res.details, res.skipped_fields)
+        done = res.success and not res.skipped_fields  # a name held back by YouTube's limit is still pending
+        print(f"[{'OK' if done else 'FAILED'}] {text}")
+        return done
 
 
 async def warm_quarantined_cli(

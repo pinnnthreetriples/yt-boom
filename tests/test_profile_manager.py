@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from config import BrowserSettings, TargetSettings
 from database import UNSET, AccountRecord, Database, RecordNotFoundError, recent_name_changes
@@ -122,6 +122,12 @@ class TestAvatarFiles(unittest.TestCase):
         self.assertNotEqual(first, other)
         self.assertTrue(Path(first).name.startswith("me_example.com-"))
         self.assertEqual(Path(first).read_bytes(), PNG)
+        self.assertEqual(sorted(p.suffix for p in store.iterdir()), [".jpg", ".png"])  # no *.part left behind
+
+    def test_accounts_with_the_same_sanitized_name_do_not_share_a_file(self):
+        store = self.root / "avatars"
+        picture = self.write("a.png", PNG)
+        self.assertNotEqual(import_avatar(picture, "a b", store), import_avatar(picture, "a_b", store))
 
     def test_forget_deletes_only_inside_the_store_and_respects_keep(self):
         store = self.root / "avatars"
@@ -201,6 +207,9 @@ class TestProfileState(unittest.TestCase):
         kind, text = format_profile_summary("a", True, ["name"], "лимит")
         self.assertEqual((kind, text.endswith("· лимит")), ("ok", True))
         self.assertEqual(format_profile_summary("a", False, [], "boom"), ("err", "Профиль «a»: не применён — boom"))
+        kind, text = format_profile_summary("a", True, [], "лимит", ["name"])
+        self.assertEqual(kind, "warn")
+        self.assertNotIn("уже актуален", text)
 
 
 class TestProfileDatabase(unittest.IsolatedAsyncioTestCase):
@@ -292,7 +301,7 @@ class TestProfileEditor(unittest.IsolatedAsyncioTestCase):
     def patched(self, **steps):
         """Replace the Studio steps by mocks (defaults: a fill that changed `name`)."""
         defaults = dict(
-            _open_profile_tab=AsyncMock(), _fill=AsyncMock(return_value=["name"]), _publish=AsyncMock(),
+            _open_profile_tab=AsyncMock(), _fill=AsyncMock(return_value=(["name"], [])), _publish=AsyncMock(),
             _verify=AsyncMock(), _avatar_src=AsyncMock(return_value=None),
         )
         for name, mock in {**defaults, **steps}.items():
@@ -313,14 +322,16 @@ class TestProfileEditor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.changed_fields, ("name",))
         self.editor._publish.assert_awaited_once()
         self.editor._verify.assert_awaited_once()
-        # description matched the live channel already: it is recorded as applied without being "changed"
-        self.db.record_account_profile_applied.assert_awaited_once_with(
-            1, {"avatar": "p/a.png", "name": "New", "description": "About"}, name_changed=True
-        )
+        # the name change is counted right after the publish, the snapshot after the check; description matched the
+        # live channel already: it is recorded as applied without being "changed"
+        self.assertEqual(self.db.record_account_profile_applied.await_args_list, [
+            call(1, {"avatar": "p/a.png"}, name_changed=True),
+            call(1, {"avatar": "p/a.png", "name": "New", "description": "About"}, name_changed=False),
+        ])
         self.runner.close.assert_awaited_once()
 
     async def test_no_difference_on_the_channel_skips_publish_but_marks_applied(self):
-        with self.patched(_fill=AsyncMock(return_value=[])):
+        with self.patched(_fill=AsyncMock(return_value=([], []))):
             res = await self.editor.apply(account(profile_name="Same"), self.db)
         self.assertTrue(res.success)
         self.assertEqual(res.changed_fields, ())
@@ -330,28 +341,47 @@ class TestProfileEditor(unittest.IsolatedAsyncioTestCase):
     async def test_name_limit_drops_the_name_but_applies_the_rest(self):
         recent = json.dumps([(datetime.now(timezone.utc) - timedelta(days=d)).isoformat() for d in (1, 2)])
         acc = account(profile_name="New", profile_description="About", profile_name_changes=recent)
-        fill = AsyncMock(return_value=["description"])
+        fill = AsyncMock(return_value=(["description"], ["name"]))
         with self.patched(_fill=fill):
             res = await self.editor.apply(acc, self.db)
         self.assertTrue(res.success)
-        self.assertEqual(fill.await_args.args[1], {"description": "About"})
+        self.assertEqual((fill.await_args.args[1], fill.await_args.args[2]), ({"name": "New", "description": "About"}, True))
+        self.assertEqual(res.skipped_fields, ("name",))
         self.assertIn("лимит", res.details)
         self.db.record_account_profile_applied.assert_awaited_once_with(1, {"description": "About"}, name_changed=False)
 
-    async def test_only_a_blocked_name_fails_without_a_browser(self):
+    async def test_only_a_blocked_name_is_a_failure_and_records_nothing(self):
         recent = json.dumps([(datetime.now(timezone.utc) - timedelta(days=d)).isoformat() for d in (1, 2)])
-        with patch.object(profile_manager, "YouTubeRunner") as factory:
+        with self.patched(_fill=AsyncMock(return_value=([], ["name"]))):
             res = await self.editor.apply(account(profile_name="New", profile_name_changes=recent), self.db)
         self.assertFalse(res.success)
-        factory.assert_not_called()
-
-    async def test_failed_verification_is_a_failure_and_records_nothing(self):
-        with self.patched(_verify=AsyncMock(side_effect=RuntimeError("не совпал"))):
-            res = await self.editor.apply(account(profile_name="New"), self.db)
-        self.assertFalse(res.success)
-        self.assertIn("не совпал", res.details)
+        self.assertEqual(res.skipped_fields, ("name",))
+        self.editor._publish.assert_not_awaited()
         self.db.record_account_profile_applied.assert_not_awaited()
         self.runner.close.assert_awaited_once()
+
+    async def test_failed_verification_still_counts_the_published_name_change(self):
+        acc = account(profile_name="New", profile_applied=applied(description="d"))
+        with self.patched(_verify=AsyncMock(side_effect=RuntimeError("не совпал"))):
+            res = await self.editor.apply(acc, self.db)
+        self.assertFalse(res.success)
+        self.assertIn("не совпал", res.details)
+        # YouTube already saved the name: it is logged against the 14-day limit, but the snapshot stays untouched
+        self.db.record_account_profile_applied.assert_awaited_once_with(1, {"description": "d"}, name_changed=True)
+        self.runner.close.assert_awaited_once()
+
+    async def test_failed_publish_records_nothing(self):
+        with self.patched(_publish=AsyncMock(side_effect=RuntimeError("timeout"))):
+            res = await self.editor.apply(account(profile_name="New"), self.db)
+        self.assertFalse(res.success)
+        self.db.record_account_profile_applied.assert_not_awaited()
+
+    async def test_a_replaced_applied_avatar_copy_is_forgotten_after_success(self):
+        acc = account(profile_avatar="p/new.png", profile_applied=applied(avatar="p/old.png"))
+        with self.patched(_fill=AsyncMock(return_value=(["avatar"], []))), patch.object(profile_manager, "forget_avatar") as forget:
+            res = await self.editor.apply(acc, self.db)
+        self.assertTrue(res.success)
+        forget.assert_called_once_with("p/old.png", keep=("p/new.png", "p/new.png"))
 
     async def test_browser_start_failure_is_reported_and_closed(self):
         self.runner.start.side_effect = RuntimeError("profile locked")
@@ -377,6 +407,61 @@ class TestProfileEditor(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 await self.editor._set_text(self.page, ("#x",), "v")
 
+    async def test_set_text_without_write_never_types(self):
+        field = MagicMock()
+        field.input_value = AsyncMock(return_value="Old")
+        with patch.object(profile_manager, "first_visible", AsyncMock(return_value=field)):
+            self.assertFalse(await self.editor._set_text(self.page, ("#x",), "New", write=False))
+        self.sim.type_text.assert_not_awaited()
+        self.page.keyboard.press.assert_not_awaited()
+
+    async def test_fill_blocked_name_is_skipped_only_when_it_differs(self):
+        self.editor._set_text = AsyncMock(return_value=False)
+        self.assertEqual(await self.editor._fill(self.page, {"name": "N"}, True), ([], ["name"]))
+        self.assertIs(self.editor._set_text.await_args.kwargs["write"], False)
+        self.editor._set_text = AsyncMock(return_value=True)  # the live name already equals the draft
+        self.assertEqual(await self.editor._fill(self.page, {"name": "N"}, True), ([], []))
+        self.editor._set_text = AsyncMock(return_value=False)
+        self.assertEqual(await self.editor._fill(self.page, {"name": "N"}, False), (["name"], []))
+
+    async def test_fill_changes_description_and_uploads_avatar(self):
+        self.editor._set_text = AsyncMock(return_value=False)
+        self.editor._upload_avatar = AsyncMock()
+        changed, skipped = await self.editor._fill(self.page, {"description": "D", "avatar": "p/a.png"}, False)
+        self.assertEqual((changed, skipped), (["description", "avatar"], []))
+        self.editor._upload_avatar.assert_awaited_once_with(self.page, "p/a.png")
+
+    async def test_upload_avatar_sets_the_file_and_confirms_the_crop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            picture = Path(folder) / "a.png"
+            picture.write_bytes(PNG)
+            file_input = MagicMock()
+            file_input.count = AsyncMock(return_value=1)
+            file_input.first.set_input_files = AsyncMock()
+            self.page.locator = MagicMock(return_value=file_input)
+            done = MagicMock()
+            with patch.object(profile_manager, "first_visible", AsyncMock(return_value=done)):
+                await self.editor._upload_avatar(self.page, str(picture))
+            file_input.first.set_input_files.assert_awaited_once_with(str(picture))
+            self.sim.click_locator.assert_awaited_once_with(self.page, done)
+
+            file_input.count = AsyncMock(return_value=0)
+            with self.assertRaises(RuntimeError):
+                await self.editor._upload_avatar(self.page, str(picture))
+            picture.unlink()
+            with self.assertRaises(RuntimeError):
+                await self.editor._upload_avatar(self.page, str(picture))
+
+    async def test_wait_published_returns_when_publish_is_disabled_and_times_out_otherwise(self):
+        self.page.wait_for_timeout = AsyncMock()
+        button = MagicMock()
+        button.is_disabled = AsyncMock(side_effect=[False, False, True])
+        await ProfileEditor._wait_published(self.page, button)
+        self.assertEqual(self.page.wait_for_timeout.await_count, 2)
+        button.is_disabled = AsyncMock(return_value=False)
+        with patch.object(profile_manager, "PUBLISH_TIMEOUT_SECONDS", 1.0), self.assertRaises(RuntimeError):
+            await ProfileEditor._wait_published(self.page, button)
+
     async def test_verify_detects_a_value_that_did_not_stick(self):
         self.page.reload = AsyncMock()
         field = MagicMock()
@@ -390,6 +475,9 @@ class TestProfileEditor(unittest.IsolatedAsyncioTestCase):
     async def test_verify_detects_an_unchanged_avatar(self):
         self.page.reload = AsyncMock()
         self.editor._avatar_src = AsyncMock(return_value="https://yt/old.jpg")
+        with self.assertRaises(RuntimeError):
+            await self.editor._verify(self.page, {"avatar": "p/a.png"}, ["avatar"], "https://yt/old.jpg")
+        self.editor._avatar_src.return_value = None  # the preview cannot be read: not a silent success
         with self.assertRaises(RuntimeError):
             await self.editor._verify(self.page, {"avatar": "p/a.png"}, ["avatar"], "https://yt/old.jpg")
         self.editor._avatar_src.return_value = "https://yt/new.jpg"
@@ -440,10 +528,17 @@ class TestProfileWizard(MenuCase):
 
     def test_description_lines_until_blank(self):
         self.seed("solo")
-        self.card("2", ESC, pasted=["Пишу про Python", "и про боты", ""])
+        self.card("2", ESC, pasted=["Пишу про Python", "и про боты", "", ""])
         self.assertEqual(self.accounts()["solo"].profile_description, "Пишу про Python\nи про боты")
-        self.card("2", ESC, pasted=["-", ""])
+        self.card("2", ESC, pasted=["-", "", ""])
         self.assertEqual(self.accounts()["solo"].profile_description, "")
+
+    def test_description_keeps_paragraphs_and_a_first_blank_line_cancels(self):
+        self.seed("solo")
+        self.card("2", ESC, pasted=["Привет", "", "О канале", "", ""])
+        self.assertEqual(self.accounts()["solo"].profile_description, "Привет\n\nО канале")
+        self.card("2", ESC, pasted=[""])
+        self.assertEqual(self.accounts()["solo"].profile_description, "Привет\n\nО канале")
 
     def test_avatar_is_validated_copied_and_the_old_copy_removed(self):
         self.seed("solo")
@@ -533,14 +628,18 @@ class TestApplyProfileCli(unittest.IsolatedAsyncioTestCase):
                  patch.object(youtube_bot, "_find_account", AsyncMock(return_value=found)):
                 self.assertEqual(await youtube_bot.apply_profile_cli("acc"), expected)
 
-        result = ProfileResult("acc", True, ("name",), "")
-        editor = MagicMock()
-        editor.return_value.apply = AsyncMock(return_value=result)
-        with patch.object(youtube_bot, "load_config", return_value=cfg), patch.object(youtube_bot, "Database", return_value=db), \
-             patch.object(youtube_bot, "_find_account", AsyncMock(return_value=account(profile_name="N"))), \
-             patch.object(youtube_bot, "ProfileEditor", editor):
-            self.assertTrue(await youtube_bot.apply_profile_cli("acc"))
-        editor.return_value.apply.assert_awaited_once()
+        for result, expected in (
+            (ProfileResult("acc", True, ("name",), ""), True),
+            (ProfileResult("acc", True, ("description",), "лимит", ("name",)), False),  # the name is still pending
+            (ProfileResult("acc", False, (), "boom"), False),
+        ):
+            editor = MagicMock()
+            editor.return_value.apply = AsyncMock(return_value=result)
+            with patch.object(youtube_bot, "load_config", return_value=cfg), patch.object(youtube_bot, "Database", return_value=db), \
+                 patch.object(youtube_bot, "_find_account", AsyncMock(return_value=account(profile_name="N"))), \
+                 patch.object(youtube_bot, "ProfileEditor", editor):
+                self.assertEqual(await youtube_bot.apply_profile_cli("acc"), expected)
+            editor.return_value.apply.assert_awaited_once()
 
 
 if __name__ == "__main__":

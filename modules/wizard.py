@@ -913,17 +913,21 @@ def _profile_edit_name(config_path: Path, account: Any) -> tuple[str, str] | Non
 def _profile_edit_description(config_path: Path, account: Any) -> tuple[str, str] | None:
     from modules.account_menu_logic import DESCRIPTION_MAX, validate_description
 
-    safe_print(color(f" Описание: вводите строки, пустая строка — конец, «-» — очистить (до {DESCRIPTION_MAX} символов)", CLR_DIM))
+    safe_print(color(
+        f" Описание: вводите или вставляйте строки; пустая строка — абзац, две подряд — конец; «-» — очистить"
+        f" (до {DESCRIPTION_MAX} символов). Сразу пустая строка — отмена",
+        CLR_DIM,
+    ))
     lines: list[str] = []
     try:
         while True:
             line = input("   ")
-            if not line.strip():
+            if not line.strip() and (not lines or not lines[-1].strip()):  # first blank cancels, a second one ends
                 break
             lines.append(line)
     except (KeyboardInterrupt, EOFError):
         return None
-    if not lines:
+    if not any(line.strip() for line in lines):
         return None
     try:
         description = validate_description(lines)
@@ -975,7 +979,9 @@ def _profile_apply(config_path: Path, account: Any, pending: list[str]) -> tuple
         return "warn", "Применение прервано"
     except Exception as exc:
         return "err", f"Не удалось применить: {exc.__class__.__name__} (подробности в логе)"
-    return format_profile_summary(result.account_name, result.success, result.changed_fields, result.details)
+    return format_profile_summary(
+        result.account_name, result.success, result.changed_fields, result.details, result.skipped_fields
+    )
 
 
 def _setup_pick_warmup(added: list[Any]) -> list[str]:

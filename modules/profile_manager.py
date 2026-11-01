@@ -18,7 +18,7 @@ from loguru import logger
 from config import BrowserSettings, TargetSettings, resolve_account_proxy
 from database import AccountRecord, Database
 from modules.account_menu_logic import applied_snapshot, name_changes_left, profile_pending_fields
-from modules.google_authenticator import YTCFG_JS
+from modules.google_authenticator import GoogleAuthenticator
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
 from modules.page_helpers import first_visible
 from modules.youtube_runner import YouTubeRunner
@@ -76,19 +76,23 @@ def validate_avatar(path: str | Path) -> tuple[Path, str]:
 
 
 def import_avatar(source: str | Path, account_name: str, avatars_dir: Path | None = None) -> str:
-    """Copy the picture into `profiles/avatars/<account>-<hash>.<ext>` and return its path relative to the project.
+    """Copy the picture into `profiles/avatars/<account>-<account hash>-<hash>.<ext>`; returns the path relative to the project.
 
     The name carries the content hash: a different picture is a different path (so "has unapplied edits" is a plain
-    comparison), and deleting the original file cannot break a later apply.
+    comparison), and deleting the original file cannot break a later apply. The account hash keeps accounts whose
+    sanitized names coincide (`a b`, `a_b`) from sharing one file.
     """
     file, extension = validate_avatar(source)
     digest = hashlib.sha256(file.read_bytes()).hexdigest()[:10]
+    owner = hashlib.sha256(account_name.encode("utf-8")).hexdigest()[:6]
     safe_name = re.sub(r"[^\w.-]", "_", account_name)
     store = avatars_dir or AVATARS_DIR
-    target = store / f"{safe_name}-{digest}{extension}"
+    target = store / f"{safe_name}-{owner}-{digest}{extension}"
     store.mkdir(parents=True, exist_ok=True)
     if not target.exists():
-        shutil.copyfile(file, target)
+        partial = target.with_suffix(target.suffix + ".part")  # an interrupted copy never leaves a half file under the real name
+        shutil.copyfile(file, partial)
+        partial.replace(target)
     return target.relative_to(PROJECT_ROOT).as_posix() if target.is_relative_to(PROJECT_ROOT) else str(target)
 
 
@@ -116,6 +120,7 @@ class ProfileResult:
     success: bool
     changed_fields: tuple[str, ...]
     details: str
+    skipped_fields: tuple[str, ...] = ()  # wanted but not applied (the name when YouTube's limit is used up)
 
 
 def _runner_target(cfg: BrowserSettings) -> TargetSettings:
@@ -149,12 +154,7 @@ class ProfileEditor:
         wanted = {field: getattr(account, f"profile_{field}") for field in profile_pending_fields(account)}
         if not wanted:
             return ProfileResult(account.name, True, (), "")
-        notes: list[str] = []
-        if "name" in wanted and name_changes_left(account) == 0:
-            del wanted["name"]
-            notes.append("никнейм: лимит YouTube (2 смены за 14 дней), попробуйте позже")
-            if not wanted:
-                return ProfileResult(account.name, False, (), notes[0])
+        name_blocked = "name" in wanted and name_changes_left(account) == 0
 
         runner = YouTubeRunner(
             self._cfg,
@@ -171,15 +171,21 @@ class ProfileEditor:
             page = pages[0] if pages else await runner.context.new_page()
             await self._open_profile_tab(page, runner, account)
             avatar_before = await self._avatar_src(page) if "avatar" in wanted else None
-            changed = await self._fill(page, wanted)
+            changed, skipped = await self._fill(page, wanted, name_blocked)
+            previous = applied_snapshot(account)
             if changed:
                 await self._publish(page)
+                if db is not None and "name" in changed:  # YouTube has it now: count it before the check below can fail
+                    await db.record_account_profile_applied(account.id, previous, name_changed=True)
                 await self._verify(page, wanted, changed, avatar_before)
-            satisfied = {**applied_snapshot(account), **wanted}
-            if db is not None:
-                await db.record_account_profile_applied(account.id, satisfied, name_changed="name" in changed)
+            done = {field: value for field, value in wanted.items() if field not in skipped}
+            if db is not None and done:
+                await db.record_account_profile_applied(account.id, {**previous, **done}, name_changed=False)
+            if "avatar" in changed:
+                forget_avatar(previous.get("avatar"), keep=(wanted["avatar"], account.profile_avatar))
+            note = "никнейм: лимит YouTube (2 смены за 14 дней), попробуйте позже" if skipped else ""
             logger.success("Профиль аккаунта {!r}: изменено {}", account.name, ", ".join(changed) or "ничего")
-            return ProfileResult(account.name, True, tuple(changed), "; ".join(notes))
+            return ProfileResult(account.name, bool(done), tuple(changed), note, tuple(skipped))
         except Exception as exc:
             logger.error("Ошибка при смене профиля аккаунта {!r}: {}", account.name, exc)
             return ProfileResult(account.name, False, (), f"{exc.__class__.__name__}: {exc}")
@@ -196,8 +202,8 @@ class ProfileEditor:
         await page.goto(HOME_URL, wait_until="domcontentloaded")
         await self._simulator.human_pause(2.0, 4.0)
         await runner._dismiss_consent(page)
-        config = await page.evaluate(YTCFG_JS)
-        if not isinstance(config, dict) or not config.get("loggedIn") or not config.get("channelId"):
+        config = await GoogleAuthenticator(self._simulator)._read_ytcfg(page)  # waits until ytcfg is there
+        if not config.get("loggedIn") or not config.get("channelId"):
             raise RuntimeError("аккаунт не вошёл или у него нет канала: сначала войдите в аккаунт")
         logger.info("Аккаунт {!r}: открываю профиль канала в YouTube Studio", account.name)
         await page.goto(STUDIO_PROFILE_URL.format(channel_id=config["channelId"]), wait_until="domcontentloaded")
@@ -205,25 +211,34 @@ class ProfileEditor:
             raise RuntimeError("вкладка «Профиль» в Studio не открылась (нет поля имени)")
         await self._simulator.human_pause(1.0, 2.0)
 
-    async def _fill(self, page: Any, wanted: dict[str, str | None]) -> list[str]:
-        """Type the differing values and upload a new avatar; returns the fields that really changed."""
+    async def _fill(self, page: Any, wanted: dict[str, str | None], name_blocked: bool) -> tuple[list[str], list[str]]:
+        """Type the differing values and upload a new avatar; returns (fields that really changed, fields skipped).
+
+        With `name_blocked` (YouTube's name limit is used up) the name is only compared: a name that differs is skipped.
+        """
         changed: list[str] = []
-        if "name" in wanted and not await self._set_text(page, NAME_INPUT, wanted["name"] or ""):
-            changed.append("name")
+        skipped: list[str] = []
+        if "name" in wanted and not await self._set_text(page, NAME_INPUT, wanted["name"] or "", write=not name_blocked):
+            (skipped if name_blocked else changed).append("name")
         if "description" in wanted and not await self._set_text(page, DESCRIPTION_INPUT, wanted["description"] or ""):
             changed.append("description")
         if "avatar" in wanted and wanted["avatar"]:
             await self._upload_avatar(page, wanted["avatar"])
             changed.append("avatar")
-        return changed
+        return changed, skipped
 
-    async def _set_text(self, page: Any, selectors: tuple[str, ...], value: str) -> bool:
-        """Replace the field's text by typing; True when the field already held `value` (nothing was typed)."""
+    async def _set_text(self, page: Any, selectors: tuple[str, ...], value: str, write: bool = True) -> bool:
+        """Replace the field's text by typing; True when the field already held `value` (nothing was typed).
+
+        With `write=False` a differing field is left alone (and False is returned).
+        """
         field = await first_visible(page, selectors, FIELD_TIMEOUT_SECONDS)
         if field is None:
             raise RuntimeError(f"поле не найдено: {selectors[0]}")
         if _same_text(await field.input_value(), value):
             return True
+        if not write:
+            return False
         await self._simulator.click_locator(page, field)
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Delete")
@@ -278,8 +293,12 @@ class ProfileEditor:
             element = await first_visible(page, selectors, FIELD_TIMEOUT_SECONDS)
             if element is None or not _same_text(await element.input_value(), wanted[field]):
                 raise RuntimeError(f"после сохранения {field} на канале не совпал с введённым")
-        if "avatar" in changed and await self._avatar_src(page) == avatar_before:
-            raise RuntimeError("после сохранения аватарка на канале не изменилась")
+        if "avatar" in changed:
+            after = await self._avatar_src(page)
+            if after is None:
+                raise RuntimeError("после сохранения не удалось прочитать превью аватарки")
+            if after == avatar_before:
+                raise RuntimeError("после сохранения аватарка на канале не изменилась")
 
     @staticmethod
     async def _avatar_src(page: Any) -> str | None:

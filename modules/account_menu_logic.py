@@ -328,11 +328,15 @@ def profile_card_lines(account: Any, now: datetime | None = None) -> list[tuple[
     return lines
 
 
-def format_profile_summary(account_name: str, success: bool, changed: Sequence[str], details: str) -> tuple[str, str]:
-    """(kind, text) for a finished apply: what changed, «already up to date», or why it failed."""
+def format_profile_summary(
+    account_name: str, success: bool, changed: Sequence[str], details: str, skipped: Sequence[str] = ()
+) -> tuple[str, str]:
+    """(kind, text) for a finished apply: what changed, «already up to date», what was left out, or why it failed."""
     if not success:
         return "err", f"Профиль «{account_name}»: не применён — {details}"
-    if not changed:
+    if not changed and skipped:
+        kind, text = "warn", f"Профиль «{account_name}»: изменений на канале нет, часть не применена"
+    elif not changed:
         kind, text = "info", f"Профиль «{account_name}»: уже актуален, менять нечего"
     else:
         kind, text = "ok", f"Профиль «{account_name}»: применено — " + ", ".join(_PROFILE_FIELD_WORDS.get(f, f) for f in changed)

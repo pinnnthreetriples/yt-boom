@@ -37,7 +37,7 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/lifecycle_engine.py` — 4-day account ageing state machine (quarantine → aging → probation → mature) with daily quota, cooldown and circuit breaker
 - `modules/account_menu_logic.py` — pure helpers of the wizard «Аккаунты» screen (warm-up pick, import/warm-up summaries, lifecycle table rows)
 - `modules/profile_manager.py` — channel profile: avatar file checks/copies (`profiles/avatars/`) and the YouTube Studio editor (nickname, description, avatar) that publishes the draft stored in the DB
-- `tests/` — comprehensive automated test suite (563 unit and integration tests)
+- `tests/` — comprehensive automated test suite (572 unit and integration tests)
 - `run_tests.py` — test discovery and test suite runner
 - `test_sessions/` — local browser session storage directories
 
