@@ -31,6 +31,26 @@ class YouTubeCommentElement(BaseModel):
 
 
 _UNSET = object()
+_PLAYER_STATE_JS = """() => {
+    const player = document.getElementById('movie_player');
+    const video = player && player.querySelector('video');
+    if (!video) return {video: false};
+    const big = player.querySelector('.ytp-large-play-button');
+    const box = video.getBoundingClientRect();
+    return {
+        video: true, paused: video.paused, ended: video.ended, muted: video.muted,
+        ad: player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting'),
+        // a video that never started sits off-screen under the cued thumbnail: its big play button is the click target
+        bigPlay: !!(big && big.offsetWidth > 0 && big.offsetHeight > 0),
+        shown: box.height > 0 && box.bottom > 0 && box.top < innerHeight,
+    };
+}"""
+# The player's own mute (what its mute button does), called before the click so playback never starts audibly.
+_MUTE_PLAYER_JS = """() => {
+    const player = document.getElementById('movie_player');
+    if (player && typeof player.mute === 'function') { player.mute(); return true; }
+    return false;
+}"""
 _COMMENT_ID_RE = re.compile(r'"commentId"\s*:\s*"(Ug[\w-][\w.\-]*)"')  # comment ids start with Ugw, Ugx, Ugy or Ugz
 
 
@@ -306,6 +326,41 @@ class YouTubeRunner:
             except Exception:
                 continue
 
+    async def _start_playback(self, page: Any) -> None:
+        """Start a paused video with a real, muted click: Firefox blocks autoplay without a user gesture.
+
+        Never during an ad (nothing else on the page is clicked), never on an ended or missing player; the click is
+        verified to land on the big play button (a video that never started) or on the video. Muted through the player's own API before the click (no audible start); the
+        `m` key, a trusted key event on the just-clicked player, is only the fallback when it is still unmuted.
+        Best effort: any failure is logged and the render goes on.
+        """
+        if not self._cfg.render_play_video:
+            return
+        try:
+            state = None
+            for _ in range(6):  # the player appears a moment after domcontentloaded and its layout settles later
+                state = await page.evaluate(_PLAYER_STATE_JS)
+                if state and state.get("video") and (state.get("bigPlay") or state.get("shown")):
+                    break
+                await self._simulator.human_pause(0.4, 0.7)
+            if not state or not state.get("video") or not state.get("paused") or state.get("ended") or state.get("ad"):
+                return
+            if not (state.get("bigPlay") or state.get("shown")):
+                logger.debug("Плеер не прорисован, клик для запуска видео пропущен")
+                return
+            await page.evaluate(_MUTE_PLAYER_JS)
+            target = "#movie_player .ytp-large-play-button" if state.get("bigPlay") else "#movie_player video"
+            await self._simulator.click_locator(page, page.locator(target).first, timeout_ms=3000, verify_hit=True)
+            await self._simulator.human_pause(0.6, 1.0)
+            after = await page.evaluate(_PLAYER_STATE_JS)
+            if after and after.get("video") and not after.get("muted") and not after.get("ad"):
+                await page.keyboard.press("m")
+            logger.debug("Видео запущено кликом без звука (было на паузе)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Не удалось запустить видео кликом, продолжаю без него: {}", exc)
+
     async def _render(self, page: Any) -> None:
         """Simulate realistic human video viewing and initial page interaction."""
         min_s = max(0.0, float(self._cfg.render_min_seconds))
@@ -313,6 +368,7 @@ class YouTubeRunner:
         duration = self._rng.uniform(min_s, max_s)
         deadline = time.monotonic() + duration
         logger.debug("Просмотр страницы видео ({:.1f}с)...", duration)
+        await self._start_playback(page)
         await self._simulator.idle(page, min(1.5, max(0.1, duration)))
         while True:
             remaining = deadline - time.monotonic()

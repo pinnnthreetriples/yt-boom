@@ -93,6 +93,7 @@ browser:
   navigation_timeout_ms: 45000
   render_min_seconds: 10
   render_max_seconds: 30
+  render_play_video: true
   firefox_user_prefs:
     media.peerconnection.enabled: true
     network.http.http3.enable: false

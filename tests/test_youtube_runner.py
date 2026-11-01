@@ -324,5 +324,121 @@ class TestYouTubeRunner(unittest.IsolatedAsyncioTestCase):
         self.assertIs(mock_click.await_args_list[-1].args[1], submit)
 
 
+class TestPlayback(unittest.IsolatedAsyncioTestCase):
+    """_start_playback: a real, muted, verified click on the video so Firefox's autoplay block does not leave it paused."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        fingerprint_patch = patch("modules.youtube_runner.get_or_create_fingerprint", return_value={"pinned": True})
+        fingerprint_patch.start()
+        self.addCleanup(fingerprint_patch.stop)
+        self.calls = []
+
+    def _runner(self, **settings):
+        cfg = BrowserSettings(
+            headless=True,
+            session_root=Path(self.temp_dir.name),
+            render_min_seconds=0.1,
+            render_max_seconds=0.2,
+            targets=[TargetSettings(name="youtube", base_url="https://www.youtube.com", item_url_template="https://www.youtube.com/watch?v={external_id}",
+                                    submit_input_selector="#i", submit_button_selector="#b", confirmation_selector="#c")],
+            **settings,
+        )
+        runner = YouTubeRunner(cfg, cfg.targets[0])
+        runner._simulator = MagicMock()
+        runner._simulator.click_locator = AsyncMock(side_effect=lambda *a, **k: self.calls.append("click"))
+        runner._simulator.human_pause = AsyncMock()
+        return runner
+
+    def _page(self, *states, mute_result=True):
+        """A page whose player state reads come from `states` in order (the last one repeats); mute and key calls are recorded."""
+        states = list(states)
+
+        async def evaluate(script, *args):
+            if "mute()" in script:
+                self.calls.append("mute")
+                return mute_result
+            return states.pop(0) if len(states) > 1 else states[0]
+
+        page = MagicMock()
+        page.evaluate = AsyncMock(side_effect=evaluate)
+        page.locator = MagicMock(return_value=MagicMock(first="video-locator"))
+        page.keyboard.press = AsyncMock(side_effect=lambda key, **k: self.calls.append(f"key {key}"))
+        return page
+
+    PAUSED = {"video": True, "paused": True, "ended": False, "ad": False, "muted": False, "shown": True}
+
+    async def test_paused_video_is_muted_then_clicked_with_a_verified_click(self):
+        runner, page = self._runner(), self._page(self.PAUSED, {**self.PAUSED, "paused": False, "muted": True})
+        await runner._start_playback(page)
+        self.assertEqual(self.calls, ["mute", "click"])  # muted BEFORE the click: no audible start
+        page.locator.assert_called_with("#movie_player video")
+        args, kwargs = runner._simulator.click_locator.await_args
+        self.assertEqual((args[1], kwargs.get("verify_hit")), ("video-locator", True))
+
+    async def test_a_video_that_never_started_is_started_through_its_big_play_button(self):
+        runner = self._runner()
+        page = self._page({**self.PAUSED, "bigPlay": True}, {**self.PAUSED, "paused": False, "muted": True})
+        await runner._start_playback(page)
+        page.locator.assert_called_with("#movie_player .ytp-large-play-button")
+        self.assertEqual(self.calls, ["mute", "click"])
+
+    async def test_nothing_is_clicked_when_playing_ended_ad_or_no_player(self):
+        for state in ({**self.PAUSED, "paused": False}, {**self.PAUSED, "ended": True}, {**self.PAUSED, "ad": True}, {**self.PAUSED, "video": False}, None):
+            self.calls.clear()
+            runner = self._runner()
+            await runner._start_playback(self._page(state))
+            self.assertEqual(self.calls, [], msg=str(state))
+
+    async def test_player_that_never_settles_is_not_clicked(self):
+        runner = self._runner()
+        await runner._start_playback(self._page({**self.PAUSED, "shown": False}))  # video off-screen, no big play button
+        self.assertEqual(self.calls, [])
+
+    async def test_flag_off_touches_nothing(self):
+        runner, page = self._runner(render_play_video=False), self._page(self.PAUSED)
+        await runner._start_playback(page)
+        page.evaluate.assert_not_awaited()
+        self.assertEqual(self.calls, [])
+
+    async def test_player_that_appears_late_is_waited_for_briefly(self):
+        runner = self._runner()
+        page = self._page({**self.PAUSED, "video": False}, {**self.PAUSED, "shown": False}, self.PAUSED, {**self.PAUSED, "paused": False, "muted": True})
+        await runner._start_playback(page)
+        self.assertEqual(self.calls, ["mute", "click"])
+
+    async def test_m_key_is_the_fallback_only_when_the_player_is_still_unmuted(self):
+        runner = self._runner()
+        await runner._start_playback(self._page(self.PAUSED, {**self.PAUSED, "paused": False, "muted": False}, mute_result=False))
+        self.assertEqual(self.calls, ["mute", "click", "key m"])
+        self.calls.clear()
+        await runner._start_playback(self._page(self.PAUSED, {**self.PAUSED, "paused": False, "muted": True}))
+        self.assertEqual(self.calls, ["mute", "click"])
+
+    async def test_failures_are_swallowed(self):
+        from modules.interaction_simulator import InteractionError
+
+        runner = self._runner()
+        runner._simulator.click_locator = AsyncMock(side_effect=InteractionError("layout kept shifting"))
+        await runner._start_playback(self._page(self.PAUSED))
+        page = MagicMock(evaluate=AsyncMock(side_effect=RuntimeError("page closed")))
+        await runner._start_playback(page)
+
+    async def test_cancellation_is_not_swallowed(self):
+        runner = self._runner()
+        runner._simulator.click_locator = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await runner._start_playback(self._page(self.PAUSED))
+
+    async def test_render_starts_playback_before_the_idle_wait(self):
+        runner = self._runner()
+        runner._simulator.idle = AsyncMock(side_effect=lambda *a, **k: self.calls.append("idle"))
+        runner._simulator.scroll = AsyncMock()
+        with patch.object(runner, "_start_playback", AsyncMock(side_effect=lambda page: self.calls.append("play"))):
+            await runner._render(MagicMock())
+        self.assertEqual(self.calls[:2], ["play", "idle"])
+
+
 if __name__ == "__main__":
     unittest.main()

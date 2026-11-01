@@ -222,6 +222,18 @@ class TestSessionHeartbeat(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(res.is_alive)
         self.assertNotIn("SECRETPW", res.details)
 
+    async def test_missing_profile_directory_is_reported_as_such(self) -> None:
+        missing = self.session_path / "no_such_profile"
+        with patch("modules.session_heartbeat.AsyncSession", side_effect=AssertionError("network used")):
+            online = await check_session_heartbeat(missing, account_name="acc")
+        offline = check_session_offline(missing, "acc")
+        for res in (online, offline):
+            self.assertFalse(res.is_alive)
+            self.assertFalse(res.login_info_present)
+            self.assertEqual(res.details, f"profile directory not found: {missing}")
+        # an existing profile without cookies.sqlite keeps the old message
+        self.assertEqual(check_session_offline(self.session_path, "acc").details, "LOGIN_INFO cookie not found in profile")
+
     async def test_heartbeat_never_writes_to_the_cookie_db(self) -> None:
         future_ts = int(time.time() + 86400 * 30)
         self._create_mock_cookies_db([(".youtube.com", "LOGIN_INFO", "token123", future_ts)])

@@ -103,6 +103,17 @@ def read_login_info_metadata(session_dir: str | Path) -> tuple[bool, str | None,
         return False, None, None
 
 
+def _no_login_info(session_dir: str | Path, account_name: str) -> HeartbeatStatus:
+    """Dead status: the profile directory is gone (path only, no cookie data) or holds no LOGIN_INFO."""
+    missing = not Path(session_dir).is_dir()
+    return HeartbeatStatus(
+        account_name=account_name,
+        is_alive=False,
+        login_info_present=False,
+        details=f"profile directory not found: {session_dir}" if missing else "LOGIN_INFO cookie not found in profile",
+    )
+
+
 def check_session_offline(session_dir: str | Path, account_name: str = "default") -> HeartbeatStatus:
     """Routine status from the profile alone, no network: LOGIN_INFO present and not expired.
 
@@ -110,12 +121,7 @@ def check_session_offline(session_dir: str | Path, account_name: str = "default"
     """
     has_login_info, expires_at_str, days_left = read_login_info_metadata(session_dir)
     if not has_login_info:
-        return HeartbeatStatus(
-            account_name=account_name,
-            is_alive=False,
-            login_info_present=False,
-            details="LOGIN_INFO cookie not found in profile",
-        )
+        return _no_login_info(session_dir, account_name)
     expired = days_left is not None and days_left <= 0
     return HeartbeatStatus(
         account_name=account_name,
@@ -175,14 +181,9 @@ async def check_session_heartbeat(
     """
     has_login_info, expires_at_str, days_left = read_login_info_metadata(session_dir)
     if not has_login_info:
-        return HeartbeatStatus(
-            account_name=account_name,
-            is_alive=False,
-            login_info_present=False,
-            details="LOGIN_INFO cookie not found in profile",
-        )
+        return _no_login_info(session_dir, account_name)
 
-    cookies = read_youtube_cookies(session_dir)
+    cookies =read_youtube_cookies(session_dir)
     if "LOGIN_INFO" not in cookies:
         return HeartbeatStatus(
             account_name=account_name,
