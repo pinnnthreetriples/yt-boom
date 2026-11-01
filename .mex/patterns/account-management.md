@@ -34,7 +34,7 @@ mex:
 Accounts are stored in the `accounts` table of `test_metrics.db`. To safeguard against data leaks, passwords and TOTP secrets must be encrypted using Windows DPAPI. Each account is assigned a persistent session directory and hardware fingerprint.
 
 ## Steps
-1. **Parse Input Format**: Use `modules.account_parser.parse_account_line()` to parse credentials from `email:password:totp_secret[:recovery_email][:proxy]` format.
+1. **Parse Input Format**: Use `modules.account_parser.parse_account_line()` to parse credentials from `email:password:totp_secret[:recovery_email][:proxy][:country=PL][:locale=pl-PL]` format (`--country`/`--locale` are the defaults for `--add-account`).
 2. **Encrypt Credentials**: Wrap passwords and TOTP secrets with `secret_store.protect_secret()` before database insertion.
 3. **Database Upsert**: Call `database.Database.upsert_account()` to persist the account record.
 4. **Pin Hardware Fingerprint**: When the account session directory is first created, invoke `get_or_create_fingerprint(session_dir)` to generate and atomically store the account session fingerprint file.
@@ -42,6 +42,7 @@ Accounts are stored in the `accounts` table of `test_metrics.db`. To safeguard a
 
 ## Gotchas
 - **Windows User Binding**: DPAPI ciphertext is bound to the current Windows user login. Moving `test_metrics.db` to another user account or machine causes `SecretStoreError`.
+- **Expected country and locale**: `expected_country` (ISO, from the seller or the recovery phone code) makes a sign-in refuse to start when the proxy's exit country (`modules.geo_guard`, same GeoIP source as Camoufox) differs or is unknown; already authenticated accounts only get a warning. `locale` overrides `browser.locale` for that account's browser and heartbeat headers. Google's `Country version` is stored as ISO in `geo_country` and only warned about.
 - **Proxy Invariants**: Ensure proxy strings include valid schemes (`socks5://` or `http://`) and credentials where needed.
 
 ## Verify

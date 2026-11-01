@@ -7,13 +7,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from loguru import logger
 from playwright.async_api import Error as PlaywrightError
 
+from modules.dom_snapshot import redact, sanitize_html
 from modules.interaction_simulator import InteractionError, InteractionSimulator
-from modules.page_helpers import first_visible
+from modules.page_helpers import CONSENT_REJECT_SELECTORS, SIGN_IN_LINK, first_visible
 from modules.totp_helper import generate_fresh_totp, get_remaining_seconds
 
 YOUTUBE_HOME_URL = "https://www.youtube.com/?hl=en&gl=US"
@@ -26,7 +27,11 @@ YOUTUBE_HOSTS = frozenset({"www.youtube.com", "youtube.com", "m.youtube.com"})
 
 
 def _buttons(*labels: str) -> tuple[str, ...]:
-    """`button` and `[role=button]` selectors for each label (Google renders both)."""
+    """`button` and `[role=button]` selectors for each label (Google renders both).
+
+    Text matching is allowed ONLY for the five constants below (see the note above them): never use this helper for
+    YouTube UI. `tests/test_selector_guard.py` allowlists exactly this helper and those constants.
+    """
     return tuple(
         selector
         for label in labels
@@ -34,7 +39,8 @@ def _buttons(*labels: str) -> tuple[str, ...]:
     )
 
 
-SIGN_IN_LINK = 'ytd-masthead #buttons a[href*="ServiceLogin"]'
+# Selectors are structural only (ids, names, types, data-*): the accounts run in any UI language and Google localizes
+# visible text and aria-label. Without Next the flow presses Enter (see _enter_value).
 NEXT_BUTTONS = (
     'button#passwordNext',
     'button#identifierNext',
@@ -42,19 +48,8 @@ NEXT_BUTTONS = (
     '#passwordNext button',
     '#identifierNext button',
     '#totpNext button',
-    'button:has-text("Next")',
-    'button:has-text("Далее")',
-    '[role="button"]:has-text("Next")',
-    '[role="button"]:has-text("Далее")',
 )
-CONSENT_REJECT = (
-    'button[aria-label*="Reject all"]',
-    'button:has-text("Reject all")',
-    'button:has-text("Отклонить все")',
-    'button[aria-label*="Accept all"]',
-    'button:has-text("Accept all")',
-    'button:has-text("Принять все")',
-)
+CONSENT_REJECT = CONSENT_REJECT_SELECTORS
 EMAIL_INPUT = ('input#identifierId', 'input[name="identifier"]', 'input[type="email"]:not([name*="recovery"]):not([id*="recovery"])')
 PASSWORD_INPUT = ('input[type="password"]', 'input[name="Passwd"]')
 TOTP_INPUT = ('input#totpPin',)
@@ -62,28 +57,30 @@ TOTP_TRUST_CHECKBOX = ('input#trustDevice', 'input[name="TrustDevice"]', 'input[
 KPE_INPUT = ('input#knowledge-preregistered-email-response',)
 CAPTCHA_MARKERS = ('img#captchaimg', 'iframe[src*="recaptcha"]')
 ERROR_BLOCKS = ('[role="alert"]', 'div[jsname="B34EJ"]', '[aria-live="assertive"] [jsname="B34EJ"]')
+AUTHENTICATOR_OPTION = ('div[data-challengetype="6"]',)
+# DELIBERATE, DO NOT "FIX" BLINDLY: these five are the only text matchers allowed in modules/*.py. They target
+# accounts.google.com sign-in / speedbump screens (not YouTube UI), which have no structural handle, and the login must
+# stay fully automatic. Labels cover en and ru only; any other language falls through to the "неизвестный экран" error.
+# Never match "Continue" on the passkey screen: it opens the native Windows Hello prompt.
 TRY_ANOTHER_WAY = _buttons("Try another way", "Другой способ")
-AUTHENTICATOR_OPTION = (
-    'div[data-challengetype="6"]',
-    '[role="link"]:has-text("Google Authenticator")',
-    'li:has-text("Google Authenticator")',
-)
 USE_ANOTHER_ACCOUNT = (
     '[role="link"]:has-text("Use another account")',
     'li:has-text("Use another account")',
     '[role="link"]:has-text("Использовать другой аккаунт")',
     'li:has-text("Использовать другой аккаунт")',
 )
-# Only refusals: "Continue" on the passkey screen would open the native Windows Hello prompt.
 DECLINE_BUTTONS = _buttons("Not now", "Не сейчас", "Skip", "Пропустить", "No thanks", "Нет, спасибо", "Cancel", "Отмена")
 WAS_IT_YOU_BUTTONS = _buttons("Yes, it was me", "Да, это я")
 ACKNOWLEDGE_BUTTONS = _buttons("I understand", "Я понимаю") + ('input[type="submit"][value="I understand"]',)
 CREATE_CHANNEL_BUTTON = '#create-channel-button button'
-YTCFG_JS = (
-    "() => ({ready: !!window.ytcfg,"
-    " loggedIn: !!(window.ytcfg && window.ytcfg.get('LOGGED_IN')),"
-    " channelId: (window.ytcfg && window.ytcfg.get('CHANNEL_ID')) || null})"
-)
+# Camoufox evaluates page.evaluate() in an isolated world: `window.ytcfg` is invisible there (so LOGGED_IN always read false)
+# and the main world (`mw:`) stays off on purpose. The inline `ytcfg.set({...})` script is DOM, readable from any world.
+YTCFG_JS = r"""() => {
+  const find = (re) => { for (const s of document.scripts) { const m = !s.src && re.exec(s.textContent); if (m) return m; } return null; };
+  const flag = find(/"LOGGED_IN":\s*(true|false)/);
+  const channel = find(/"CHANNEL_ID":\s*"([\w-]+)"/);
+  return {ready: flag !== null, loggedIn: flag !== null && flag[1] === 'true', channelId: channel ? channel[1] : null};
+}"""
 
 SESSION_OWNER_FILE = "account_owner.txt"
 
@@ -128,6 +125,22 @@ def _screen_path(url: str) -> str:
     return f"{parsed.hostname or ''}{parsed.path}"
 
 
+def with_hl_en(url: str) -> str:
+    """The same URL with `hl=en`: every other parameter (service, continue, flowName...) is kept as it is."""
+    parsed = urlparse(url)
+    query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != "hl"]
+    return urlunparse(parsed._replace(query=urlencode(query + [("hl", "en")])))
+
+
+def _is_english(url: str) -> bool:
+    return dict(parse_qsl(urlparse(url).query)).get("hl", "").lower() == "en"
+
+
+def _is_google_sign_in(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and parsed.hostname == "accounts.google.com"
+
+
 def read_session_owner(session_dir: Path | str) -> str | None:
     """Email the profile was signed in with (written after a successful sign-in), None for older sessions."""
     try:
@@ -152,8 +165,9 @@ def write_session_owner(session_dir: Path | str, email: str) -> None:
 class GoogleAuthenticator:
     """Signs a Camoufox persistent context into YouTube through the regular Google sign-in flow."""
 
-    def __init__(self, simulator: InteractionSimulator) -> None:
+    def __init__(self, simulator: InteractionSimulator, artifacts_dir: Path | str | None = None) -> None:
         self._simulator = simulator
+        self._artifacts_dir = Path(artifacts_dir) if artifacts_dir is not None else None  # None: no unknown-screen dump
         self.detected_country: str | None = None
 
     async def is_session_authenticated(self, context: Any) -> bool:
@@ -267,7 +281,13 @@ class GoogleAuthenticator:
         link = await self._first_visible(page, (SIGN_IN_LINK,), timeout_seconds=15.0)
         if link is None:
             raise GoogleAuthError("на youtube.com не найдена ссылка Sign in")
-        await self._simulator.click_locator(page, link)
+        # The handlers below know en/ru labels only, and the link carries the browser / account language (hl=ru, hl=pl...):
+        # open the same sign-in URL with hl=en so every Google screen is rendered in English.
+        href = await link.get_attribute("href")
+        if href and _is_google_sign_in(href) and not _is_english(href):
+            await page.goto(with_hl_en(href), referer=page.url, wait_until="domcontentloaded")
+        else:
+            await self._simulator.click_locator(page, link)
         await self._simulator.human_pause(1.5, 3.0)
 
     async def _dismiss_consent(self, page: Any) -> None:
@@ -328,6 +348,7 @@ class GoogleAuthenticator:
                 if state.idle_key != path:
                     state.idle_key, state.idle_since = path, now
                 elif now - state.idle_since > UNKNOWN_SCREEN_SECONDS:
+                    await self._dump_unknown_screen(page, path)
                     raise GoogleAuthError(f"неизвестный экран, подходящих действий нет: {path}")
                 await asyncio.sleep(POLL_SECONDS)
                 continue
@@ -340,6 +361,19 @@ class GoogleAuthenticator:
             if state.repeats >= STUCK_REPEATS:
                 raise GoogleAuthError(f"застряли на экране «{screen}» ({path})")
         raise GoogleAuthError(f"таймаут авторизации, последний экран: {_screen_path(page.url)}")
+
+    async def _dump_unknown_screen(self, page: Any, path: str) -> None:
+        """Save the sanitized DOM of a screen no handler knows (no query string, values, emails or tokens) for a new handler."""
+        if self._artifacts_dir is None:
+            return
+        try:
+            snapshot = sanitize_html(await page.content())
+            target = self._artifacts_dir / f"google_unknown_screen_{int(time.time())}.html"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"<!-- {redact(path)} -->\n{snapshot}\n", encoding="utf-8")
+            logger.info("Снимок неизвестного экрана Google сохранён в {}", target)
+        except Exception as exc:
+            logger.debug("Не удалось сохранить снимок неизвестного экрана: {}", exc)
 
     async def _handle_screen(self, page: Any, state: _FormState) -> str | None:
         """Act on the first recognised element of the current screen; returns the screen name, None when nothing matches."""

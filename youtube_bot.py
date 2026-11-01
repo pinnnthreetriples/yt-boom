@@ -16,6 +16,7 @@ from database import AccountRecord, ActivityLogCreate, Database, RecordNotFoundE
 from modules.collector import CollectorError
 from modules.account_parser import looks_like_credentials, parse_account_line
 from modules.account_warmer import AccountWarmer, WarmUpResult
+from modules.geo_guard import check_account_exit, normalize_country, normalize_locale, resolve_exit_country, warn_if_exit_mismatch
 from modules.google_authenticator import GoogleAuthenticator, GoogleAuthError, read_session_owner, write_session_owner
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine
@@ -37,6 +38,48 @@ def format_author(author: str | None) -> str:
 
 def setup_cli_logging(level: str = "INFO", log_file: str | None = None) -> None:
     setup_bot_logging(level=level, log_file=log_file)
+
+
+async def _login_country_allowed(account_name: str, expected: str | None, proxy: str | None) -> tuple[bool, str | None]:
+    """Fail closed before a sign-in: the exit country of the proxy must be the account's expected one.
+
+    Returns (allowed, exit country). Without an expected country nothing is checked and the login goes on as before.
+    """
+    verdict, exit_country = await check_account_exit(expected, proxy)
+    if verdict == "mismatch":
+        logger.error(
+            "Вход аккаунта {!r} отменён: ожидаемая страна {}, а прокси выходит из страны {}. "
+            "Первый вход с IP чужой страны ставит аккаунт под риск блокировки: смените прокси или ожидаемую страну",
+            account_name, expected, exit_country,
+        )
+    elif verdict == "unknown":
+        logger.error(
+            "Вход аккаунта {!r} отменён: не удалось определить страну выхода прокси (ожидается {}). "
+            "Проверьте прокси и повторите",
+            account_name, expected,
+        )
+    return verdict not in ("mismatch", "unknown"), exit_country
+
+
+async def _warn_country_disagreement(
+    account: AccountRecord, country: str, exit_country: str | None, proxy: str | None
+) -> None:
+    """After a sign-in: warn when the account's `Country version` differs from the expected or the exit country."""
+    if len(country) != 2:  # the text was not recognised as a country
+        return
+    if exit_country is None and (account.expected_country or proxy):
+        exit_country = await resolve_exit_country(proxy)
+    differs = [
+        f"{label} {value}"
+        for label, value in (("ожидаемой страной", account.expected_country), ("страной выхода прокси", exit_country))
+        if value and value != country
+    ]
+    if differs:
+        logger.warning(
+            "Аккаунт {!r}: Country version {} отличается от {}. Это текущая настройка аккаунта, "
+            "а не обязательно страна регистрации; вход не блокируется",
+            account.name, country, " и от ".join(differs),
+        )
 
 
 async def interactive_login(config_path: str = "config.yaml", account_name: str | None = None) -> None:
@@ -74,6 +117,12 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
         session_dir = cfg.browser.session_root / "youtube"
         proxy_url = cfg.browser.proxy
 
+    if acc is not None and acc.expected_country:
+        allowed, _ = await _login_country_allowed(acc.name, acc.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+        if not allowed:
+            await db.close()
+            return
+
     session_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Запуск браузера Camoufox для авторизации в YouTube (аккаунт: {!r})...", account_name or "default")
@@ -86,6 +135,7 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
         session_dir=session_dir,
         proxy=resolve_account_proxy(proxy_url, cfg.browser.proxy),
         account_name=account_name or "default",
+        locale=acc.locale if acc is not None else None,
     )
     opts = runner.launch_options()
     authenticator = GoogleAuthenticator(InteractionSimulator())
@@ -126,8 +176,21 @@ async def add_account_cli(
     session_path: str | None = None,
     proxy_url: str | None = None,
     config_path: str = "config.yaml",
+    country: str | None = None,
+    locale: str | None = None,
 ) -> None:
-    """Add or update an account in the database."""
+    """Add or update an account in the database. `country` / `locale` are set only when given (and validated)."""
+    geo: dict[str, str] = {}
+    if country:
+        if (iso := normalize_country(country)) is None:
+            print(f"[ERROR] --country {country!r}: страна не распознана (например PL или Poland)", file=sys.stderr)
+            sys.exit(1)
+        geo["expected_country"] = iso
+    if locale:
+        if (tag := normalize_locale(locale)) is None:
+            print(f"[ERROR] --locale {locale!r}: ожидается язык-СТРАНА, например pl-PL", file=sys.stderr)
+            sys.exit(1)
+        geo["locale"] = tag
     cfg = load_config(config_path)
     db = Database(cfg.app.db_path)
     await db.connect()
@@ -139,6 +202,7 @@ async def add_account_cli(
             session_path=eff_session,
             proxy_url=proxy_url,
             is_active=True,
+            **geo,
         )
         print(
             f"[OK] Account {account.name!r} registered successfully "
@@ -170,9 +234,12 @@ async def _register_credentials_account(
     name: str | None = None,
     session_path: str | None = None,
     proxy_url: str | None = None,
+    country: str | None = None,
+    locale: str | None = None,
 ) -> AccountRecord:
-    """Register `email:password:totp[...]`. A known account keeps its session path, proxy and active flag unless told otherwise."""
-    parsed = parse_account_line(spec, proxy=proxy_url)
+    """Register `email:password:totp[...]`. A known account keeps its session path, proxy, active flag, expected country
+    and locale unless told otherwise."""
+    parsed = parse_account_line(spec, proxy=proxy_url, country=country, locale=locale)
     account_name = (name or parsed.default_name).strip()
     existing = await db.get_account(account_name)
     upsert_args: dict[str, Any] = {
@@ -186,6 +253,10 @@ async def _register_credentials_account(
         upsert_args["session_path"] = session_path or str(cfg.browser.session_root / account_name)
     if parsed.proxy is not None:
         upsert_args["proxy_url"] = parsed.proxy
+    if parsed.expected_country is not None:
+        upsert_args["expected_country"] = parsed.expected_country
+    if parsed.locale is not None:
+        upsert_args["locale"] = parsed.locale
     return await db.upsert_account(**upsert_args)
 
 
@@ -203,18 +274,21 @@ async def add_credentials_account_cli(
     session_path: str | None = None,
     proxy_url: str | None = None,
     config_path: str = "config.yaml",
+    country: str | None = None,
+    locale: str | None = None,
 ) -> bool:
     """`--add-account email:password:totp_secret[:recovery_email]`: register the account with status `pending`."""
     cfg = load_config(config_path)
     async with Database(cfg.app.db_path) as db:
         try:
-            account = await _register_credentials_account(db, cfg, spec, name, session_path, proxy_url)
+            account = await _register_credentials_account(db, cfg, spec, name, session_path, proxy_url, country, locale)
         except ValueError as exc:
             print(f"[ERROR] {exc}", file=sys.stderr)
             return False
         print(
             f"[OK] Account {account.name!r} registered (id={account.id}, status={account.auth_status}, "
-            f"session={account.session_path}, proxy={mask_proxy_url(account.proxy_url) or 'direct'}). "
+            f"session={account.session_path}, proxy={mask_proxy_url(account.proxy_url) or 'direct'}, "
+            f"country={account.expected_country or '-'}, locale={account.locale or '-'}). "
             f"Next: --auth-account {account.name}"
         )
         return True
@@ -229,19 +303,28 @@ async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRe
     simulator = InteractionSimulator(InteractionConfig(key_delay_ms_min=50, key_delay_ms_max=100))
     owner = read_session_owner(account.session_path)
     force_relogin = owner is not None and owner != account.email.lower()  # the saved session is another account's
+    proxy = resolve_account_proxy(account.proxy_url, cfg.browser.proxy)
+    exit_country: str | None = None
+    if account.auth_status != "authenticated" or force_relogin:  # a real sign-in follows: the country must match first
+        allowed, exit_country = await _login_country_allowed(account.name, account.expected_country, proxy)
+        if not allowed:
+            return False
+    else:
+        await warn_if_exit_mismatch(account.name, account.expected_country, proxy)
     runner = YouTubeRunner(
         cfg.browser,
         _resolve_youtube_target(cfg),
         session_dir=account.session_path,
         account_name=account.name,
         simulator=simulator,
-        proxy=resolve_account_proxy(account.proxy_url, cfg.browser.proxy),
+        proxy=proxy,
+        locale=account.locale,
     )
     authenticated = False
     new_status: str | None = None
     try:
         await runner.start()
-        authenticator = GoogleAuthenticator(simulator)
+        authenticator = GoogleAuthenticator(simulator, artifacts_dir=cfg.browser.session_root / "_artifacts")
         authenticated = await authenticator.authenticate(
             runner.context,
             account.email,
@@ -251,8 +334,11 @@ async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRe
             force_relogin=force_relogin,
         )
         new_status = "authenticated"
-        if authenticator.detected_country:
-            await db.set_account_geo_country(account.id, authenticator.detected_country)
+        detected = authenticator.detected_country
+        if isinstance(detected, str) and detected:
+            country = normalize_country(detected) or detected  # ISO when recognised, else the text as Google wrote it
+            await db.set_account_geo_country(account.id, country)
+            await _warn_country_disagreement(account, country, exit_country, proxy)
     except GoogleAuthError as exc:
         logger.error("Авторизация {!r} не удалась: {}", account.name, exc)
         new_status = "failed"
@@ -599,11 +685,11 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
             print("  No accounts found in database or configuration.")
         else:
             header = (
-                f"{'ID':<4} | {'Name':<16} | {'Status':<8} | {'Auth':<13} | {'Geo':<12} | {'Replies':<8} | "
+                f"{'ID':<4} | {'Name':<16} | {'Status':<8} | {'Auth':<13} | {'Geo':<12} | {'Exp':<3} | {'Locale':<7} | {'Replies':<8} | "
                 f"{'Email':<24} | {'Proxy':<30} | {'Session Path'}"
             )
             print(header)
-            print("-" * 110)
+            print("-" * 123)
             for acc in accounts:
                 status = "ACTIVE" if acc.is_active else "DISABLED"
                 proxy_display = mask_proxy_url(acc.proxy_url) if acc.proxy_url else "direct (no proxy)"
@@ -616,13 +702,15 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
                     f"{status:<8} | "
                     f"{acc.auth_status:<13} | "
                     f"{geo_display:<12} | "
+                    f"{acc.expected_country or '-':<3} | "
+                    f"{acc.locale or '-':<7} | "
                     f"{acc.total_replies:<8} | "
                     f"{mask_email(acc.email):<24} | "
                     f"{proxy_display:<30} | "
                     f"{acc.session_path}"
                 )
                 print(row)
-            print("-" * 110)
+            print("-" * 123)
             print(f"Total Accounts: {len(accounts)} (Active: {sum(1 for a in accounts if a.is_active)})")
         print("=" * 80 + "\n")
     finally:
@@ -784,6 +872,12 @@ async def run_reply_bot(
         runner_kwargs["proxy"] = proxy_url
     if account_name is not None:
         runner_kwargs["account_name"] = resolved_acc_name
+    if acc_record is not None:
+        if acc_record.locale:
+            runner_kwargs["locale"] = acc_record.locale
+        await warn_if_exit_mismatch(
+            acc_record.name, acc_record.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy)
+        )
 
     runner = YouTubeRunner(cfg.browser, yt_target, **runner_kwargs)
 
@@ -1101,6 +1195,12 @@ async def run_multi_video_pipeline(
         runner_kwargs["proxy"] = proxy_url
     if account_name is not None:
         runner_kwargs["account_name"] = resolved_acc_name
+    if acc_record is not None:
+        if acc_record.locale:
+            runner_kwargs["locale"] = acc_record.locale
+        await warn_if_exit_mismatch(
+            acc_record.name, acc_record.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy)
+        )
 
     runner = YouTubeRunner(cfg.browser, yt_target, **runner_kwargs)
 
@@ -1467,7 +1567,7 @@ def main() -> None:
         "--add-account",
         type=str,
         default=None,
-        metavar="NAME | EMAIL:PASSWORD:TOTP[:RECOVERY_EMAIL][:PROXY] | -",
+        metavar="NAME | EMAIL:PASSWORD:TOTP[:RECOVERY_EMAIL][:PROXY][:country=PL][:locale=pl-PL] | -",
         help=(
             "Add or update account by name, or register Google credentials email:password:totp_secret[:recovery_email] "
             "(status pending). Pass '-' to read the account line from stdin so the password stays out of the process list"
@@ -1475,10 +1575,12 @@ def main() -> None:
     )
     parser.add_argument("--name", type=str, default=None, help="Account name for --add-account with credentials (default: the email)")
     parser.add_argument("--auth-account", type=str, default=None, metavar="NAME_OR_EMAIL", help="Sign the account into YouTube (Camoufox with its proxy and fixed fingerprint, TOTP 2FA)")
-    parser.add_argument("--import-accounts-file", type=str, default=None, metavar="FILE", help="Import accounts from a text file (one email:password:totp[:recovery_email][:proxy] per line) and authenticate them one by one; accounts that are already authenticated are skipped")
+    parser.add_argument("--import-accounts-file", type=str, default=None, metavar="FILE", help="Import accounts from a text file (one email:password:totp[:recovery_email][:proxy][:country=PL][:locale=pl-PL] per line) and authenticate them one by one; accounts that are already authenticated are skipped")
     parser.add_argument("--force", action="store_true", help="With --import-accounts-file: sign in accounts that are already authenticated too")
     parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (http://user:pass@ip:port or ip:port:user:pass) for adding account or session override")
     parser.add_argument("--session", type=str, default=None, help="Session directory path for adding account")
+    parser.add_argument("--country", type=str, default=None, help="With --add-account: the account's expected country (PL or Poland); a sign-in is refused when the proxy exits elsewhere")
+    parser.add_argument("--locale", type=str, default=None, help="With --add-account: browser language of the account (e.g. pl-PL); default is browser.locale")
     parser.add_argument("--heartbeat", "--check-session", dest="heartbeat", nargs="?", const="ALL", default=None, metavar="NAME_OR_ALL", help="Show session status from the LOGIN_INFO cookie, no network (default: all active accounts)")
     parser.add_argument("--heartbeat-online", action="store_true", help="With --heartbeat: also verify the session with an HTTP request to YouTube (Firefox-like, through the account proxy)")
     parser.add_argument("--warm-up", type=str, default=None, metavar="NAME_OR_EMAIL", help="Run humanized browser warm-up for an account (natural watch, mouse movement, comments scroll)")
@@ -1544,10 +1646,17 @@ def main() -> None:
                     session_path=args.session,
                     proxy_url=args.proxy,
                     config_path=args.config,
+                    country=args.country,
+                    locale=args.locale,
                 )
             )
             sys.exit(0 if ok else 1)
-        asyncio.run(add_account_cli(args.add_account, session_path=args.session, proxy_url=args.proxy, config_path=args.config))
+        asyncio.run(
+            add_account_cli(
+                args.add_account, session_path=args.session, proxy_url=args.proxy, config_path=args.config,
+                country=args.country, locale=args.locale,
+            )
+        )
         return
 
     if args.auth_account:

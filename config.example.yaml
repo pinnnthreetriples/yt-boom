@@ -70,7 +70,7 @@ processor:
 
     '
   styles:
-  - friendly agreement and encouragement
+  - casual remark that picks up one specific detail of the comment
   - thoughtful and insightful follow-up question
   - humorous, witty remark or light banter
   - concise acknowledgement or brief nod
@@ -93,6 +93,7 @@ browser:
   navigation_timeout_ms: 45000
   render_min_seconds: 10
   render_max_seconds: 30
+  render_play_video: true
   firefox_user_prefs:
     media.peerconnection.enabled: true
     network.http.http3.enable: false

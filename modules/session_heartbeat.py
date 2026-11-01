@@ -7,16 +7,36 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from curl_cffi.requests import AsyncSession
 from loguru import logger
 
-from config import resolve_account_proxy
+from config import parse_proxy, resolve_account_proxy
 from database import AccountRecord
 from modules.fingerprint_manager import load_fingerprint
 
 # Sessions are made by Camoufox (Firefox): the request must look like Firefox, not like a Chrome replaying the cookies.
 HEARTBEAT_IMPERSONATE = "firefox155"  # closest curl_cffi TLS profile to the installed Firefox 156
+
+
+def curl_proxy_url(proxy: str | None) -> str | None:
+    """Proxy URL for libcurl from any form `parse_proxy` accepts; `socks5://` becomes `socks5h://` so DNS is resolved on the proxy.
+
+    libcurl resolves names locally for plain `socks5://` (a DNS leak next to the proxied request). Only for curl:
+    Playwright does not know `socks5h`, so the browser path keeps using `parse_proxy` untouched.
+    """
+    parsed = parse_proxy(proxy)
+    if parsed is None:
+        return None
+    scheme, _, address = parsed["server"].partition("://")
+    credentials = ""
+    if parsed.get("username"):
+        credentials = quote(parsed["username"], safe="")
+        if parsed.get("password"):
+            credentials += f":{quote(parsed['password'], safe='')}"
+        credentials += "@"
+    return f"{'socks5h' if scheme == 'socks5' else scheme}://{credentials}{address}"
 
 
 @dataclass(frozen=True)
@@ -83,6 +103,17 @@ def read_login_info_metadata(session_dir: str | Path) -> tuple[bool, str | None,
         return False, None, None
 
 
+def _no_login_info(session_dir: str | Path, account_name: str) -> HeartbeatStatus:
+    """Dead status: the profile directory is gone (path only, no cookie data) or holds no LOGIN_INFO."""
+    missing = not Path(session_dir).is_dir()
+    return HeartbeatStatus(
+        account_name=account_name,
+        is_alive=False,
+        login_info_present=False,
+        details=f"profile directory not found: {session_dir}" if missing else "LOGIN_INFO cookie not found in profile",
+    )
+
+
 def check_session_offline(session_dir: str | Path, account_name: str = "default") -> HeartbeatStatus:
     """Routine status from the profile alone, no network: LOGIN_INFO present and not expired.
 
@@ -90,12 +121,7 @@ def check_session_offline(session_dir: str | Path, account_name: str = "default"
     """
     has_login_info, expires_at_str, days_left = read_login_info_metadata(session_dir)
     if not has_login_info:
-        return HeartbeatStatus(
-            account_name=account_name,
-            is_alive=False,
-            login_info_present=False,
-            details="LOGIN_INFO cookie not found in profile",
-        )
+        return _no_login_info(session_dir, account_name)
     expired = days_left is not None and days_left <= 0
     return HeartbeatStatus(
         account_name=account_name,
@@ -155,14 +181,9 @@ async def check_session_heartbeat(
     """
     has_login_info, expires_at_str, days_left = read_login_info_metadata(session_dir)
     if not has_login_info:
-        return HeartbeatStatus(
-            account_name=account_name,
-            is_alive=False,
-            login_info_present=False,
-            details="LOGIN_INFO cookie not found in profile",
-        )
+        return _no_login_info(session_dir, account_name)
 
-    cookies = read_youtube_cookies(session_dir)
+    cookies =read_youtube_cookies(session_dir)
     if "LOGIN_INFO" not in cookies:
         return HeartbeatStatus(
             account_name=account_name,
@@ -174,7 +195,7 @@ async def check_session_heartbeat(
     try:
         async with AsyncSession(
             impersonate=HEARTBEAT_IMPERSONATE,
-            proxy=proxy,
+            proxy=curl_proxy_url(proxy),
             timeout=timeout,
             headers=fingerprint_headers(session_dir, locale),
         ) as session:
@@ -236,5 +257,5 @@ async def check_account_heartbeat(
         account_name=account.name,
         proxy=proxy,
         timeout=timeout,
-        locale=locale,
+        locale=account.locale or locale,
     )

@@ -48,7 +48,7 @@ Then read this file fully before doing anything else in this session.
 - Multi-account parallel orchestration supporting `each` and `share` routing modes
 - Account lifecycle engine (`modules/lifecycle_engine.py`): quarantine 0-24h, aging 24-48h (no comments), probation 48-72h (1/day, 3h cooldown), mature 72h+ (5/day, 45-90 min); 3 consecutive errors restrict an account; `--lifecycle` and `--warm-quarantined` CLI
 - Wizard stage 1 «Аккаунты» menu: `5` import accounts (file or pasted `login:password:TOTP` lines, then pick who to warm up), `6` warm up all quarantine/aging accounts, `8` read-only lifecycle table (`modules/account_menu_logic.py`)
-- Comprehensive automated test suite (522 passing unit and integration tests)
+- Comprehensive automated test suite (651 passing unit and integration tests)
 
 **Not yet built:**
 - Real-time WebRTC audio stream generation for interactive live events

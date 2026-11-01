@@ -128,7 +128,7 @@ class ProcessorSettings(BaseModel):
     max_sentences: int = Field(default=2, ge=1)
     styles: list[str] = Field(
         default_factory=lambda: [
-            "friendly agreement and encouragement",
+            "casual remark that picks up one specific detail of the comment",
             "thoughtful and insightful follow-up question",
             "humorous, witty remark or light banter",
             "concise acknowledgement or brief nod",
@@ -331,6 +331,7 @@ class BrowserSettings(BaseModel):
     navigation_timeout_ms: int = Field(default=45000, ge=5000)
     render_min_seconds: float = Field(default=45.0, gt=0)
     render_max_seconds: float = Field(default=90.0, gt=0)
+    render_play_video: bool = True  # click a paused watch-page video (muted) so it really plays during the render wait
     firefox_user_prefs: dict[str, Any] = Field(
         default_factory=lambda: {
             "media.peerconnection.enabled": True,
@@ -380,6 +381,8 @@ class LimitsSettings(BaseModel):
     video_cooldown_seconds: float = Field(default=120.0, ge=0)
     pause_min_seconds: float = Field(default=8.0, ge=0)
     pause_max_seconds: float = Field(default=20.0, ge=0)
+    # Wait this long after a posted reply, then look for it as an anonymous visitor would (0 turns the check off).
+    visibility_check_delay_seconds: float = Field(default=45.0, ge=0)
     retry_backoff_seconds: float = Field(default=45.0, ge=1)
     max_queue_attempts: int = Field(default=3, ge=1, le=10)
 

@@ -7,6 +7,15 @@ from typing import Any
 
 from playwright.async_api import Error as PlaywrightError
 
+# Structural handles only: the bot runs accounts in any UI language, and visible text, `aria-label` and `title` are
+# localized (verified in en/ru/pl, see .mex/patterns/youtube-reply-flow.md). A text selector is never acceptable here.
+SIGN_IN_LINK = 'ytd-masthead #buttons a[href*="ServiceLogin"]'
+# consent.youtube.com: two forms that post to /save, told apart by the hidden `set_eom` flag
+# (essential-only mode: true = "reject all", false = "accept all"). Verified live on consent.youtube.com/m and /d
+# (en, pl, de, fr): each selector matches 2 buttons (two layouts, one display:none); a miss only means the banner stays.
+CONSENT_REJECT_SELECTORS = ('form[action*="consent"]:has(input[name="set_eom"][value="true"]) button',)
+CONSENT_ACCEPT_SELECTORS = ('form[action*="consent"]:has(input[name="set_eom"][value="false"]) button',)
+
 
 async def first_visible(
     page: Any,
@@ -37,4 +46,4 @@ async def first_visible(
         await asyncio.sleep(poll_seconds)
 
 
-__all__ = ["first_visible"]
+__all__ = ["CONSENT_ACCEPT_SELECTORS", "CONSENT_REJECT_SELECTORS", "SIGN_IN_LINK", "first_visible"]
