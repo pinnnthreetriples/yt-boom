@@ -19,6 +19,7 @@ from database import (
 )
 from modules.account_warmer import AccountWarmer
 from modules.comment_visibility import CommentVisibilityChecker
+from modules.geo_guard import warn_if_exit_mismatch
 from modules.interaction_simulator import InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.pool_manager import PoolManager
@@ -167,12 +168,17 @@ class MultiAccountOrchestrator:
             account_name=acc.name,
             simulator=self._simulator,
             rng=self._rng,
+            locale=acc.locale,
         )
 
     async def _get_runner(self, acc: AccountRecord) -> Any:
         """Return the account's long-lived runner, creating it on first use; the pool never exceeds `concurrency`."""
         runner = self._runners.get(acc.id)
         if runner is None:
+            if acc.expected_country:  # once per account and process; only a warning, a running account is never blocked
+                await warn_if_exit_mismatch(
+                    acc.name, acc.expected_country, resolve_account_proxy(acc.proxy_url, self._cfg.browser.proxy)
+                )
             while len(self._runners) >= self._concurrency:
                 idle_acc_id = next(
                     (

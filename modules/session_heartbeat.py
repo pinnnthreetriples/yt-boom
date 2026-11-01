@@ -257,5 +257,5 @@ async def check_account_heartbeat(
         account_name=account.name,
         proxy=proxy,
         timeout=timeout,
-        locale=locale,
+        locale=account.locale or locale,
     )

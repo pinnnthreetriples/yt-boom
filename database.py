@@ -139,6 +139,8 @@ _ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
     ("auth_status", "TEXT DEFAULT 'pending'"),
     ("fingerprint_data", "TEXT"),
     ("geo_country", "TEXT"),
+    ("expected_country", "TEXT"),
+    ("locale", "TEXT"),
 )
 
 _ACCOUNT_LIFECYCLE_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -283,6 +285,8 @@ class AccountRecord(BaseModel):
     auth_status: str = "pending"
     fingerprint_data: str | None = None
     geo_country: str | None = None
+    expected_country: str | None = None
+    locale: str | None = None
     lifecycle_stage: str = "quarantine"
     authenticated_at: str | None = None
     quarantine_until: str | None = None
@@ -305,6 +309,8 @@ class AccountCreate(BaseModel):
     totp_secret: str | None = Field(default=None, repr=False, exclude=True)
     recovery_email: str | None = None
     geo_country: str | None = None
+    expected_country: str | None = None
+    locale: str | None = None
     lifecycle_stage: str = "quarantine"
     authenticated_at: str | None = None
     quarantine_until: str | None = None
@@ -1221,6 +1227,8 @@ class Database:
         totp_secret: str | None = None,
         recovery_email: str | None = None,
         geo_country: str | None | _Unset = UNSET,
+        expected_country: str | None | _Unset = UNSET,
+        locale: str | None | _Unset = UNSET,
     ) -> AccountRecord:
         """Create or update an account by name.
 
@@ -1228,6 +1236,8 @@ class Database:
         `proxy_url=None` removes the proxy); a new account needs `session_path`, starts active and without proxy.
         Credentials passed as None keep what is stored. A changed email, password or proxy resets `auth_status`
         to `pending`. `password` and `totp_secret` are stored encrypted (Windows DPAPI).
+        `expected_country` (ISO alpha-2, upper-cased here) and `locale` (e.g. `pl-PL`) keep the stored value when not
+        passed; an explicit None clears them. Callers validate them (`modules.geo_guard`).
         """
         name = name.strip()
         if not name:
@@ -1241,6 +1251,10 @@ class Database:
         email, password, totp_secret, recovery_email = (
             (value.strip() or None) if value else None for value in (email, password, totp_secret, recovery_email)
         )
+        if isinstance(expected_country, str):
+            expected_country = expected_country.strip().upper() or None
+        if isinstance(locale, str):
+            locale = locale.strip() or None
         now = datetime.now(timezone.utc).isoformat()
         async with self._transaction() as conn:
             row = await (await conn.execute("SELECT * FROM accounts WHERE name = ?", (name,))).fetchone()
@@ -1250,8 +1264,9 @@ class Database:
                 await conn.execute(
                     """
                     INSERT INTO accounts (name, session_path, proxy_url, is_active, total_replies, created_at,
-                                          email, password, totp_secret, recovery_email, geo_country)
-                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                                          email, password, totp_secret, recovery_email, geo_country,
+                                          expected_country, locale)
+                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         name,
@@ -1264,6 +1279,8 @@ class Database:
                         protect_secret(totp_secret),
                         recovery_email,
                         None if isinstance(geo_country, _Unset) else geo_country,
+                        None if isinstance(expected_country, _Unset) else expected_country,
+                        None if isinstance(locale, _Unset) else locale,
                     ),
                 )
             else:
@@ -1272,6 +1289,8 @@ class Database:
                 new_proxy = current.proxy_url if isinstance(proxy_url, _Unset) else proxy_url
                 new_active = current.is_active if isinstance(is_active, _Unset) else bool(is_active)
                 new_country = current.geo_country if isinstance(geo_country, _Unset) else geo_country
+                new_expected = current.expected_country if isinstance(expected_country, _Unset) else expected_country
+                new_locale = current.locale if isinstance(locale, _Unset) else locale
                 credentials_changed = (
                     (email is not None and email != current.email)
                     or (password is not None and password != current.password)
@@ -1286,6 +1305,8 @@ class Database:
                         totp_secret = COALESCE(?, totp_secret),
                         recovery_email = COALESCE(?, recovery_email),
                         geo_country = ?,
+                        expected_country = ?,
+                        locale = ?,
                         auth_status = CASE WHEN ? THEN 'pending' ELSE auth_status END
                     WHERE id = ?
                     """,
@@ -1298,6 +1319,8 @@ class Database:
                         protect_secret(totp_secret),
                         recovery_email,
                         new_country,
+                        new_expected,
+                        new_locale,
                         1 if credentials_changed else 0,
                         row["id"],
                     ),

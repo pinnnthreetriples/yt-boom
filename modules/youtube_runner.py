@@ -68,10 +68,12 @@ class YouTubeRunner:
         simulator: InteractionSimulator | None = None,
         artifacts_dir: Path | None = None,
         rng: random.Random | None = None,
+        locale: str | None = None,
     ) -> None:
         self._cfg = browser_settings
         self._target = target
         self._account_name = account_name
+        self._locale = locale or browser_settings.locale  # the account's own locale, else browser.locale
         if proxy is not _UNSET:
             self._proxy = proxy
         else:
@@ -135,7 +137,7 @@ class YouTubeRunner:
             "os": self._cfg.os,
             "geoip": self._cfg.geoip,
             "humanize": self._cfg.humanize,
-            "locale": self._cfg.locale,
+            "locale": self._locale,
             "persistent_context": True,
             "user_data_dir": str(self._session_dir),
             "firefox_user_prefs": prefs,
