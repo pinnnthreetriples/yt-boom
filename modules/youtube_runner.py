@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict
 from config import BrowserSettings, TargetSettings, parse_proxy
 from modules.fingerprint_manager import get_or_create_fingerprint, host_webgl_config, is_compatible
 from modules.interaction_simulator import InteractionError, InteractionSimulator
-from modules.page_helpers import first_visible
+from modules.page_helpers import CONSENT_ACCEPT_SELECTORS, SIGN_IN_LINK, first_visible
 from modules.ui_test_runner import NavigationError, SubmissionError, SubmissionResult
 
 
@@ -31,6 +31,29 @@ class YouTubeCommentElement(BaseModel):
 
 
 _UNSET = object()
+
+# Structural selectors only, verified live in ru-RU and en-US (see .mex/patterns/youtube-reply-flow.md): visible text and
+# aria-label are localized and must never be matched.
+EXPAND_REPLIES_SELECTORS = (
+    # the visible expander of the current layout; the two ids below sit in the collapsed #expander and are hidden
+    "#replies #more-replies-sub-thread button",
+    "#replies ytd-button-renderer#more-replies button",
+    "ytd-comment-replies-renderer #more-replies",
+    "#more-replies button",
+)
+REPLY_INPUT_SELECTORS = (
+    "#reply-dialog #contenteditable-root",
+    "ytd-comment-reply-dialog-renderer #contenteditable-root",
+    "div#contenteditable-root[contenteditable='true']",
+    "#contenteditable-textarea #contenteditable-root",
+    "ytd-comment-reply-dialog-renderer textarea",
+)
+SUBMIT_BUTTON_SELECTOR = "#submit-button button"  # inside the composer that holds the typed text
+SUBMIT_BUTTON_PAGE_SELECTORS = (
+    "#reply-dialog #submit-button button",
+    "ytd-comment-reply-dialog-renderer #submit-button button",
+    "ytd-button-renderer#submit-button button",
+)
 _PLAYER_STATE_JS = """() => {
     const player = document.getElementById('movie_player');
     const video = player && player.querySelector('video');
@@ -306,18 +329,7 @@ class YouTubeRunner:
 
     async def _dismiss_consent(self, page: Any) -> None:
         """Dismiss EU/US cookie consent banner if it appears on YouTube."""
-        selectors = [
-            "button[aria-label*='Accept']",
-            "button[aria-label*='Принять']",
-            "button:has-text('Accept all')",
-            "button:has-text('Принять все')",
-            "button:has-text('I agree')",
-            "ytd-button-renderer:has-text('Accept all') button",
-            "ytd-button-renderer:has-text('Принять все') button",
-            "form[action*='consent'] button",
-            ".yt-spec-button-shape-next--filled:has-text('Accept')",
-        ]
-        for sel in selectors:
+        for sel in CONSENT_ACCEPT_SELECTORS:
             try:
                 locator = page.locator(sel).first
                 if await locator.count() > 0 and await locator.is_visible():
@@ -431,46 +443,20 @@ class YouTubeRunner:
             except Exception:
                 pass
 
-        expander_selectors = [
-            # Dedicated YouTube reply expander elements
-            "#replies ytd-button-renderer#more-replies button",
-            "ytd-comment-replies-renderer #more-replies",
-            "ytd-comment-replies-renderer ytd-button-renderer button",
-            "ytd-comment-replies-renderer #expander-header button",
-            "#more-replies button",
-            # Specific aria-labels that indicate viewing replies (plural/view)
-            "button[aria-label*='replies' i]",
-            "button[aria-label*='View reply' i]",
-            "button[aria-label*='Show reply' i]",
-            "button[aria-label*='ответов' i]",
-            "button[aria-label*='ответа' i]",
-            "button[aria-label*='Посмотреть ответ' i]",
-            "button[aria-label*='Показать ответ' i]",
-        ]
         expanded_count = 0
-        for sel in expander_selectors:
+        for sel in EXPAND_REPLIES_SELECTORS:
             try:
                 buttons = page.locator(sel)
                 count = await buttons.count()
                 for i in range(min(count, 3)):
                     btn = buttons.nth(i)
                     if await btn.is_visible():
-                        # Do not click if button is already expanded or represents 'Скрыть' (collapse)
+                        # Do not click if the button is already expanded (the collapse control is #less-replies)
                         try:
                             aria_attr = btn.get_attribute("aria-expanded")
                             if asyncio.iscoroutine(aria_attr):
                                 aria_attr = await aria_attr
                             if aria_attr == "true":
-                                continue
-                        except Exception:
-                            pass
-
-                        try:
-                            raw_txt = btn.inner_text()
-                            if asyncio.iscoroutine(raw_txt):
-                                raw_txt = await raw_txt
-                            btn_txt = str(raw_txt or "").lower()
-                            if "скрыть" in btn_txt or "hide" in btn_txt:
                                 continue
                         except Exception:
                             pass
@@ -498,7 +484,7 @@ class YouTubeRunner:
         reply_button = await self._find_sub_comment_reply_button(page, comment_id=comment_id, timeout_seconds=15.0)
         if reply_button is None:
             # Check if YouTube is asking user to sign in
-            sign_in = page.locator("a[aria-label*='Sign in' i], a:has-text('Sign in'), a:has-text('Войти')")
+            sign_in = page.locator(SIGN_IN_LINK)
             if await sign_in.count() > 0:
                 msg = (
                     f"Сессия YouTube в {self._session_dir} не авторизована. Выполните вход через "
@@ -553,23 +539,10 @@ class YouTubeRunner:
         dialog = reply_input.locator(
             "xpath=ancestor::*[self::ytd-commentbox or self::ytd-comment-reply-dialog-renderer][1]"
         )
-        scoped_selectors = [
-            "#submit-button button",
-            "button[aria-label*='Reply' i]",
-            "button[aria-label*='Ответить' i]",
-            "button:has-text('Reply')",
-            "button:has-text('Ответить')",
-        ]
-        page_selectors = [
-            "#reply-dialog #submit-button button",
-            "ytd-comment-reply-dialog-renderer #submit-button button",
-            "ytd-button-renderer#submit-button button",
-        ]
-
         submit_btn = None
         submit_deadline = time.monotonic() + 6.0
         while time.monotonic() < submit_deadline and submit_btn is None:
-            searches = [(dialog, sel) for sel in scoped_selectors] + [(page, sel) for sel in page_selectors]
+            searches = [(dialog, SUBMIT_BUTTON_SELECTOR)] + [(page, sel) for sel in SUBMIT_BUTTON_PAGE_SELECTORS]
             for scope, sel in searches:
                 try:
                     locator = await self._first_visible(scope, sel)
@@ -613,18 +586,9 @@ class YouTubeRunner:
         return match.group(1) if match else None
 
     async def _wait_reply_input(self, page: Any, timeout_seconds: float = 6.0) -> Any | None:
-        reply_input_selectors = [
-            "#reply-dialog #contenteditable-root",
-            "ytd-comment-reply-dialog-renderer #contenteditable-root",
-            "div#contenteditable-root[contenteditable='true']",
-            "#contenteditable-textarea #contenteditable-root",
-            "div[aria-label*='reply' i][contenteditable='true']",
-            "div[aria-label*='ответ' i][contenteditable='true']",
-            "ytd-comment-reply-dialog-renderer textarea",
-        ]
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            for sel in reply_input_selectors:
+            for sel in REPLY_INPUT_SELECTORS:
                 try:
                     locator = await self._first_visible(page, sel)
                     if locator is not None:
@@ -675,10 +639,6 @@ class YouTubeRunner:
                 f"ytd-comment-renderer:has(a[href*='lc={comment_id}']) #reply-button-end :is(button, a)",
                 f"a[href*='lc={comment_id}'] >> xpath=ancestor::ytd-comment-view-model >> #reply-button-end :is(button, a)",
                 f"a[href*='lc={comment_id}'] >> xpath=ancestor::ytd-comment-renderer >> #reply-button-end :is(button, a)",
-                f"ytd-comment-view-model:has(a[href*='lc={comment_id}']) button[aria-label*='Ответить' i]",
-                f"ytd-comment-view-model:has(a[href*='lc={comment_id}']) button[aria-label*='Reply' i]",
-                f"a[href*='lc={comment_id}'] >> xpath=ancestor::ytd-comment-view-model >> button[aria-label*='Ответить' i]",
-                f"a[href*='lc={comment_id}'] >> xpath=ancestor::ytd-comment-view-model >> button[aria-label*='Reply' i]",
             ])
 
         generic = [
@@ -687,8 +647,6 @@ class YouTubeRunner:
             "ytd-comment-view-model:has(#linked-comment-badge) #reply-button-end :is(button, a)",
             "ytd-comment-renderer[linked-comment-badge] #reply-button-end :is(button, a)",
             ".badge-shape-wiz--highlighted >> xpath=ancestor::ytd-comment-view-model >> #reply-button-end :is(button, a)",
-            "ytd-comment-view-model[linked-comment-badge] button[aria-label*='Ответить' i]",
-            "ytd-comment-view-model[linked-comment-badge] button[aria-label*='Reply' i]",
             # 3. Reply button inside expanded replies container (#replies #expander)
             "#replies #expander ytd-comment-view-model #reply-button-end :is(button, a)",
             "#replies #expander ytd-comment-renderer #reply-button-end :is(button, a)",
@@ -696,14 +654,8 @@ class YouTubeRunner:
             "ytd-comment-replies-renderer ytd-comment-view-model #reply-button-end :is(button, a)",
             # 4. Fallback: reply button in replies section
             "#replies #reply-button-end :is(button, a)",
-            "ytd-comment-thread-renderer #replies button[aria-label*='Reply' i]",
-            "ytd-comment-thread-renderer #replies button[aria-label*='Ответить' i]",
             # 5. Last resort fallback
             "#reply-button-end :is(button, a)",
-            "button[aria-label*='Reply' i]",
-            "button[aria-label*='Ответить' i]",
-            "button:has-text('Reply')",
-            "button:has-text('Ответить')",
         ]
         if not comment_id:
             selectors.extend(generic)

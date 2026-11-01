@@ -24,7 +24,7 @@ SEARCH_CARD_SELECTOR = "ytd-video-renderer a#video-title"
 FALLBACK_SEARCH_QUERIES = ("relaxing music", "cooking recipes", "travel vlog", "science explained", "funny animals")
 PLAYER_SELECTOR = "#movie_player"
 COMMENTS_SELECTOR = "#comments"
-MORE_REPLIES_SELECTOR = "#replies #more-replies button"
+MORE_REPLIES_SELECTOR = "#replies #more-replies-sub-thread button, #replies #more-replies button"  # the first is the visible one
 LIKE_BUTTON_SELECTOR = "#segmented-like-button button"
 
 THEATER_CHANCE = 0.35
