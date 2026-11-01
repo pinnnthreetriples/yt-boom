@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import io
 import sqlite3
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -279,6 +280,7 @@ class TestImportFlow(MenuCase):
             for where, text in (("output", output), ("loguru", logged.getvalue()), ("stderr", err.getvalue())):
                 self.assertNotIn(secret, text, where)
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI")
     def test_stored_credentials_are_encrypted_not_raw(self):
         with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
             self.paste([good_line(1)], "n")

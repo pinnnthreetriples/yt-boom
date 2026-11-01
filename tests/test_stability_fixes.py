@@ -251,6 +251,7 @@ class TestRunnerPoolLimit(unittest.IsolatedAsyncioTestCase):
 class TestProcessGuard(unittest.TestCase):
     """The tests never bind the test process itself: structures and calls are checked through a fake kernel32."""
 
+    @unittest.skipUnless(sys.platform == "win32", "WinAPI structure sizes (LONG is 4 bytes)")
     def test_extended_limits_layout_matches_winapi(self):
         wide = ctypes.sizeof(ctypes.c_void_p) == 8
         self.assertEqual(ctypes.sizeof(JobBasicLimits), 64 if wide else 48)
