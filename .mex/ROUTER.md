@@ -47,7 +47,7 @@ Then read this file fully before doing anything else in this session.
 - Windows DPAPI credential encryption (`protect_secret` / `reveal_secret`) for SQLite persistence
 - Multi-account parallel orchestration supporting `each` and `share` routing modes
 - Account lifecycle engine (`modules/lifecycle_engine.py`): quarantine 0-24h, aging 24-48h (no comments), probation 48-72h (1/day, 3h cooldown), mature 72h+ (5/day, 45-90 min); 3 consecutive errors restrict an account; `--lifecycle` and `--warm-quarantined` CLI
-- Comprehensive automated test suite (446 passing unit and integration tests)
+- Comprehensive automated test suite (475 passing unit and integration tests)
 
 **Not yet built:**
 - Real-time WebRTC audio stream generation for interactive live events

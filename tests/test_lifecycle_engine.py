@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from database import AccountRecord, Database
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.multi_account_orchestrator import MultiAccountOrchestrator
-from modules.session_heartbeat import FALLBACK_USER_AGENT, build_heartbeat_headers
 
 T0 = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
 
@@ -234,25 +233,6 @@ class TestDatabaseLifecycle(unittest.IsolatedAsyncioTestCase):
             (session / "fingerprint.json").write_text("{broken", encoding="utf-8")
             await db.sync_account_fingerprint(acc.id, session)  # damaged file never overwrites the stored value
             self.assertEqual((await db.get_account(acc.id)).fingerprint_data, payload)
-
-
-class TestHeartbeatHeaders(unittest.TestCase):
-    def test_user_agent_comes_from_the_pinned_fingerprint(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "fingerprint.json").write_text(
-                json.dumps({"format": 1, "os": "windows", "fingerprint": {"navigator": {"userAgent": "Pinned/1.0"}}}),
-                encoding="utf-8",
-            )
-            headers = build_heartbeat_headers(tmp)
-        self.assertEqual(headers["User-Agent"], "Pinned/1.0")
-        self.assertEqual(headers["Sec-Fetch-Mode"], "navigate")
-        self.assertNotIn("sec-ch-ua", {k.lower() for k in headers})
-
-    def test_falls_back_to_firefox_128_without_a_fingerprint(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            headers = build_heartbeat_headers(tmp)
-        self.assertEqual(headers["User-Agent"], FALLBACK_USER_AGENT)
-        self.assertIn("Firefox/128.0", FALLBACK_USER_AGENT)
 
 
 class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):

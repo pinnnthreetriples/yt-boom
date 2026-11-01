@@ -247,6 +247,7 @@ class TestYouTubeRunner(unittest.IsolatedAsyncioTestCase):
         mock_rng.random.return_value = 0.0  # guaranteed to trigger typo
         mock_rng.choice.side_effect = lambda choices: choices[0]
         mock_rng.uniform.return_value = 5.0
+        mock_rng.lognormvariate.return_value = 5.0
 
         sim = InteractionSimulator(config=cfg, rng=mock_rng)
         with patch("asyncio.sleep", new_callable=AsyncMock):
