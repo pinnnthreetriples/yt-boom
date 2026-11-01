@@ -331,6 +331,7 @@ class BrowserSettings(BaseModel):
     navigation_timeout_ms: int = Field(default=45000, ge=5000)
     render_min_seconds: float = Field(default=45.0, gt=0)
     render_max_seconds: float = Field(default=90.0, gt=0)
+    render_play_video: bool = True  # click a paused watch-page video (muted) so it really plays during the render wait
     firefox_user_prefs: dict[str, Any] = Field(
         default_factory=lambda: {
             "media.peerconnection.enabled": True,
