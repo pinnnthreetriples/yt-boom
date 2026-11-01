@@ -11,8 +11,8 @@ from playwright.async_api import Error as PlaywrightError
 # localized (verified in en/ru/pl, see .mex/patterns/youtube-reply-flow.md). A text selector is never acceptable here.
 SIGN_IN_LINK = 'ytd-masthead #buttons a[href*="ServiceLogin"]'
 # consent.youtube.com: two forms that post to /save, told apart by the hidden `set_eom` flag
-# (essential-only mode: true = "reject all", false = "accept all"). Taken from the page markup, not reproducible
-# from a non-EU address; a miss only means the banner stays and the later steps report it.
+# (essential-only mode: true = "reject all", false = "accept all"). Verified live on consent.youtube.com/m and /d
+# (en, pl, de, fr): each selector matches 2 buttons (two layouts, one display:none); a miss only means the banner stays.
 CONSENT_REJECT_SELECTORS = ('form[action*="consent"]:has(input[name="set_eom"][value="true"]) button',)
 CONSENT_ACCEPT_SELECTORS = ('form[action*="consent"]:has(input[name="set_eom"][value="false"]) button',)
 

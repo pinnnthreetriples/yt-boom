@@ -17,7 +17,7 @@ mex:
   id: mx_01M69VC039A3DJ99V5S1GNSRPJ
   type: pattern
   status: promoted
-  revision: 3
+  revision: 4
   title: youtube-reply-flow
   relations:
     - type: related_to
@@ -36,7 +36,7 @@ Posting replies under YouTube comments requires driving `modules.youtube_runner.
 ## Steps
 1. **Initialize Runner**: Instantiate `YouTubeRunner` with account settings, pinned fingerprint, and proxy config.
 2. **Navigate to Permalinks**: Open the video URL with `&lc={comment_id}` query parameter to ensure the target parent comment or sub-comment is highlighted.
-3. **Dismiss Consent**: Call `_dismiss_consent(page)`; it clicks the `consent.youtube.com` form whose hidden `set_eom` flag is `false` (`CONSENT_ACCEPT_SELECTORS` in `page_helpers.py`). Not verified live (no consent page for a non-EU address); the youtube.com lightbox variant has no known structural handle.
+3. **Dismiss Consent**: Call `_dismiss_consent(page)`; it clicks the `consent.youtube.com` form whose hidden `set_eom` flag is `false` (`CONSENT_ACCEPT_SELECTORS` in `page_helpers.py`). Verified live 2026-11-01 on `consent.youtube.com/m?...&uxe=eomtm&cm=2` (en, pl) and `/d` (en, de, fr, pl); the page is served only for some URL variants from a non-EU address. The youtube.com lightbox variant has no known structural handle.
 4. **Locate Reply Trigger**: Use structural selector `#reply-button-end :is(button, a)` targeting the specific comment ID container (`ytd-comment-view-model:has(a[href*='lc={comment_id}'])`).
 5. **Handle First-Time Channel Creation**: Call `_confirm_channel_creation(page)`. If `ytd-channel-creation-dialog-renderer` appears, click `#create-channel-button button` and wait for modal dismissal.
 6. **Focus Contenteditable Input**: Click `#contenteditable-root` inside the active reply dialog.

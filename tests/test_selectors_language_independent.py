@@ -2,7 +2,8 @@
 
 Fixtures copy the structure captured live on 2026-11-01 (YouTube watch page and reply composer in ru-RU / en-US,
 accounts.google.com first screen in en / ru / pl) with only the localized strings changing per language. The
-consent.youtube.com forms are the one synthetic fixture: no consent page is served to a non-EU address.
+consent.youtube.com pages (/m and /d, captured live 2026-11-01 in en / pl / de / fr) keep the real form structure and hidden
+inputs; classes, jsactions and the `escs` / `bl` tokens are dropped.
 """
 from __future__ import annotations
 
@@ -65,10 +66,45 @@ GOOGLE = """
 <div id="identifierNext"><div><button type="button" jsname="LgbsSe">{next}</button></div></div></form>
 """
 
-CONSENT = """
-<form action="https://consent.youtube.com/save" method="POST"><input type="hidden" name="set_eom" value="true"><button>{reject}</button></form>
-<form action="https://consent.youtube.com/save" method="POST"><input type="hidden" name="set_eom" value="false"><button>{accept}</button></form>
-"""
+_HIDDEN = ('<input type="hidden" name="gl" value="DE"><input type="hidden" name="m" value="0"><input type="hidden" name="app" value="0">'
+           '<input type="hidden" name="pc" value="yt"><input type="hidden" name="continue" value="https://www.youtube.com/watch?v=dQw4w9WgXcQ">'
+           '<input type="hidden" name="x" value="{x}"><input type="hidden" name="hl" value="{hl}"><input type="hidden" name="src" value="1">')
+_ACCEPT_FLAGS = '<input type="hidden" name="set_ytc" value="true" required=""><input type="hidden" name="set_apyt" value="true" required="">'
+
+
+def _consent_page(variant: str, hl: str, reject: str, accept: str) -> str:
+    """consent.youtube.com: the buttons are laid out twice (one copy is display:none), reject and accept are separate forms."""
+    m = variant == "m"
+    hidden = _HIDDEN.format(x=6 if m else 7, hl=hl) + ('<input type="hidden" name="uxe" value="eomtm"><input type="hidden" name="cm" value="2">' if m else "")
+
+    def form(label: str, flags: str) -> str:
+        aria = f' aria-label="{label}"' if m else ""
+        return (f'<form action="https://consent.youtube.com/save" method="POST"><div data-is-touch-wrapper="true">'
+                f'<button jscontroller="soHxf"{aria}><div></div><span jsname="V67aGc">{label}</span></button></div>{hidden}{flags}</form>')
+
+    reject_form = form(reject, '<input type="hidden" name="set_eom" value="true" required="">')
+    accept_flags = _ACCEPT_FLAGS + '<input type="hidden" name="set_eom" value="false" required="">' if m else (
+        '<input type="hidden" name="set_eom" value="false" required="">' + _ACCEPT_FLAGS)
+    accept_form = form(accept, accept_flags)
+    return f'<div class="shown">{reject_form}{accept_form}</div><div class="other-layout" style="display:none">{accept_form}{reject_form}</div>'
+
+
+# (variant, hl) -> (reject label, accept label)
+CONSENT_PAGES = {
+    ("m", "en"): ("Reject all", "Accept all"),
+    ("m", "pl"): ("Odrzuć wszystko", "Zaakceptuj wszystko"),
+    ("d", "en"): ("Reject all", "Confirm your settings"),
+    ("d", "de"): ("Alle ablehnen", "Einstellungen bestätigen"),
+    ("d", "fr"): ("Tout refuser", "Confirmer vos paramètres"),
+    ("d", "pl"): ("Odrzuć wszystko", "Potwierdź ustawienia"),
+}
+
+YTCFG_PAGES = {
+    "signed in": ('window.ytcfg = {get: () => false}; ytcfg.set({"SESSION_INDEX":"0","LOGGED_IN":true,"CHANNEL_ID":"UC1234567890abcdefghij_-"});', True, True, "UC1234567890abcdefghij_-"),
+    "signed in, no channel id on this page": ('ytcfg.set({"DATASYNC_ID":"1||","LOGGED_IN": true});', True, True, None),
+    "guest": ('ytcfg.set({"LOGGED_IN":false,"INNERTUBE_CONTEXT_CLIENT_NAME":1});', True, False, None),
+    "config not parsed yet": ("var ytInitialData = {};", False, False, None),
+}
 
 
 class _BrowserCase(unittest.IsolatedAsyncioTestCase):
@@ -128,20 +164,31 @@ class TestYouTubeSelectors(_BrowserCase):
                 self.assertTrue(owner.endswith("lc=TARGET.sub"), owner)
 
     async def _check_consent_forms_told_apart_by_the_hidden_flag(self) -> None:
-        for lang, labels in {"en": ("Reject all", "Accept all"), "ru": ("Отклонить все", "Принять все"), "pl": ("Odrzuć wszystko", "Zaakceptuj wszystko")}.items():
-            with self.subTest(lang=lang):
-                await self.page.set_content(CONSENT.format(reject=labels[0], accept=labels[1]))
+        for (variant, hl), (reject_label, accept_label) in CONSENT_PAGES.items():
+            with self.subTest(variant=variant, hl=hl):
+                await self.page.set_content(_consent_page(variant, hl, reject_label, accept_label))
+                self.assertEqual(await self.count(CONSENT_REJECT_SELECTORS[0]), 2)  # both layouts
+                self.assertEqual(await self.count(CONSENT_ACCEPT_SELECTORS[0]), 2)
                 reject = await first_visible(self.page, CONSENT_REJECT_SELECTORS)
                 accept = await first_visible(self.page, CONSENT_ACCEPT_SELECTORS)
-                self.assertEqual(await reject.inner_text(), labels[0])
-                self.assertEqual(await accept.inner_text(), labels[1])
-
+                self.assertEqual((await reject.inner_text()).strip(), reject_label)
+                self.assertEqual((await accept.inner_text()).strip(), accept_label)
+                flag = "e => e.closest('form').querySelector('input[name=set_eom]').value"
+                self.assertEqual((await reject.evaluate(flag), await accept.evaluate(flag)), ("true", "false"))
 
     async def test_youtube_selectors_in_every_ui_language(self) -> None:
         # one browser start for all three checks (a Camoufox launch costs seconds)
         await self._check_thread_expander_and_composer()
         await self._check_reply_button_of_the_linked_comment()
         await self._check_consent_forms_told_apart_by_the_hidden_flag()
+
+
+class TestYtcfgFromInlineScript(_BrowserCase):
+    async def test_login_state_is_read_from_the_inline_config_in_any_world(self) -> None:
+        for name, (script, ready, logged_in, channel) in YTCFG_PAGES.items():
+            with self.subTest(page=name):
+                await self.page.set_content(f"<html><body><script nonce='x'>{script}</script><script src='/x.js'></script></body></html>")
+                self.assertEqual(await self.page.evaluate(ga.YTCFG_JS), {"ready": ready, "loggedIn": logged_in, "channelId": channel})
 
 
 class TestGoogleSignInSelectors(_BrowserCase):
