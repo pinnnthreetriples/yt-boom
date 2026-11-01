@@ -14,6 +14,7 @@ unit-tests:
     key: pip-$CI_COMMIT_REF_SLUG
     paths:
       - .cache/pip
+    when: always
   before_script:
     - pip install -r requirements.txt
     - cp config.example.yaml config.yaml
