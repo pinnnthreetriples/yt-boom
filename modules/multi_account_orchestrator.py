@@ -250,7 +250,9 @@ class MultiAccountOrchestrator:
 
     async def _run_warmup(self, acc: AccountRecord) -> None:
         try:
-            async with self._warmup_slot:
+            async with self._warmup_slot, self._runner_locks[acc.id]:
+                # the warm-up opens its own browser on the account's profile: free it from a long-lived runner first
+                await self._drop_runner(acc.id)
                 result = await self._warmer.warm_up(acc, db=self._db)
             if not getattr(result, "success", True):
                 self._warmup_failed_at[acc.id] = datetime.now(timezone.utc)

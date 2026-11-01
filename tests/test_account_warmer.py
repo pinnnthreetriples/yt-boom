@@ -77,11 +77,12 @@ class TestAccountWarmer(unittest.IsolatedAsyncioTestCase):
         element.bounding_box = AsyncMock(return_value={"x": 10, "y": 10, "width": 400, "height": 300})
         return element
 
-    def _page(self, cards, url="https://www.youtube.com/watch?v=home_vid_1"):
+    def _page(self, cards, url="https://www.youtube.com/watch?v=home_vid_1", search_cards=()):
         page = AsyncMock()
         page.url = url
         by_selector = {
             "ytd-rich-grid-media a#video-title-link": cards,
+            "ytd-video-renderer a#video-title": list(search_cards),
             "#replies #more-replies button": [self._element()],
         }
         page.query_selector_all = AsyncMock(side_effect=lambda sel: by_selector.get(sel, []))
@@ -110,6 +111,19 @@ class TestAccountWarmer(unittest.IsolatedAsyncioTestCase):
         self.mock_sim.click_locator.assert_any_await(page, card)
         mock_db.record_account_warmup_success.assert_awaited_once_with(1)
         mock_db.increment_account_stats.assert_not_called()
+
+    async def test_empty_home_feed_falls_back_to_a_search_and_not_to_the_retired_trending_page(self) -> None:
+        card = self._element(href="/watch?v=search_vid_1")
+        page = self._page([], url="https://www.youtube.com/watch?v=search_vid_1", search_cards=[card])
+
+        res = await self._warm(page, random.Random(1))
+
+        self.assertTrue(res.success, res.details)
+        visited = [call.args[0] for call in page.goto.await_args_list]
+        self.assertEqual(visited[0], "https://www.youtube.com/?hl=en")
+        self.assertTrue(visited[1].startswith("https://www.youtube.com/results?hl=en&search_query="), visited)
+        self.assertFalse(any("trending" in url for url in visited))
+        self.mock_sim.click_locator.assert_any_await(page, card)
 
     async def test_warm_up_without_video_cards_fails_instead_of_using_a_hardcoded_link(self) -> None:
         page = self._page([])

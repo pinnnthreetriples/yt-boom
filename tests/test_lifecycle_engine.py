@@ -5,6 +5,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -264,6 +265,7 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
         orch._skipped_logged, orch._lifecycle_logged = set(), set()
         orch._warmer, orch._warmup_tasks, orch._warmup_failed_at = warmer, {}, {}
         orch._warmup_slot = asyncio.Semaphore(1)
+        orch._runner_locks, orch._runners = defaultdict(asyncio.Lock), {}
         return orch, warmer
 
     async def test_young_accounts_are_skipped_and_warmed_up_in_the_background(self):
@@ -300,6 +302,24 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
             await orch._usable_accounts()
             await orch._finish_warmups()
         self.assertEqual(warmer.warm_up.await_count, 1)
+
+    async def test_warmup_waits_for_the_account_lock_and_frees_its_open_browser(self):
+        db = AsyncMock(spec=Database)
+        db.list_active_accounts.return_value = [_account(2, id=7)]
+        orch, warmer = self._orchestrator(db)
+        runner = MagicMock(close=AsyncMock())
+        orch._runners[7] = runner
+
+        async with orch._runner_locks[7]:  # a comment is being posted by this account
+            await orch._usable_accounts()
+            await asyncio.sleep(0)
+            warmer.warm_up.assert_not_awaited()
+            runner.close.assert_not_awaited()
+        await orch._finish_warmups()
+
+        runner.close.assert_awaited_once()
+        self.assertNotIn(7, orch._runners)
+        warmer.warm_up.assert_awaited_once()
 
     async def test_dry_run_never_starts_a_warmup(self):
         db = AsyncMock(spec=Database)

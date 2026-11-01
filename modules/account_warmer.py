@@ -5,6 +5,7 @@ import random
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote_plus
 
 from loguru import logger
 
@@ -16,6 +17,11 @@ from modules.youtube_runner import YouTubeRunner
 HOME_URL = "https://www.youtube.com/?hl=en"
 HOME_FEED_SELECTOR = "ytd-browse[page-subtype='home'], ytd-browse[browse-id='FEwhat_to_watch']"  # FEwhat_to_watch
 VIDEO_CARD_SELECTOR = "ytd-rich-grid-media a#video-title-link"
+# YouTube retired /feed/trending in July 2025: a fresh account with an empty home feed falls back to a search
+SEARCH_URL = "https://www.youtube.com/results?hl=en&search_query={query}"
+SEARCH_RESULTS_SELECTOR = "ytd-search"
+SEARCH_CARD_SELECTOR = "ytd-video-renderer a#video-title"
+FALLBACK_SEARCH_QUERIES = ("relaxing music", "cooking recipes", "travel vlog", "science explained", "funny animals")
 PLAYER_SELECTOR = "#movie_player"
 COMMENTS_SELECTOR = "#comments"
 MORE_REPLIES_SELECTOR = "#replies #more-replies button"
@@ -139,24 +145,16 @@ class AccountWarmer:
     # ------------------------------------------------------------ discovery
 
     async def _open_video_from_feed(self, page: Any, runner: Any, account: AccountRecord) -> str:
-        """Home feed -> scroll -> click one visible video card with a Bezier mouse path; returns the watch URL."""
-        await page.goto(HOME_URL, wait_until="domcontentloaded")
-        await self._simulator.human_pause(2.0, 4.0)
-        await runner._dismiss_consent(page)
-        try:
-            await page.wait_for_selector(HOME_FEED_SELECTOR, timeout=15000)
-        except Exception as exc:
-            logger.debug("Аккаунт {!r}: лента главной не появилась вовремя: {}", account.name, exc)
-
-        cards: list[Any] = []
-        for _ in range(4):
-            await self._simulator.scroll(page, self._rng.randint(300, 700))
-            await self._simulator.human_pause(1.0, 2.5)
-            cards = await self._visible_cards(page)
-            if len(cards) >= 3:
-                break
+        """Home feed (a neutral search when it is empty) -> scroll -> click one visible video card; returns the watch URL."""
+        cards = await self._cards_on(page, runner, account, HOME_URL, HOME_FEED_SELECTOR, VIDEO_CARD_SELECTOR)
         if not cards:
-            raise RuntimeError("no video cards found on the home feed")
+            query = self._rng.choice(FALLBACK_SEARCH_QUERIES)
+            logger.info("Аккаунт {!r}: лента главной пуста, ищу видео по запросу {!r}", account.name, query)
+            cards = await self._cards_on(
+                page, runner, account, SEARCH_URL.format(query=quote_plus(query)), SEARCH_RESULTS_SELECTOR, SEARCH_CARD_SELECTOR
+            )
+        if not cards:
+            raise RuntimeError("no video cards found on the home feed or in the fallback search")
 
         card = self._rng.choice(cards[:8])
         href = await card.get_attribute("href")
@@ -171,10 +169,31 @@ class AccountWarmer:
         url = page.url
         return url if isinstance(url, str) and "watch?v=" in url else (href or "")
 
-    @staticmethod
-    async def _visible_cards(page: Any) -> list[Any]:
+    async def _cards_on(
+        self, page: Any, runner: Any, account: AccountRecord, url: str, ready_selector: str, card_selector: str
+    ) -> list[Any]:
+        """Open `url`, scroll a little and return the visible video cards (empty when the page has none)."""
+        await page.goto(url, wait_until="domcontentloaded")
+        await self._simulator.human_pause(2.0, 4.0)
+        await runner._dismiss_consent(page)
+        try:
+            await page.wait_for_selector(ready_selector, timeout=15000)
+        except Exception as exc:
+            logger.debug("Аккаунт {!r}: страница {} не появилась вовремя: {}", account.name, url, exc)
+
         cards: list[Any] = []
-        for element in await page.query_selector_all(VIDEO_CARD_SELECTOR):
+        for _ in range(4):
+            await self._simulator.scroll(page, self._rng.randint(300, 700))
+            await self._simulator.human_pause(1.0, 2.5)
+            cards = await self._visible_cards(page, card_selector)
+            if len(cards) >= 3:
+                break
+        return cards
+
+    @staticmethod
+    async def _visible_cards(page: Any, selector: str = VIDEO_CARD_SELECTOR) -> list[Any]:
+        cards: list[Any] = []
+        for element in await page.query_selector_all(selector):
             try:
                 href = await element.get_attribute("href")
                 if href and "/watch?v=" in href and await element.is_visible():
