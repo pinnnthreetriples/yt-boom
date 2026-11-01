@@ -14,7 +14,7 @@ from playwright.async_api import Error as PlaywrightError
 from pydantic import BaseModel, ConfigDict
 
 from config import BrowserSettings, TargetSettings, parse_proxy
-from modules.fingerprint_manager import get_or_create_fingerprint, is_compatible
+from modules.fingerprint_manager import get_or_create_fingerprint, host_webgl_config, is_compatible
 from modules.interaction_simulator import InteractionError, InteractionSimulator
 from modules.page_helpers import first_visible
 from modules.ui_test_runner import NavigationError, SubmissionError, SubmissionResult
@@ -128,6 +128,9 @@ class YouTubeRunner:
             options["i_know_what_im_doing"] = True
         except Exception as exc:
             logger.warning("Не удалось получить сохранённый отпечаток, Camoufox сгенерирует случайный: {}", exc)
+        gpu = host_webgl_config(self._session_dir, self._cfg.os)
+        if gpu is not None:
+            options["webgl_config"] = gpu  # the fingerprint's own gpu is not applied to WebGL: without this Camoufox redraws it per launch
         return options
 
     async def start(self) -> Any:

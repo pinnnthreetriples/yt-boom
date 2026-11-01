@@ -668,6 +668,119 @@ class TestLifecyclePacing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(done, 1)
         self.assertEqual(len(await self.db.list_pool_videos(status="pending")), 1)
 
+    async def _gated_run(self, hours: float, extra_videos: int = 2):
+        await self._account("mature_acc", hours)
+        for n in range(extra_videos):
+            await self.db.add_video_to_pool(f"https://www.youtube.com/watch?v=lifevid{n}{n}{n}x{n}", comments_target=3)
+        orchestrator, runner = self._orchestrator(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="r", duration_seconds=0.1)
+        )
+        sleep = AsyncMock()
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", sleep):
+            done = await orchestrator.execute_video_pool(max_comments_per_video=2)
+        return orchestrator, runner, sleep, done
+
+    async def test_gated_account_does_not_fetch_comments_for_the_remaining_videos(self) -> None:
+        orchestrator, runner, _, done = await self._gated_run(100)
+        self.assertEqual(done, 1)
+        self.assertEqual(runner.run.await_count, 1)
+        self.assertEqual(orchestrator._collector.fetch_popular_comments.await_count, 1)
+
+    async def test_gated_account_leaves_every_video_unfinished_and_skips_the_useless_pause(self) -> None:
+        orchestrator, _, sleep, _ = await self._gated_run(100)
+        videos = await self.db.list_pool_videos(status="all")
+        self.assertEqual(len(videos), 3)
+        self.assertTrue(all(v.status != "completed" for v in videos))
+        self.assertEqual(len(await self.db.list_pool_videos(status="pending")), 3)
+        sleep.assert_not_awaited()  # the cooldown would refuse the next comment anyway
+        self.assertEqual(len(orchestrator._gated_accounts), 1)
+
+    async def test_one_gated_account_does_not_stop_the_others(self) -> None:
+        gated = await self._account("mature_acc", 100)
+        free = await self._account("manual_acc", None)  # no lifecycle clock: never gated
+        for n in range(2):
+            await self.db.add_video_to_pool(f"https://www.youtube.com/watch?v=lifevid{n}{n}{n}y{n}", comments_target=2)
+        orchestrator, runner = self._orchestrator(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="r", duration_seconds=0.1)
+        )
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            done = await orchestrator.execute_video_pool(max_comments_per_video=2)
+        self.assertEqual(orchestrator._gated_accounts, {gated.id})
+        # the free account went on past the first video (the shared fixture comments run out after 6 ids)
+        self.assertGreater((await self.db.get_account(free.id)).total_replies, 2)
+        self.assertEqual((await self.db.get_account(gated.id)).total_replies, 1)
+        self.assertEqual(done, 1 + (await self.db.get_account(free.id)).total_replies)
+
+
+class TestVisibilityHook(TestLifecyclePacing):
+    """Post-submit visibility check: background, observability only (inherits the fixtures, mode "each")."""
+
+    def _watched(self, run, checker):
+        orchestrator, _ = self._orchestrator(run)
+        orchestrator._visibility = checker
+        return orchestrator
+
+    @staticmethod
+    def _checker(release: asyncio.Event | None = None, seen: bool | None = False):
+        async def watch(video_id, comment_id, account_name):
+            if release is not None:
+                await release.wait()
+            return seen
+
+        return MagicMock(watch=AsyncMock(side_effect=watch))
+
+    async def test_live_reply_is_checked_in_the_background_without_blocking_or_hurting_the_account(self) -> None:
+        account = await self._account("manual_acc", None)
+        release = asyncio.Event()
+        checker = self._checker(release, seen=False)
+        orchestrator = self._watched(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="Ugx.r1", duration_seconds=0.1), checker
+        )
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            done = await orchestrator._process_video(self.video, 3, account)  # returns while the checks still wait
+        self.assertEqual(done, 3)
+        self.assertEqual(len(orchestrator._visibility_tasks), 3)
+        release.set()
+        await orchestrator._finish_visibility_checks()
+        self.assertEqual(checker.watch.await_count, 3)
+        self.assertEqual(checker.watch.await_args_list[0].args, ("lifevid1111", "Ugx.r1", "manual_acc"))
+        self.assertEqual((await self.db.get_account(account.id)).consecutive_errors, 0)  # a miss is not an error
+
+    async def test_dry_run_failed_submit_and_missing_remote_id_are_not_checked(self) -> None:
+        account = await self._account("manual_acc", None)
+        cases = (
+            (True, SubmissionResult(success=True, remote_id="Ugx.r1", duration_seconds=0.1)),
+            (False, SubmissionResult(success=False, error="x", duration_seconds=0.1)),
+            (False, SubmissionResult(success=True, remote_id=None, duration_seconds=0.1)),
+        )
+        for dry_run, result in cases:
+            checker = self._checker()
+            orchestrator = self._watched(lambda *a, result=result, **k: result, checker)
+            orchestrator._dry_run = dry_run
+            with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+                await orchestrator._process_video(self.video, 1, account)
+            await orchestrator._finish_visibility_checks()
+            checker.watch.assert_not_awaited()
+
+    async def test_checker_exists_only_for_real_runners_with_a_positive_delay(self) -> None:
+        orchestrator, _ = self._orchestrator(lambda *a, **k: None)
+        self.assertIsNone(orchestrator._visibility)  # tests inject a runner_factory
+        real = MultiAccountOrchestrator(self.config, db=self.db, collector=MagicMock())
+        self.assertIsNotNone(real._visibility)
+        self.config.limits.visibility_check_delay_seconds = 0
+        self.assertIsNone(MultiAccountOrchestrator(self.config, db=self.db, collector=MagicMock())._visibility)
+
+    async def test_pool_run_waits_for_pending_checks_before_returning(self) -> None:
+        await self._account("manual_acc", None)
+        checker = self._checker()
+        orchestrator = self._watched(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="Ugx.r1", duration_seconds=0.1), checker
+        )
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            await orchestrator.execute_video_pool(max_comments_per_video=1)
+        self.assertEqual(checker.watch.await_count, 1)
+        self.assertFalse(orchestrator._visibility_tasks)
+
 
 if __name__ == "__main__":
     unittest.main()

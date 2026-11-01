@@ -125,7 +125,7 @@ class TestTypeTextAllowTypos(unittest.IsolatedAsyncioTestCase):
         rng.uniform.return_value = 5.0
         rng.lognormvariate.return_value = 5.0
         rng.choice.side_effect = lambda choices: choices[0]
-        sim = InteractionSimulator(InteractionConfig(typo_probability=0.5), rng=rng)
+        sim = InteractionSimulator(InteractionConfig(typo_probability=0.5, transposition_share=0.0), rng=rng)
         with patch("asyncio.sleep", new_callable=AsyncMock), \
              patch.object(sim, "_type_with_typo", new_callable=AsyncMock) as typo:
             await sim.type_text(page, "token", allow_typos=False)

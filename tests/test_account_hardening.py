@@ -17,7 +17,14 @@ import youtube_bot
 from config import AccountSettings, BrowserSettings, TargetSettings, mask_proxy_url, parse_proxy, resolve_account_proxy
 from database import UNSET, AccountRecord, Database, Payload
 from modules.account_parser import ParsedAccount, parse_account_line
-from modules.fingerprint_manager import _probe_host_renderer, get_or_create_fingerprint, host_gpu, is_compatible
+from modules.fingerprint_manager import (
+    _fix_windows_taskbar,
+    _probe_host_renderer,
+    get_or_create_fingerprint,
+    host_gpu,
+    host_webgl_config,
+    is_compatible,
+)
 from modules.google_authenticator import GoogleAuthError, read_session_owner, write_session_owner
 from modules.multi_account_orchestrator import MultiAccountOrchestrator
 from modules.totp_helper import generate_totp, normalize_secret, validate_totp_secret
@@ -648,6 +655,115 @@ class TestHostGpu(unittest.TestCase):
             self.assertEqual(_probe_host_renderer(), self.RENDERER)
         with patch("modules.fingerprint_manager.subprocess.run", side_effect=OSError("no python")):
             self.assertIsNone(_probe_host_renderer())
+
+
+def _camou_config(**kwargs) -> dict:
+    """The config Camoufox really hands the browser (CAMOU_CONFIG_* env chunks), for a pinned fingerprint."""
+    from camoufox.utils import launch_options
+
+    env = launch_options(os="windows", i_know_what_im_doing=True, locale="en-US", **kwargs)["env"]
+    chunks, index = [], 1
+    while f"CAMOU_CONFIG_{index}" in env:
+        chunks.append(env[f"CAMOU_CONFIG_{index}"])
+        index += 1
+    return json.loads("".join(chunks))
+
+
+class TestHostGpuReachesWebgl(unittest.TestCase):
+    HOST = ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 980 Direct3D11 vs_5_0 ps_5_0), or similar")
+
+    @staticmethod
+    def _cache(root: Path, gpu: tuple[str, str]) -> Path:
+        (root / "_host_gpu.json").write_text(json.dumps({"vendor": gpu[0], "renderer": gpu[1]}), encoding="utf-8")
+        return root / "acc"
+
+    def test_cached_host_gpu_becomes_the_webgl_config_without_probing(self):
+        with tempfile.TemporaryDirectory() as temp,              patch("modules.fingerprint_manager.sys.platform", "win32"),              patch("modules.fingerprint_manager._probe_host_renderer") as probe:
+            self.assertEqual(host_webgl_config(self._cache(Path(temp), self.HOST), "windows"), self.HOST)
+            self.assertIsNone(host_webgl_config(Path(temp) / "empty" / "acc", "windows"))  # no cache: nothing to pin
+            probe.assert_not_called()
+
+    def test_nothing_is_pinned_for_another_os_a_non_windows_host_or_a_gpu_camoufox_has_no_data_for(self):
+        with tempfile.TemporaryDirectory() as temp:
+            session = self._cache(Path(temp), self.HOST)
+            with patch("modules.fingerprint_manager.sys.platform", "win32"):
+                self.assertIsNone(host_webgl_config(session, "macos"))
+            with patch("modules.fingerprint_manager.sys.platform", "linux"):
+                self.assertIsNone(host_webgl_config(session, "windows"))
+            unknown = self._cache(Path(temp), ("Google Inc. (Acme)", "ANGLE (Acme, Acme X Direct3D11), or similar"))
+            with patch("modules.fingerprint_manager.sys.platform", "win32"):
+                self.assertIsNone(host_webgl_config(unknown, "windows"))
+
+    def test_runner_passes_the_pin_and_camoufox_applies_it_headful_and_headless(self):
+        from camoufox.fingerprints import generate_fingerprint
+
+        fingerprint = generate_fingerprint(os="windows", gpu={"vendor": self.HOST[0], "renderer": self.HOST[1]})
+        with tempfile.TemporaryDirectory() as temp:
+            runner = _runner(Path(temp))
+            with patch("modules.youtube_runner.get_or_create_fingerprint", return_value=fingerprint),                  patch("modules.youtube_runner.host_webgl_config", return_value=self.HOST):
+                options = runner._launch_options()
+            self.assertEqual(options["webgl_config"], self.HOST)
+            with patch("modules.youtube_runner.get_or_create_fingerprint", return_value=fingerprint),                  patch("modules.youtube_runner.host_webgl_config", return_value=None):
+                self.assertNotIn("webgl_config", runner._launch_options())  # no pin: as before
+            seen = set()
+            for headless in (True, False):
+                config = _camou_config(headless=headless, fingerprint=fingerprint, webgl_config=options["webgl_config"])
+                self.assertEqual((config["webGl:vendor"], config["webGl:renderer"]), self.HOST)
+                seen.add(json.dumps(config["webGl:parameters"], sort_keys=True))
+            self.assertEqual(len(seen), 1)  # same parameters across modes, not a per-screen redraw
+
+    def test_without_the_pin_camoufox_redraws_the_gpu_from_the_screen(self):
+        """Why webgl_config is needed: the fingerprint's own gpu does not reach WebGL (camoufox fpgen.yml)."""
+        from camoufox.fingerprints import from_fpgen, generate_fingerprint
+
+        fingerprint = generate_fingerprint(os="windows", gpu={"vendor": self.HOST[0], "renderer": self.HOST[1]})
+        self.assertEqual(fingerprint["gpu"]["renderer"], self.HOST[1])
+        self.assertNotIn("webGl:renderer", from_fpgen(fingerprint))
+
+
+class TestWindowsTaskbar(unittest.TestCase):
+    @staticmethod
+    def _fp(avail=1080, outer=1080, inner=960):
+        return {"screen": {"width": 1920, "height": 1080, "availHeight": avail}, "window": {"outerHeight": outer, "innerHeight": inner}}
+
+    def test_screen_without_a_taskbar_gets_windows_11s_48px_and_the_window_is_clamped(self):
+        fingerprint = self._fp()
+        _fix_windows_taskbar(fingerprint)
+        self.assertEqual(fingerprint["screen"]["availHeight"], 1032)
+        self.assertEqual(fingerprint["window"], {"outerHeight": 1032, "innerHeight": 912})  # chrome height (120) kept
+
+    def test_window_that_already_fits_and_real_taskbars_are_left_alone(self):
+        fitting = self._fp(outer=1000, inner=880)
+        _fix_windows_taskbar(fitting)
+        self.assertEqual((fitting["screen"]["availHeight"], fitting["window"]["outerHeight"]), (1032, 1000))
+        for avail in (1032, 1040, 1050):
+            fingerprint = self._fp(avail=avail)
+            _fix_windows_taskbar(fingerprint)
+            self.assertEqual(fingerprint, self._fp(avail=avail))
+        for odd in ({}, {"screen": None}, {"screen": {"width": 1}}):
+            _fix_windows_taskbar(odd)
+
+    def test_only_a_new_windows_fingerprint_is_corrected_and_the_saved_one_is_reused_as_is(self):
+        with tempfile.TemporaryDirectory() as temp,              patch("modules.fingerprint_manager.host_gpu", return_value=None),              patch("camoufox.fingerprints.generate_fingerprint", side_effect=lambda os: self._fp()) as generate:
+            win = get_or_create_fingerprint(Path(temp) / "win", "windows")
+            self.assertEqual(win["screen"]["availHeight"], 1032)
+            saved = json.loads((Path(temp) / "win" / "fingerprint.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["fingerprint"]["screen"]["availHeight"], 1032)
+            self.assertEqual(get_or_create_fingerprint(Path(temp) / "win", "windows"), win)
+            self.assertEqual(get_or_create_fingerprint(Path(temp) / "mac", "macos")["screen"]["availHeight"], 1080)
+            self.assertEqual(generate.call_count, 2)
+
+    def test_camoufox_keeps_the_48px_gap_and_a_consistent_window(self):
+        from camoufox.fingerprints import generate_fingerprint
+
+        for _ in range(8):
+            fingerprint = generate_fingerprint(os="windows")
+            _fix_windows_taskbar(fingerprint)
+            screen = fingerprint["screen"]
+            self.assertLess(screen["availHeight"], screen["height"])
+            config = _camou_config(headless=True, fingerprint=fingerprint)
+            self.assertLessEqual(config["window.outerHeight"], config["screen.availHeight"])
+            self.assertEqual(config["screen.height"] - config["screen.availHeight"], screen["height"] - screen["availHeight"])
 
 
 def _runner(root: Path) -> YouTubeRunner:

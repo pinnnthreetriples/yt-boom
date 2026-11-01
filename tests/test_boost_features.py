@@ -163,7 +163,7 @@ class TestBoostFeatures(unittest.IsolatedAsyncioTestCase):
             user_prompt_template="Comment: {text}\nTone: {style}",
         )
         self.assertTrue(len(proc_cfg.styles) >= 5)
-        self.assertIn("friendly agreement and encouragement", proc_cfg.styles)
+        self.assertNotIn("friendly agreement and encouragement", proc_cfg.styles)  # stock agreement invites cliches
         self.assertIn("thoughtful and insightful follow-up question", proc_cfg.styles)
 
     # -------------------------------------------------------------

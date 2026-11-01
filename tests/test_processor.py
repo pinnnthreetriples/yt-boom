@@ -120,7 +120,8 @@ class TestProcessor(unittest.TestCase):
             call_kwargs = mock_create.call_args.kwargs
             messages = call_kwargs["messages"]
             self.assertEqual(messages[0]["role"], "system")
-            self.assertEqual(messages[0]["content"], "Test system prompt.")
+            self.assertTrue(messages[0]["content"].startswith("Test system prompt."))
+            self.assertIn("В точку!", messages[0]["content"])  # banned stock openers are always appended
             self.assertEqual(messages[1]["role"], "user")
             self.assertIn("Parent: Parent comment text (by OriginalAuthor)", messages[1]["content"])
             self.assertIn("Sub: Sub-comment text (by UserA)", messages[1]["content"])
@@ -178,7 +179,7 @@ class TestProcessor(unittest.TestCase):
             user_msg = call_kwargs["messages"][1]["content"]
             self.assertIn("Tone: humorous, witty remark or light banter", user_msg)
 
-    def _paraphrase(self, text, *replies, error=None):
+    def _paraphrase(self, text, *replies, error=None, calls=None):
         import asyncio
         from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -196,7 +197,7 @@ class TestProcessor(unittest.TestCase):
                     create.side_effect = error
                 else:
                     create.side_effect = [resp(r) for r in replies]
-                out = [await proc.paraphrase(text) for _ in replies or [None]]
+                out = [await proc.paraphrase(text) for _ in range(calls or len(replies) or 1)]
                 return out, create
 
         return asyncio.run(run())
@@ -213,6 +214,67 @@ class TestProcessor(unittest.TestCase):
         self.assertEqual(self._paraphrase(text, "Отличное видео, согласен")[0][0], text)  # mention dropped
         self.assertEqual(self._paraphrase(text, "   ")[0][0], text)  # empty
         self.assertEqual(self._paraphrase(text, error=RuntimeError("boom"))[0][0], text)  # API failure
+
+    TEMPLATE = "Спасибо за подробный разбор, очень полезно и наглядно"
+    PARAPHRASE = "Благодарю за детальный разбор, очень полезно и понятно"
+
+    def test_text_similarity_separates_copies_from_paraphrases(self):
+        from modules.processor import text_similarity
+
+        self.assertGreaterEqual(text_similarity(self.TEMPLATE, self.TEMPLATE + "!"), 0.9)
+        self.assertGreaterEqual(text_similarity(self.TEMPLATE, self.TEMPLATE.upper().replace(",", "")), 0.9)
+        self.assertLess(text_similarity(self.TEMPLATE, self.PARAPHRASE), 0.6)
+        self.assertLess(text_similarity(self.TEMPLATE, "а где купить такой же? ссылку скиньте кто знает"), 0.3)
+        self.assertEqual(text_similarity("", "что-то"), 0.0)
+
+    def test_paraphrase_retries_once_when_too_close_to_the_template(self):
+        out, create = self._paraphrase(self.TEMPLATE, self.TEMPLATE + "!", self.PARAPHRASE, calls=1)
+        self.assertEqual(out, [self.PARAPHRASE])
+        self.assertEqual(create.await_count, 2)
+        self.assertIn("too similar", create.call_args_list[1].kwargs["messages"][1]["content"])
+
+    def test_paraphrase_rejects_variant_close_to_a_recent_one(self):
+        first = "Отличный разбор, всё очень понятно, спасибо"
+        out, create = self._paraphrase(
+            self.TEMPLATE, first, first.replace(",", "") + "!", self.PARAPHRASE, calls=2
+        )
+        self.assertEqual(out, [first, self.PARAPHRASE])
+        self.assertEqual(create.await_count, 3)
+
+    def test_paraphrase_posts_template_only_after_two_similar_results(self):
+        out, create = self._paraphrase(self.TEMPLATE, self.TEMPLATE + "!", self.TEMPLATE + "!!", calls=1)
+        self.assertEqual(out, [self.TEMPLATE])
+        self.assertEqual(create.await_count, 2)
+
+    def test_parallel_paraphrases_do_not_post_the_same_text(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        proc = DeepSeekProcessor(
+            DeepSeekSettings(api_key="mock_key"),
+            ProcessorSettings(system_prompt="sys", user_prompt_template="{text}"),
+        )
+        replies = iter(["Отличный разбор, всё очень понятно", "Отличный разбор, всё очень понятно", "Крутая подача, спасибо автору"])
+
+        async def slow_create(**kwargs):
+            await asyncio.sleep(0)  # both workers are past their prompt snapshot before either finishes
+            return MagicMock(choices=[MagicMock(message=MagicMock(content=next(replies)))])
+
+        async def run():
+            with patch.object(proc._client.chat.completions, "create", new=slow_create):
+                return await asyncio.gather(proc.paraphrase(self.TEMPLATE), proc.paraphrase(self.TEMPLATE))
+
+        first, second = asyncio.run(run())
+        self.assertNotEqual(first, second)
+        self.assertEqual({first, second}, {"Отличный разбор, всё очень понятно", "Крутая подача, спасибо автору"})
+
+    def test_default_styles_have_no_stock_agreement(self):
+        from config import ProcessorSettings as Settings
+        from modules.processor import ANTI_CLICHE_RULES, DEFAULT_STYLES
+
+        self.assertNotIn("friendly agreement and encouragement", DEFAULT_STYLES)
+        self.assertNotIn("friendly agreement and encouragement", Settings(system_prompt="s", user_prompt_template="{text}").styles)
+        self.assertIn("Spot on!", ANTI_CLICHE_RULES)
 
     def test_should_paraphrase_needs_switch_and_key(self):
         from types import SimpleNamespace

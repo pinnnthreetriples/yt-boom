@@ -18,6 +18,7 @@ from database import (
     VideoPoolItem,
 )
 from modules.account_warmer import AccountWarmer
+from modules.comment_visibility import CommentVisibilityChecker
 from modules.interaction_simulator import InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.pool_manager import PoolManager
@@ -48,6 +49,7 @@ class MultiAccountOrchestrator:
         processor: DeepSeekProcessor | None = None,
         runner_factory: Callable[[AccountRecord], Any] | None = None,
         warmer: AccountWarmer | None = None,
+        visibility_checker: CommentVisibilityChecker | None = None,
     ) -> None:
         if isinstance(config_or_path, AppConfig):
             self._cfg = config_or_path
@@ -102,8 +104,14 @@ class MultiAccountOrchestrator:
         self._warmer = warmer or AccountWarmer(self._cfg.browser, simulator=self._simulator, rng=self._rng)
         self._warmup_tasks: dict[int, asyncio.Task[Any]] = {}
         self._warmup_failed_at: dict[int, datetime] = {}
-        self._gate_stopped = False  # an account was held back by its lifecycle limits during this run
+        self._gated_accounts: set[int] = set()  # accounts held back by their lifecycle limits during this run
         self._warmup_slot = asyncio.Semaphore(1)  # one warm-up browser at a time
+        # An injected runner_factory means no real YouTube behind the runners (tests): nothing to look for then.
+        delay = self._cfg.limits.visibility_check_delay_seconds
+        self._visibility = visibility_checker or (
+            CommentVisibilityChecker(self._collector, delay) if runner_factory is None and delay > 0 else None
+        )
+        self._visibility_tasks: set[asyncio.Task[Any]] = set()
 
     @property
     def db(self) -> Database:
@@ -268,6 +276,31 @@ class MultiAccountOrchestrator:
             logger.info("[LIFECYCLE] Waiting for {} warm-up session(s) to finish", len(tasks))
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _watch_visibility(self, acc: AccountRecord, video: VideoPoolItem, remote_id: str | None) -> None:
+        """Check in the background that a live reply shows up for anonymous visitors; never blocks the next comment."""
+        if self._visibility is None or self._dry_run or not remote_id:
+            return
+        task = asyncio.create_task(self._visibility.watch(video.video_id, remote_id, acc.name))
+        self._visibility_tasks.add(task)
+        task.add_done_callback(self._visibility_tasks.discard)
+
+    async def _finish_visibility_checks(self) -> None:
+        tasks = list(self._visibility_tasks)
+        if tasks:
+            logger.info("[ВИДИМОСТЬ] Ожидание проверки видимости ответов: {}", len(tasks))
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _gate_account(self, acc: AccountRecord) -> None:
+        """Stop `acc` for this run: its remaining videos stay in the pool for the next one."""
+        if acc.id in self._gated_accounts:
+            return
+        self._gated_accounts.add(acc.id)
+        logger.info(
+            "[LIFECYCLE] Account {} reached its comment limits: a run leaves about one comment per account, "
+            "the remaining videos stay pending for the next run",
+            acc.name,
+        )
+
     async def _may_comment_now(self, acc: AccountRecord) -> bool:
         """Re-check an account that was picked earlier (mode "each") against its current counters in the database."""
         fresh = await self._db.get_account(acc.id)
@@ -376,7 +409,7 @@ class MultiAccountOrchestrator:
 
                 acc = account or await self._pick_account()
                 if acc is not None and account is not None and not await self._may_comment_now(acc):
-                    self._gate_stopped = True
+                    self._gate_account(acc)
                     self._claimed.discard(it.external_id)
                     break
                 if acc is None:
@@ -434,7 +467,7 @@ class MultiAccountOrchestrator:
                     async with self._runner_locks[acc.id]:
                         # picked by parallel workers before any of them posted: re-check against the saved counters
                         if not await self._may_comment_now(acc):
-                            self._gate_stopped = True
+                            self._gate_account(acc)
                             continue
                         runner = await self._get_runner(acc)
                         try:
@@ -531,6 +564,7 @@ class MultiAccountOrchestrator:
                         )
                         video_comments_done += 1
                         posted = True
+                        self._watch_visibility(acc, video, sub_res.remote_id)
                     else:
                         logger.error(
                             "ОШИБКА | Не удалось отправить ответ аккаунтом {!r} к видео {}: {}",
@@ -543,6 +577,9 @@ class MultiAccountOrchestrator:
                     if not posted:  # a failed comment stays free for another account
                         self._claimed.discard(it.external_id)
                 if posted and video_comments_done < needed and not self._dry_run:
+                    if account is not None and not await self._may_comment_now(acc):
+                        self._gate_account(acc)  # the cooldown refuses the next comment: no point in pausing
+                        break
                     await asyncio.sleep(
                         self._rng.uniform(self._cfg.limits.pause_min_seconds, self._cfg.limits.pause_max_seconds)
                     )
@@ -566,6 +603,7 @@ class MultiAccountOrchestrator:
             return await self._execute_video_pool(max_comments_per_video, comments_target_per_video)
         finally:
             await self._finish_warmups()
+            await self._finish_visibility_checks()
 
     async def _execute_video_pool(
         self,
@@ -609,6 +647,8 @@ class MultiAccountOrchestrator:
                 done = 0
                 try:
                     for video in videos:
+                        if acc.id in self._gated_accounts:
+                            break  # no comments can be posted any more: do not fetch the remaining videos
                         done += await self._process_video(video, target_of(video), acc)
                 finally:
                     await self._drop_runner(acc.id)  # the account's browser closes when its turn ends
@@ -626,7 +666,7 @@ class MultiAccountOrchestrator:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             await self._close_runners()
-        if self._account_mode == "each" and not self._gate_stopped:
+        if self._account_mode == "each" and not self._gated_accounts:
             for video in videos:
                 await self._db.update_pool_video_progress(video.id, comments_added=0, completed=True)
         total_comments = sum(r for r in results if isinstance(r, int))
@@ -655,6 +695,9 @@ class MultiAccountOrchestrator:
         for task in list(self._warmup_tasks.values()):
             task.cancel()
         await asyncio.gather(*self._warmup_tasks.values(), return_exceptions=True)
+        for task in list(self._visibility_tasks):
+            task.cancel()
+        await asyncio.gather(*self._visibility_tasks, return_exceptions=True)
         await self._close_runners()
         if hasattr(self._collector, "close"):
             try:
