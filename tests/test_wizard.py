@@ -269,7 +269,7 @@ class TestWizardConfigUpdateAndSteps(unittest.TestCase):
                 step_proxy(self.config_path)
 
     def test_step_account_check_status_then_continue(self):
-        with patch("modules.wizard.prompt_user", side_effect=["2", "4"]):
+        with patch("modules.wizard.prompt_user", side_effect=["A1", "1", "4"]):
             res = step_account(self.config_path, self.root / "sessions")
             self.assertFalse(res)
 

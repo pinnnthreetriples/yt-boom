@@ -539,17 +539,25 @@ def _setup_proxy_table(accounts: list[tuple[Any, bool]]) -> None:
         safe_print(color(f"   … ещё {len(accounts) - _SETUP_MAX_ACCOUNTS}", CLR_DIM))
 
 
+def _setup_account_rows(accounts: list[tuple[Any, bool]]) -> list[MenuRow | None]:
+    """One selectable row per account (key A1, A2, …): name, login state and proxy."""
+    proxy_w = MENU_WIDTH - 3 - 24 - 2 - 11 - 2
+    rows: list[MenuRow | None] = []
+    for i, (acc, ok) in enumerate(accounts, 1):
+        proxy = _fit(mask_proxy(acc.proxy_url) if acc.proxy_url else "без прокси", proxy_w)
+        state = "● вошёл" if ok else "○ нет входа"
+        rows.append((f"A{i}", _fit(acc.name, 24), f"{state:<11}  {proxy}", CLR_GREEN if ok else CLR_YELLOW))
+    return rows
+
+
 def step_account(config_path: Path, session_root: Path) -> bool:
-    """Stage 1 «Аккаунты»: list of accounts with login state, add / log in / log out (proxies come next).
+    """Stage 1 «Аккаунты»: every account is a row (Enter/Space opens its actions), plus add / import / warm-up.
 
     Returns True if at least one account (or the main `session_root` profile) is logged in.
     «0»/Esc raises WizardBack.
     """
-    rows: list[MenuRow | None] = [
+    tail: list[MenuRow | None] = [
         ("1", "Войти в аккаунт", "новый или уже добавленный", CLR_DIM),
-        ("2", "Проверить вход", "", ""),
-        ("7", "Переименовать", "имя для вас: ник или почта", CLR_DIM),
-        ("3", "Выйти из аккаунта", "удалить сохранённую сессию", CLR_DIM),
         ("5", "Импорт аккаунтов", "файл или вставка строк", CLR_DIM),
         ("6", "Прогрев", "карантин и aging одним кликом", CLR_DIM),
         ("8", "Жизненный цикл", "стадии, квоты, heartbeat", CLR_DIM),
@@ -559,7 +567,8 @@ def step_account(config_path: Path, session_root: Path) -> bool:
         ("0", "← Назад", "", ""),
     ]
 
-    selected: int | None = None
+    cursor_key: str | None = None
+    selected = 0
     notice: tuple[str, str] | None = None
     warned_empty = False
     redraw = True
@@ -567,16 +576,17 @@ def step_account(config_path: Path, session_root: Path) -> bool:
         if redraw:
             accounts = _setup_accounts(config_path)
             logged = sum(1 for _, ok in accounts if ok)
+            rows: list[MenuRow | None] = [*_setup_account_rows(accounts), *([None] if accounts else []), *tail]
             _setup_screen(1, "Аккаунты", "нужны, чтобы публиковать ответы", [])
             _setup_accounts_table(accounts)
             if notice:
                 safe_print()
                 tui.status_line(*notice)
-            if selected is None:
-                selected = _setup_index(rows, "4" if accounts else "1")
+            selected = _setup_index(rows, cursor_key or ("4" if accounts else "1"))
             redraw, notice = False, None
 
         choice, selected = _setup_menu(lambda: rows, selected)
+        cursor_key = choice
 
         if choice == "0":
             raise WizardBack()
@@ -587,12 +597,8 @@ def step_account(config_path: Path, session_root: Path) -> bool:
                 continue
             return logged > 0 or check_youtube_session(session_root)[0]
 
-        if choice == "2":  # the counter line on top shows the fresh «вошли M из N»
-            redraw = True
-            continue
-
-        if choice == "7":
-            notice = _setup_rename(config_path, accounts) if accounts else ("warn", "Аккаунтов нет")
+        if choice.startswith("A") and choice[1:].isdigit() and 1 <= int(choice[1:]) <= len(accounts):
+            notice = _setup_account_actions(config_path, session_root, accounts, accounts[int(choice[1:]) - 1])
             redraw = True
             continue
 
@@ -627,25 +633,40 @@ def step_account(config_path: Path, session_root: Path) -> bool:
             else:
                 notice = ("ok", "Вход выполнен, сессия сохранена") if fresh_logged > logged else ("warn", "Вход не выполнен")
             if added or fresh_logged > logged:
-                selected = _setup_index(rows, "4")
+                cursor_key = "4"
             redraw = True
             continue
 
-        if choice == "3":
-            target = _setup_pick_account(accounts, "Из какого аккаунта выйти?") if len(accounts) > 1 else (accounts[0][0] if accounts else None)
-            if len(accounts) > 1 and target is None:
-                continue
-            name = f"«{target.name}»" if target else "основного профиля"
-            try:
-                if not _yes(prompt_user(f"Удалить сессию {name}? (y/N)", "n")):
-                    continue
-            except WizardBack:
-                continue
-            ok, msg = _setup_clear_session(session_root, target)
-            notice, redraw = ("ok" if ok else "err", msg), True
-            continue
-
         tui.status_line("warn", f"Неизвестная команда: {choice}")
+
+
+def _setup_account_actions(
+    config_path: Path, session_root: Path, accounts: list[tuple[Any, bool]], entry: tuple[Any, bool],
+) -> tuple[str, str] | None:
+    """Actions of one account: check login, rename, log out. Returns the notice to show (None = nothing happened)."""
+    acc = entry[0]
+    rows: list[MenuRow | None] = [
+        ("1", "Проверить вход", "", ""),
+        ("2", "Переименовать", "имя для вас: ник или почта", CLR_DIM),
+        ("3", "Выйти из аккаунта", "удалить сохранённую сессию", CLR_DIM),
+        None,
+        ("0", "← Назад", "", ""),
+    ]
+    choice, _ = arrow_menu(lambda: rows, [f" {color(acc.name, CLR_BOLD)}"], esc_key="0")
+    if choice == "1":
+        ok = check_youtube_session(Path(acc.session_path))[0]
+        return ("ok", f"«{acc.name}»: вход выполнен") if ok else ("warn", f"«{acc.name}»: нет входа")
+    if choice == "2":
+        return _setup_rename(config_path, accounts, acc)
+    if choice == "3":
+        try:
+            if not _yes(prompt_user(f"Удалить сессию «{acc.name}»? (y/N)", "n")):
+                return None
+        except WizardBack:
+            return None
+        ok, msg = _setup_clear_session(session_root, acc)
+        return ("ok" if ok else "err", msg)
+    return None
 
 
 _SETUP_MAX_ACCOUNTS = 8
@@ -657,26 +678,13 @@ def _setup_accounts(config_path: Path) -> list[tuple[Any, bool]]:
 
 
 def _setup_accounts_table(accounts: list[tuple[Any, bool]]) -> None:
-    """Counter «N · вошли M из N», then a mini table Аккаунт / Вход / Прокси (first 8, then «… ещё K»)."""
+    """Counter «N · вошли M из N»; the accounts themselves are the menu rows below."""
     logged = sum(1 for _, ok in accounts if ok)
     if not accounts:
         tui.kv_table([("Аккаунтов", "пока нет — добавьте первый", "warn")])
         return
     tui.kv_table([("Аккаунтов", f"{len(accounts)} · вошли {logged} из {len(accounts)}", "" if logged else "warn")])
-    shown = accounts[:_SETUP_MAX_ACCOUNTS]
-    name_w = min(24, max(len("Аккаунт"), *(len(acc.name) for acc, _ in shown)))
-    proxy_w = MENU_WIDTH - 3 - name_w - 2 - 11 - 2
     safe_print()
-    safe_print(color(f"   {'Аккаунт':<{name_w}}  {'Вход':<11}  Прокси", CLR_DIM))
-    for acc, ok in shown:
-        name = color(f"{_fit(acc.name, name_w):<{name_w}}", CLR_BOLD)
-        login = color(f"{'● вошёл' if ok else '○ нет входа':<11}", CLR_GREEN if ok else CLR_YELLOW)
-        proxy = _fit(mask_proxy(acc.proxy_url) if acc.proxy_url else "без прокси", proxy_w)
-        safe_print(f"   {name}  {login}  {proxy}")
-        if acc.name == "default":
-            safe_print(color("   (по умолчанию — можно переименовать)", CLR_DIM))
-    if len(accounts) > _SETUP_MAX_ACCOUNTS:
-        safe_print(color(f"   … ещё {len(accounts) - _SETUP_MAX_ACCOUNTS}", CLR_DIM))
 
 
 def _setup_pick_account(
@@ -699,14 +707,11 @@ def _setup_pick_account(
     return accounts[int(pick) - 1][0] if pick.isdigit() and 1 <= int(pick) <= len(accounts) else None
 
 
-def _setup_rename(config_path: Path, accounts: list[tuple[Any, bool]]) -> tuple[str, str] | None:
-    """«Переименовать»: pick an account, ask the new name, rename it in the DB and config.yaml.
+def _setup_rename(config_path: Path, accounts: list[tuple[Any, bool]], acc: Any) -> tuple[str, str] | None:
+    """«Переименовать»: ask the new name for `acc`, rename it in the DB and config.yaml.
 
     Returns the notice to show, or None when cancelled. Session folders are not touched.
     """
-    acc = accounts[0][0] if len(accounts) == 1 else _setup_pick_account(accounts, "Какой аккаунт переименовать?")
-    if acc is None:
-        return None
     try:
         new_name = prompt_user(f"Новое имя для «{acc.name}» — для вас: ник или почта").strip()
     except WizardBack:
@@ -772,16 +777,48 @@ def _read_secret_line(prompt: str) -> str:
     import getpass
 
     try:
+        if sys.platform == "win32" and sys.stdin.isatty() and sys.stdout.isatty() and sys.stdin is sys.__stdin__:
+            return _read_masked_line_windows(prompt)
         return getpass.getpass(prompt)
     except (KeyboardInterrupt, EOFError):
         safe_print(f"\n{color('[!]', CLR_YELLOW)} Операция отменена.")
         raise WizardBack()
 
 
+def _read_masked_line_windows(prompt: str) -> str:
+    """getpass with a `•` per typed character: the plain getpass shows nothing, so the field looks dead."""
+    import msvcrt
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    chars: list[str] = []
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("\r", "\n"):
+            break
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch == "\x1a":
+            raise EOFError
+        if ch in ("\x00", "\xe0"):  # arrow / function key: the second code is not a character
+            msvcrt.getwch()
+        elif ch == "\b":
+            if chars:
+                chars.pop()
+                sys.stdout.write("\b \b")
+        elif ch.isprintable():
+            chars.append(ch)
+            sys.stdout.write("•")
+        sys.stdout.flush()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return "".join(chars)
+
+
 def _read_account_paste() -> list[str]:
     """Pasted `login:password:TOTP_SECRET` lines, one per account, until an empty line; nothing is echoed back."""
     safe_print(color(" Вставьте строки login:password:TOTP_SECRET — по одной на аккаунт.", CLR_DIM))
-    safe_print(color(" Ввод не отображается. Пустая строка — конец.", CLR_DIM))
+    safe_print(color(" Вместо символов показываются точки (•). Пустая строка — конец.", CLR_DIM))
     lines: list[str] = []
     while True:
         line = _read_secret_line(f" {len(lines) + 1:>3} › ")

@@ -20,7 +20,7 @@ from modules.wizard import (
     step_proxy,
     step_reply_mode,
 )
-from tests.tui_keys import DOWN, ENTER, ESC, UP, scripted_keys
+from tests.tui_keys import DOWN, ENTER, ESC, SPACE, UP, scripted_keys
 
 
 class SetupScreenCase(unittest.TestCase):
@@ -141,11 +141,9 @@ class TestAccountScreens(SetupScreenCase):
         self.assertFalse(result)
         self.assertIn("Аккаунты", output)
         self.assertIn("Аккаунтов  1 · вошли 0 из 1", output)
-        self.assertRegex(output, r"Аккаунт +Вход")
-        self.assertRegex(output, r"default +○ нет входа")
-        self.assertRegex(output, r"Аккаунт +Вход +Прокси")
-        self.assertRegex(output, r"default +○ нет входа +http://1\.2\.3\.4:8080")
-        self.assertIn("(по умолчанию — можно переименовать)", output)
+        self.assertRegex(output, r"default(?:\x1b\[[0-9;]*m| )+○ нет входа(?:\x1b\[[0-9;]*m| )+http://1\.2\.3\.4:8080")
+        for moved in ("Проверить вход", "Переименовать", "Выйти из аккаунта"):
+            self.assertNotIn(moved, output)  # per-account actions live in the account's own menu
 
     def test_add_account_refreshes_list(self):
         def add(config_path):
@@ -154,26 +152,24 @@ class TestAccountScreens(SetupScreenCase):
             return True
 
         with patch("modules.wizard.add_account_stepwise", side_effect=add) as adder:
-            _, output = self.run_keys(lambda: step_account(self.config_path, self.root / "sessions"), DOWN, DOWN, ENTER, UP, ENTER, ENTER)
+            _, output = self.run_keys(lambda: step_account(self.config_path, self.root / "sessions"), "1", "N", ENTER)
         adder.assert_called_once_with(self.config_path)
         self.assertIn("Аккаунт добавлен · всего 2", output)
         self.assertIn("bot_2", output)
 
-    def test_list_is_capped_at_eight(self):
+    def test_every_account_is_a_row(self):
         from modules.wizard import _save_account
         for i in range(10):
             _save_account(self.config_path, f"acc_{i}", str(self.root / "s" / str(i)), None)
         _, output = self.run_keys(lambda: step_account(self.config_path, self.root / "sessions"), ENTER)
         self.assertIn("Аккаунтов  10 · вошли 0 из 10", output)
-        self.assertIn("acc_7", output)
-        self.assertNotIn("acc_8", output)
-        self.assertIn("… ещё 2", output)
+        self.assertIn("acc_9", output)
 
     def test_no_accounts_defaults_to_add_and_continue_warns_once(self):
         with patch("modules.wizard.load_accounts", return_value=[]), \
              patch("modules.wizard.add_account_stepwise", return_value=False) as adder:
             result, output = self.run_keys(
-                lambda: step_account(self.config_path, self.root / "sessions"), ENTER, UP, UP, ENTER, ENTER,
+                lambda: step_account(self.config_path, self.root / "sessions"), ENTER, "4", "4",
             )
         adder.assert_called_once()
         self.assertFalse(result)
@@ -185,8 +181,8 @@ class TestAccountScreens(SetupScreenCase):
         session.mkdir(parents=True)
         self.run_keys(
             lambda: step_account(self.config_path, self.root / "sessions"),
-            *[DOWN] * 5, ENTER, ENTER, *[UP] * 5, ENTER, inputs=["n", "y"],
-        )  # «Выйти» → no, «Выйти» → yes, back up to «Продолжить»
+            DOWN, DOWN, ENTER, "3", ENTER, "3", "4", inputs=["n", "y"],
+        )  # the account → «Выйти» → no, again → yes, then «Продолжить»
         self.assertFalse(session.exists())
 
     def test_logout_picks_account_when_several(self):
@@ -199,26 +195,26 @@ class TestAccountScreens(SetupScreenCase):
         main.mkdir(parents=True)
         _, output = self.run_keys(
             lambda: step_account(self.config_path, self.root / "sessions"),
-            *[DOWN] * 5, ENTER, DOWN, ENTER, *[UP] * 5, ENTER, inputs=["y"],
-        )  # «Выйти» → second account → yes → «Продолжить»
+            DOWN, DOWN, DOWN, ENTER, "3", "4", inputs=["y"],
+        )  # the second account → «Выйти» → yes → «Продолжить»
         self.assertFalse(other.exists())
         self.assertTrue(main.exists())
         self.assertIn("Сессия «bot_2» удалена", output)
 
-    def rename(self, *keys: str, inputs: list[str]) -> str:
-        """«Переименовать» (5th row) → keys → name input(s) → back up to «Продолжить»."""
+    def rename(self, index: int, *, inputs: list[str]) -> str:
+        """Account number `index` (0-based) → «Переименовать» → name input(s) → «Продолжить»."""
         _, output = self.run_keys(
             lambda: step_account(self.config_path, self.root / "sessions"),
-            *[DOWN] * 4, ENTER, *keys, *[UP] * 4, ENTER, inputs=inputs,
+            *[DOWN] * (2 + index), ENTER, "2", "4", inputs=inputs,
         )
         return output
 
     def test_rename_default_survives_restart(self):
         from config import load_config
         from modules.wizard import load_accounts
-        output = self.rename(inputs=["  main@mail.ru "])
+        output = self.rename(0, inputs=["  main@mail.ru "])
         self.assertIn("Переименован: default → main@mail.ru", output)
-        self.assertRegex(output, r"main@mail\.ru +○ нет входа")
+        self.assertRegex(output, r"main@mail\.ru(?:\x1b\[[0-9;]*m| )+○ нет входа")
         self.assertEqual([a.name for a in load_accounts(self.config_path)], ["main@mail.ru"])
         cfg = load_config(self.config_path)  # what sync_accounts_from_config upserts on the next run
         self.assertEqual([a.name for a in cfg.browser.accounts], ["main@mail.ru"])
@@ -229,7 +225,7 @@ class TestAccountScreens(SetupScreenCase):
         from modules.wizard import _save_account, load_accounts
         load_accounts(self.config_path)
         _save_account(self.config_path, "bot_2", str(self.root / "sessions" / "bot_2"), None)
-        output = self.rename(DOWN, ENTER, inputs=["shop_2"])
+        output = self.rename(1, inputs=["shop_2"])
         self.assertIn("Переименован: bot_2 → shop_2", output)
         self.assertEqual([a.name for a in load_accounts(self.config_path)], ["default", "shop_2"])
         self.assertEqual([a["name"] for a in self.raw()["browser"]["accounts"]], ["shop_2"])
@@ -238,17 +234,30 @@ class TestAccountScreens(SetupScreenCase):
         from modules.wizard import _save_account, load_accounts
         load_accounts(self.config_path)
         _save_account(self.config_path, "bot_2", str(self.root / "sessions" / "bot_2"), None)
-        self.assertIn("Имя «default» уже занято", self.rename(DOWN, ENTER, inputs=["default"]))
-        self.assertIn("Имя не может быть пустым", self.rename(ENTER, inputs=["  "]))
+        self.assertIn("Имя «default» уже занято", self.rename(1, inputs=["default"]))
+        self.assertIn("Имя не может быть пустым", self.rename(0, inputs=["  "]))
         self.assertEqual([a.name for a in load_accounts(self.config_path)], ["default", "bot_2"])
 
-    def test_login_uses_account_picker(self):
+    def test_login_row_adds_or_logs_in(self):
         with patch("modules.wizard.login_account_wizard", return_value=False) as login:
             _, output = self.run_keys(
-                lambda: step_account(self.config_path, self.root / "sessions"), DOWN, DOWN, ENTER, UP, UP, ENTER,
+                lambda: step_account(self.config_path, self.root / "sessions"), "1", "4",
             )
         login.assert_called_once()
         self.assertIn("Вход не выполнен", output)
+
+    def test_space_opens_account_actions_and_check_login_reports_that_account(self):
+        _, output = self.run_keys(
+            lambda: step_account(self.config_path, self.root / "sessions"), DOWN, DOWN, SPACE, "1", "4",
+        )
+        self.assertIn("«default»: нет входа", output)
+
+    def test_account_actions_escape_goes_back_to_the_list(self):
+        result, output = self.run_keys(
+            lambda: step_account(self.config_path, self.root / "sessions"), DOWN, DOWN, ENTER, ESC, "4",
+        )
+        self.assertFalse(result)
+        self.assertNotIn("Переименован", output)
 
     def test_account_menu_header(self):
         with patch("modules.wizard.step_proxy") as proxy:
