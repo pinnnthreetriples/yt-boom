@@ -50,7 +50,7 @@ NEXT_BUTTONS = (
     '#totpNext button',
 )
 CONSENT_REJECT = CONSENT_REJECT_SELECTORS
-EMAIL_INPUT = ('input#identifierId', 'input[name="identifier"]', 'input[type="email"]:not([name*="recovery"]):not([id*="recovery"])')
+EMAIL_INPUT = ('input#identifierId', 'input[name="identifier"]')  # no generic type="email": it matches recovery-contact fields
 PASSWORD_INPUT = ('input[type="password"]', 'input[name="Passwd"]')
 TOTP_INPUT = ('input#totpPin',)
 TOTP_TRUST_CHECKBOX = ('input#trustDevice', 'input[name="TrustDevice"]', 'input[type="checkbox"]')
@@ -58,6 +58,11 @@ KPE_INPUT = ('input#knowledge-preregistered-email-response',)
 CAPTCHA_MARKERS = ('img#captchaimg', 'iframe[src*="recaptcha"]')
 ERROR_BLOCKS = ('[role="alert"]', 'div[jsname="B34EJ"]', '[aria-live="assertive"] [jsname="B34EJ"]')
 AUTHENTICATOR_OPTION = ('div[data-challengetype="6"]',)
+# "Verify your info to continue" (accounts.google.com/uplevelingstep/selection, captured live): Google asks for a phone-based
+# check, tiles with `data-step-type` 5 (QR code) and 1 (SMS), that cannot be automated. Recognised by the path and by the
+# tiles, never by text, so it is the same in every UI language and fails at once instead of idling for UNKNOWN_SCREEN_SECONDS.
+UPLEVELING_PATH = "/uplevelingstep/"
+UPLEVELING_TILES = ('div[role="link"][data-step-type]',)
 # DELIBERATE, DO NOT "FIX" BLINDLY: these five are the only text matchers allowed in modules/*.py. They target
 # accounts.google.com sign-in / speedbump screens (not YouTube UI), which have no structural handle, and the login must
 # stay fully automatic. Labels cover en and ru only; any other language falls through to the "неизвестный экран" error.
@@ -377,6 +382,11 @@ class GoogleAuthenticator:
 
     async def _handle_screen(self, page: Any, state: _FormState) -> str | None:
         """Act on the first recognised element of the current screen; returns the screen name, None when nothing matches."""
+        # Before any click: the footer button of this screen is not a safe "decline" (its meaning is not known)
+        if UPLEVELING_PATH in page.url or await self._any_visible(page, UPLEVELING_TILES):
+            raise GoogleAuthError(
+                f"Google требует подтверждение аккаунта по телефону (QR/SMS), автоматически не пройти: {_screen_path(page.url)}"
+            )
         # Speedbumps and security confirmation interstitials: decline or acknowledge them first
         if await self._click_first(page, DECLINE_BUTTONS):
             return "decline"

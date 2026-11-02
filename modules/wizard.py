@@ -643,9 +643,13 @@ def step_account(config_path: Path, session_root: Path) -> bool:
 def _setup_account_actions(
     config_path: Path, session_root: Path, accounts: list[tuple[Any, bool]], entry: tuple[Any, bool],
 ) -> tuple[str, str] | None:
-    """Actions of one account: check login, rename, log out. Returns the notice to show (None = nothing happened)."""
+    """Actions of one account: sign in automatically, check login, rename, log out.
+
+    Returns the notice to show (None = nothing happened).
+    """
     acc = entry[0]
     rows: list[MenuRow | None] = [
+        ("4", "Войти автоматически", "по почте и паролю аккаунта", CLR_DIM),
         ("1", "Проверить вход", "", ""),
         ("2", "Переименовать", "имя для вас: ник или почта", CLR_DIM),
         ("3", "Выйти из аккаунта", "удалить сохранённую сессию", CLR_DIM),
@@ -653,6 +657,8 @@ def _setup_account_actions(
         ("0", "← Назад", "", ""),
     ]
     choice, _ = arrow_menu(lambda: rows, [f" {color(acc.name, CLR_BOLD)}"], esc_key="0")
+    if choice == "4":
+        return _setup_auto_login(config_path, acc)
     if choice == "1":
         ok = check_youtube_session(Path(acc.session_path))[0]
         return ("ok", f"«{acc.name}»: вход выполнен") if ok else ("warn", f"«{acc.name}»: нет входа")
@@ -667,6 +673,36 @@ def _setup_account_actions(
         ok, msg = _setup_clear_session(session_root, acc)
         return ("ok" if ok else "err", msg)
     return None
+
+
+def _setup_auto_login(config_path: Path, acc: Any) -> tuple[str, str] | None:
+    """«Войти автоматически»: sign `acc` in with its stored email, password and (if any) TOTP secret.
+
+    An account without a stored password is asked for `почта пароль [TOTP]` first (shown as typed, like the import).
+    Returns the notice to show (None = cancelled).
+    """
+    from config import load_config
+    from youtube_bot import _register_credentials_account, auth_account_cli
+
+    if not (acc.email and acc.password):
+        safe_print(color(" У аккаунта нет пароля. Введите: почта пароль [TOTP]. Пустая строка — отмена.", CLR_DIM))
+        try:
+            line = _read_secret_line(" › ").strip()
+        except WizardBack:
+            return None
+        if not line:
+            return None
+        cfg = load_config(config_path)
+        try:
+            _pools_db(config_path, lambda db: _register_credentials_account(db, cfg, line, name=acc.name))
+        except ValueError as exc:
+            return "err", f"Строка не принята: {exc}"
+    tui.status_line("info", f"Автоматический вход «{acc.name}»…")
+    try:
+        ok = asyncio.run(auth_account_cli(acc.name, str(config_path)))
+    except Exception as exc:
+        return "err", f"«{acc.name}»: вход не удался ({exc.__class__.__name__}), подробности в логе"
+    return ("ok", f"«{acc.name}»: вход выполнен") if ok else ("err", f"«{acc.name}»: вход не удался, подробности в логе")
 
 
 _SETUP_MAX_ACCOUNTS = 8

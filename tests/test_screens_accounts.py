@@ -13,6 +13,8 @@ import yaml
 
 from database import ActivityLogCreate, Database
 from modules.wizard import (
+    _setup_account_actions,
+    _setup_accounts,
     _threads_summary,
     activity_log_viewer,
     add_account_stepwise,
@@ -151,6 +153,47 @@ class TestAccounts(ScreenCase):
         ok, _, _ = self.run_keys(add_account_stepwise, (), [""])
         self.assertFalse(ok)
         self.assertEqual([a.name for a in load_accounts(self.config_path)], before)
+
+    def auto_login(self, name: str, auth_result: bool = True, typed: str = ""):
+        """Enter on the first row of the account's actions («Войти автоматически»); returns (notice, auth mock)."""
+        entry = next(item for item in _setup_accounts(self.config_path) if item[0].name == name)
+        with patch("youtube_bot.auth_account_cli", new_callable=AsyncMock, return_value=auth_result) as auth, \
+             patch("modules.wizard._read_secret_line", return_value=typed):
+            notice, _, _ = self.run_keys(
+                lambda cfg: _setup_account_actions(cfg, self.root / "sessions", [entry], entry), (ENTER,)
+            )
+        return notice, auth
+
+    def test_auto_login_uses_the_stored_password(self):
+        async def _seed(db):
+            await db.upsert_account("bob", str(self.root / "sessions" / "bob"), None, True,
+                                    email="bob@gmail.com", password="pw")
+        self.db(_seed)
+        notice, auth = self.auto_login("bob")
+        auth.assert_called_once_with("bob", str(self.config_path))
+        self.assertEqual(notice[0], "ok")
+
+    def test_auto_login_failure_is_reported(self):
+        async def _seed(db):
+            await db.upsert_account("bob", str(self.root / "sessions" / "bob"), None, True,
+                                    email="bob@gmail.com", password="pw")
+        self.db(_seed)
+        notice, _ = self.auto_login("bob", auth_result=False)
+        self.assertEqual(notice[0], "err")
+
+    def test_auto_login_asks_for_a_missing_password_and_saves_it(self):
+        self.seed_accounts("bob")
+        notice, auth = self.auto_login("bob", typed="bob@gmail.com secretpw")
+        saved = self.db(lambda db: db.get_account("bob"))
+        self.assertEqual((saved.email, saved.password, saved.totp_secret), ("bob@gmail.com", "secretpw", None))
+        auth.assert_called_once_with("bob", str(self.config_path))
+        self.assertEqual(notice[0], "ok")
+
+    def test_auto_login_without_password_and_empty_input_does_nothing(self):
+        self.seed_accounts("bob")
+        notice, auth = self.auto_login("bob", typed="")
+        self.assertIsNone(notice)
+        auth.assert_not_called()
 
 
 class TestThreads(ScreenCase):
