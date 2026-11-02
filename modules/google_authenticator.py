@@ -94,6 +94,7 @@ NAVIGATION_TIMEOUT_MS = 45000
 POLL_SECONDS = 1.0
 FIELD_POLL_SECONDS = 0.4
 SUBMIT_WAIT_SECONDS = 18.0  # how long Google may take to answer a submitted field before it counts as rejected
+STALE_ERROR_GRACE_SECONDS = 3.0  # an error already on screen before the submit is not Google's answer until this long passed
 UNKNOWN_SCREEN_SECONDS = 90.0  # no known element on the same page for this long: give up with the page name
 STUCK_REPEATS = 3  # the same screen handled this many times in a row
 TOTP_MAX_ATTEMPTS = 2
@@ -122,6 +123,7 @@ class _FormState:
     repeats: int = 0
     idle_key: str = ""
     idle_since: float = 0.0
+    password_sent: set[str] = field(default_factory=set)  # screen paths that already received the password
 
 
 def _screen_path(url: str) -> str:
@@ -395,7 +397,12 @@ class GoogleAuthenticator:
         if await self._click_first(page, ACKNOWLEDGE_BUTTONS):
             return "acknowledge"
 
+        # The same password is never sent twice to one screen: if it came back, the first try was most likely rejected
+        password_path = _screen_path(page.url)
+        if password_path in state.password_sent and await self._any_visible(page, PASSWORD_INPUT):
+            raise GoogleAuthError(f"экран пароля вернулся после отправки, повторно пароль не вводится: {password_path}")
         if await self._submit_field(page, PASSWORD_INPUT, state.password, "password", "неверный пароль"):
+            state.password_sent.add(password_path)
             return "password"
         if await self._submit_totp(page, state):
             return "totp"
@@ -440,11 +447,14 @@ class GoogleAuthenticator:
         await self._simulator.type_text(page, value, allow_typos=False)
         await self._simulator.human_pause(0.4, 0.9)
         next_button = await self._first_visible(page, NEXT_BUTTONS, timeout_seconds=1.5)
+        stale_error = await self._visible_error_text(page)  # left over from the previous try: not the answer to this submit
         if next_button is not None:
             await self._simulator.click_locator(page, next_button)
         else:
+            if selectors != KPE_INPUT:  # only the recovery-email screen has no Next; anywhere else Enter is a fallback worth a trace
+                logger.warning("На экране {} нет кнопки Next, отправляю Enter", path_before)
             await page.keyboard.press("Enter")
-        return await self._wait_after_submit(page, selectors, path_before)
+        return await self._wait_after_submit(page, selectors, path_before, stale_error)
 
     @staticmethod
     async def _clear_field(page: Any, field_locator: Any) -> None:
@@ -462,15 +472,24 @@ class GoogleAuthenticator:
         except PlaywrightError as exc:
             logger.debug("Не удалось очистить поле: {}", exc)
 
-    async def _wait_after_submit(self, page: Any, selectors: tuple[str, ...], path_before: str) -> str:
-        deadline = time.monotonic() + SUBMIT_WAIT_SECONDS
+    async def _wait_after_submit(
+        self, page: Any, selectors: tuple[str, ...], path_before: str, stale_error: str | None = None
+    ) -> str:
+        started = time.monotonic()
+        deadline = started + SUBMIT_WAIT_SECONDS
+        stale_gone = False  # the error that was on screen at the submit has disappeared (so any error now is a new one)
         while True:
             if _screen_path(page.url) != path_before:
                 return _CHANGED
             if await self._first_visible(page, selectors) is None:
                 return _CHANGED
             error = await self._visible_error_text(page)
-            if error:
+            if error is None:
+                stale_gone = True
+            elif (
+                stale_error is None or error != stale_error or stale_gone
+                or time.monotonic() - started >= STALE_ERROR_GRACE_SECONDS
+            ):
                 logger.warning("Google ответил ошибкой на экране {}: {}", path_before, error[:200])
                 return f"{_ERROR}: {error}"
             if time.monotonic() >= deadline:
@@ -534,6 +553,8 @@ class GoogleAuthenticator:
         state.totp_attempts += 1
         outcome = await self._enter_value(page, field_locator, code, TOTP_INPUT)
         logger.debug("Код 2FA введён (попытка {}, результат: {})", state.totp_attempts, outcome)
+        if outcome == _CHANGED:
+            state.totp_attempts = 0  # accepted: the next 2FA screen (re-auth) gets a fresh budget and no wait for a new window
         if outcome != _CHANGED and state.totp_attempts >= TOTP_MAX_ATTEMPTS:
             raise GoogleAuthError("код 2FA не принят")
         return True
