@@ -29,7 +29,7 @@ class ParsedAccount(BaseModel):
 
     email: str
     password: str = Field(repr=False, exclude=True)
-    totp_secret: str = Field(repr=False, exclude=True)
+    totp_secret: str | None = Field(default=None, repr=False, exclude=True)
     recovery_email: str | None = None
     proxy: str | None = None
     expected_country: str | None = None
@@ -45,20 +45,24 @@ def looks_like_credentials(value: str) -> bool:
     return bool(_EMAIL_PREFIX.match(value.strip()))
 
 
-def _split_credentials(rest: str) -> tuple[str, str, str | None]:
-    """`password[:colons]:totp_secret[:recovery_email]` -> (password, canonical totp secret, recovery email)."""
+def _split_credentials(rest: str) -> tuple[str, str | None, str | None]:
+    """`password[:colons][:totp_secret][:recovery_email]` -> (password, canonical totp secret or None, recovery email).
+
+    The secret is optional: `password` alone or `password:` (empty placeholder) means no TOTP. Without a secret the
+    password cannot contain colons, otherwise its last piece is read as the secret.
+    """
     pieces = rest.split(":")
     while len(pieces) > 2 and not pieces[-1].strip():  # empty placeholders: `secret::proxy`, trailing ':'
         pieces.pop()
     recovery_email: str | None = None
     if len(pieces) >= 3 and "@" in pieces[-1]:
         recovery_email = pieces.pop().strip() or None
-    if len(pieces) < 2:
-        raise ValueError("не хватает полей: нужны email:password:totp_secret")
-    secret_text = pieces.pop().strip()
+    secret_text = pieces.pop().strip() if len(pieces) >= 2 else ""
     password = ":".join(pieces)
-    if not password or not secret_text:
-        raise ValueError("пароль и TOTP-секрет не должны быть пустыми")
+    if not password:
+        raise ValueError("пароль не должен быть пустым")
+    if not secret_text:
+        return password, None, recovery_email
     try:
         totp_secret = validate_totp_secret(secret_text)
     except ValueError as exc:
@@ -80,11 +84,12 @@ def _geo_fields(country: str | None, locale: str | None) -> tuple[str | None, st
 def parse_account_line(
     line: str, proxy: str | None = None, country: str | None = None, locale: str | None = None
 ) -> ParsedAccount:
-    """Parse `email:password:totp_secret[:recovery_email][:proxy][:country=PL][:locale=pl-PL]`.
+    """Parse `email:password[:totp_secret][:recovery_email][:proxy][:country=PL][:locale=pl-PL]`.
 
     The password may contain colons: the email is everything before the first colon, the TOTP secret is the last
-    piece before the optional recovery email (the only piece with '@') and the optional proxy. The secret must be
-    valid Base32, so a mis-split line (a proxy mistaken for the secret) is rejected instead of stored.
+    piece before the optional recovery email (the only piece with '@') and the optional proxy. The secret may be
+    left out (`email:password`); a secret that is present must be valid
+    Base32, so a mis-split line (a proxy mistaken for the secret) is rejected instead of stored.
     The proxy is `scheme://...`, `host:port`, `user:pass@host:port` or `host:port:user:pass` (IPv6 in brackets).
     `country` (the account's expected country: ISO code or name) and `locale` are the last `key=value` pieces of the
     line; the `country` / `locale` arguments are the defaults when the line has none.
@@ -95,7 +100,7 @@ def parse_account_line(
     email, separator, rest = text.partition(":")
     email = email.strip()
     if not separator or "@" not in email:
-        raise ValueError("формат: email:password:totp_secret[:recovery_email][:proxy]")
+        raise ValueError("формат: email:password[:totp_secret][:recovery_email][:proxy]")
 
     geo = {"country": country, "locale": locale}
     while (geo_tail := _GEO_TAIL.search(rest)) is not None:

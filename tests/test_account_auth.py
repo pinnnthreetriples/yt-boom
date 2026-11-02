@@ -124,8 +124,23 @@ class TestAccountLineParsing(unittest.TestCase):
         acc = parse_account_line("bob@gmail.com:p:a:ss:JBSWY3DP")
         self.assertEqual((acc.password, acc.totp_secret), ("p:a:ss", "JBSWY3DP"))
 
+    def test_totp_secret_is_optional(self):
+        for line, password in (
+            ("bob@gmail.com:onlypass", "onlypass"),
+            ("bob@gmail.com:onlypass:", "onlypass"),
+        ):
+            acc = parse_account_line(line)
+            self.assertEqual((acc.password, acc.totp_secret), (password, None), line)
+
+    def test_without_secret_recovery_email_and_proxy_still_parse(self):
+        acc = parse_account_line("bob@gmail.com:pw::rescue@mail.ru:1.2.3.4:8080:user:pass")
+        self.assertEqual((acc.password, acc.totp_secret, acc.recovery_email, acc.proxy),
+                         ("pw", None, "rescue@mail.ru", "1.2.3.4:8080:user:pass"))
+        acc = parse_account_line("bob@gmail.com:pw:1.2.3.4:8080")
+        self.assertEqual((acc.password, acc.totp_secret, acc.proxy), ("pw", None, "1.2.3.4:8080"))
+
     def test_invalid_lines(self):
-        for bad in ("", "just-a-name", "bob@gmail.com:onlypass", "nomail:pw:JBSWY3DP", "bob@gmail.com::JBSWY3DP"):
+        for bad in ("", "just-a-name", "nomail:pw:JBSWY3DP", "bob@gmail.com::JBSWY3DP", "bob@gmail.com:"):
             with self.assertRaises(ValueError, msg=bad):
                 parse_account_line(bad)
 
