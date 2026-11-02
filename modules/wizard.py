@@ -773,52 +773,18 @@ _LIFECYCLE_MAX_ROWS = 15
 
 
 def _read_secret_line(prompt: str) -> str:
-    """One line typed or pasted without echo (the lines hold passwords); Ctrl+C / EOF cancel like prompt_user."""
-    import getpass
-
+    """One line typed or pasted and shown as is; Ctrl+C / EOF cancel like prompt_user."""
     try:
-        if sys.platform == "win32" and sys.stdin.isatty() and sys.stdout.isatty() and sys.stdin is sys.__stdin__:
-            return _read_masked_line_windows(prompt)
-        return getpass.getpass(prompt)
+        return input(prompt)
     except (KeyboardInterrupt, EOFError):
         safe_print(f"\n{color('[!]', CLR_YELLOW)} Операция отменена.")
         raise WizardBack()
 
 
-def _read_masked_line_windows(prompt: str) -> str:
-    """getpass with a `•` per typed character: the plain getpass shows nothing, so the field looks dead."""
-    import msvcrt
-
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
-    chars: list[str] = []
-    while True:
-        ch = msvcrt.getwch()
-        if ch in ("\r", "\n"):
-            break
-        if ch == "\x03":
-            raise KeyboardInterrupt
-        if ch == "\x1a":
-            raise EOFError
-        if ch in ("\x00", "\xe0"):  # arrow / function key: the second code is not a character
-            msvcrt.getwch()
-        elif ch == "\b":
-            if chars:
-                chars.pop()
-                sys.stdout.write("\b \b")
-        elif ch.isprintable():
-            chars.append(ch)
-            sys.stdout.write("•")
-        sys.stdout.flush()
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-    return "".join(chars)
-
-
 def _read_account_paste() -> list[str]:
-    """Pasted `login:password:TOTP_SECRET` lines, one per account, until an empty line; nothing is echoed back."""
+    """Pasted `login:password:TOTP_SECRET` lines, one per account, until an empty line."""
     safe_print(color(" Вставьте строки login:password:TOTP_SECRET — по одной на аккаунт.", CLR_DIM))
-    safe_print(color(" Вместо символов показываются точки (•). Пустая строка — конец.", CLR_DIM))
+    safe_print(color(" Пустая строка — конец.", CLR_DIM))
     lines: list[str] = []
     while True:
         line = _read_secret_line(f" {len(lines) + 1:>3} › ")

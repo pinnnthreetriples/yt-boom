@@ -335,9 +335,9 @@ class TestImportFlow(MenuCase):
             self.assertIn("проверьте список", notice[1])
             self.assertNotIn("db is locked", notice[1])
 
-    def test_getpass_cancel_raises_wizard_back(self):
+    def test_input_cancel_raises_wizard_back(self):
         for error in (KeyboardInterrupt, EOFError):
-            with self.subTest(error=error.__name__), patch("getpass.getpass", side_effect=error),                  patch("sys.stdout", io.StringIO()), self.assertRaises(WizardBack):
+            with self.subTest(error=error.__name__), patch("builtins.input", side_effect=error),                  patch("sys.stdout", io.StringIO()), self.assertRaises(WizardBack):
                 _read_secret_line(" › ")
 
     def test_empty_paste_and_cancel(self):
