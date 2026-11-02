@@ -149,6 +149,7 @@ class _FlowCase(unittest.IsolatedAsyncioTestCase):
             "FIELD_POLL_SECONDS": 0.01,
             "POLL_SECONDS": 0.01,
             "UNKNOWN_SCREEN_SECONDS": 0.3,
+            "STALE_ERROR_GRACE_SECONDS": 0.2,
             "TOTP_WINDOW_PAD_SECONDS": 0.0,
         }.items():
             patcher = patch.object(ga, name, value)
@@ -227,6 +228,63 @@ class TestSlowAnswers(_FlowCase):
         page = FakePage(screens, "pwd")
         await self.run_form(page)
         self.assertEqual(page.typed, ["pw", "pw"])
+
+
+    async def test_the_password_is_never_sent_twice_to_one_screen(self):
+        screens = {
+            "pwd": Screen(PWD_URL, exact=PWD.exact, on_enter=[(0.05, "blink"), (0.15, "again")]),
+            "blink": Screen(PWD_URL),  # the form is re-rendered: the field is gone for a moment, so the submit "changed" the screen
+            "again": Screen(PWD_URL, exact=PWD.exact),
+        }
+        page = FakePage(screens, "pwd")
+        with self.assertRaisesRegex(ga.GoogleAuthError, "повторно пароль не вводится"):
+            await self.run_form(page)
+        self.assertEqual(page.typed, ["pw"])
+
+    async def test_every_accepted_totp_screen_gets_a_fresh_attempt_budget(self):
+        screens = {
+            f"t{n}": Screen(
+                f"https://accounts.google.com/v3/signin/challenge/totp{n}", exact=frozenset({ga.TOTP_INPUT[0]}),
+                on_enter=[(0.05, f"t{n + 1}" if n < 2 else "home")],
+            )
+            for n in range(3)
+        }
+        screens["home"] = HOME
+        page = FakePage(screens, "t0")
+        await self.run_form(page)  # a re-auth 2FA screen after a successful one used to fail with "код 2FA не принят"
+        self.assertEqual(page.typed, ["123456"] * 3)
+
+    async def test_an_error_left_from_the_previous_try_is_not_the_answer_to_this_submit(self):
+        stale = Screen(
+            PWD_URL, exact=frozenset({ga.PASSWORD_INPUT[0], ga.ERROR_BLOCKS[0]}), error="Wrong password",
+            on_enter=[(0.1, "home")],
+        )
+        page = FakePage({"pwd": stale, "home": HOME}, "pwd")
+        await self.run_form(page)
+        self.assertEqual(page.typed, ["pw"])
+
+    async def test_the_same_error_text_is_reported_once_the_grace_time_has_passed(self):
+        stale = Screen(PWD_URL, exact=frozenset({ga.PASSWORD_INPUT[0], ga.ERROR_BLOCKS[0]}), error="Wrong password")
+        page = FakePage({"pwd": stale}, "pwd")
+        started = time.monotonic()
+        with self.assertRaisesRegex(ga.GoogleAuthError, "неверный пароль: Wrong password"):
+            await self.run_form(page)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, ga.STALE_ERROR_GRACE_SECONDS)  # not at once...
+        self.assertLess(elapsed, ga.SUBMIT_WAIT_SECONDS)  # ...and not only at the timeout
+
+    async def test_enter_without_next_is_traced_except_on_the_recovery_email_screen(self):
+        def next_warnings(log):
+            return [c for c in log.warning.call_args_list if "Next" in c.args[0]]
+
+        pwd = Screen(PWD_URL, exact=PWD.exact, on_enter=[(0.05, "home")])
+        with patch.object(ga, "logger") as log:
+            await self.run_form(FakePage({"pwd": pwd, "home": HOME}, "pwd"))
+        self.assertTrue(next_warnings(log))
+        kpe = Screen(PWD_URL, exact=frozenset({ga.KPE_INPUT[0]}), on_enter=[(0.05, "home")])
+        with patch.object(ga, "logger") as log:
+            await self.run_form(FakePage({"kpe": kpe, "home": HOME}, "kpe"), recovery="r@x.y")
+        self.assertFalse(next_warnings(log))
 
 
 class TestScreens(_FlowCase):

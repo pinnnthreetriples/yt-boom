@@ -17,6 +17,9 @@ FORBIDDEN_STRING = re.compile(
     r"""has-text\(|:text-is\(|:text-matches\(|:text\(|:visible-text|internal:(?:text|label|attr)"""
     r"""|(?:^|>>\s*)text\s*=|aria-label(?!ledby)"""
     r"""|\[\s*(?:title|placeholder|alt)\s*[~|^$*]?="""
+    # a submit input found by its visible value is text matching too; [value] on other inputs (set_eom=true) is a flag
+    r"""|\[\s*type\s*=\s*["']?submit["']?\s*\]\s*\[\s*value\s*[~|^$*]?="""
+    r"""|\[\s*value\s*[~|^$*]?=[^\]]*\]\s*\[\s*type\s*=\s*["']?submit"""
     r"""|\btext\(\)|normalize-space\(|contains\(\s*\.\s*,""",
     re.IGNORECASE,
 )
@@ -115,6 +118,8 @@ class TestSelectorGuard(unittest.TestCase):
             'page.locator("//button[contains(text(), \'Next\')]")',
             'page.get_by_text("Next")',
             'page.get_by_role("button", name="Next")',
+            'page.locator("input[type=\'submit\'][value=\'Next\']")',
+            'page.locator(\'input[value="Next"][type="submit"]\')',
         )
         for source in bad:
             self.assertTrue(find_violations(source), source)
@@ -127,6 +132,7 @@ def f(page):
     page.locator("ytd-comment-view-model:has(a[href*='lc=X']) #reply-button-end :is(button, a)")
     page.locator('form[action*="consent"]:has(input[name="set_eom"][value="true"]) button')
     page.locator("#replies #more-replies-sub-thread button")
+    page.locator('form input[type="submit"]')
     page.get_by_role("button")
     return "button text=ok", "aria-expanded"
 '''
