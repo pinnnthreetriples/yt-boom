@@ -156,8 +156,21 @@ _ACCOUNT_LIFECYCLE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("consecutive_errors", "INTEGER NOT NULL DEFAULT 0"),
 )
 
+# Channel profile: the draft the operator typed (`profile_name` / `profile_description` / `profile_avatar`), the JSON
+# snapshot of what was last published to YouTube (`profile_applied`) and the JSON list of recent channel-name changes.
+_ACCOUNT_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("profile_name", "TEXT"),
+    ("profile_description", "TEXT"),
+    ("profile_avatar", "TEXT"),
+    ("profile_applied", "TEXT"),
+    ("profile_applied_at", "TEXT"),
+    ("profile_name_changes", "TEXT"),
+)
+
 QUARANTINE_HOURS = 24
 DAILY_RESET_HOUR_UTC = 4
+NAME_CHANGES_PER_WINDOW = 2  # YouTube: the channel name may change twice within 14 days
+NAME_CHANGE_WINDOW_DAYS = 14
 
 _ERROR_LIMIT = 2000
 _SCHEMA_ATTEMPTS = 6
@@ -297,6 +310,12 @@ class AccountRecord(BaseModel):
     warmup_sessions_done: int = 0
     last_warmup_at: str | None = None
     consecutive_errors: int = 0
+    profile_name: str | None = None
+    profile_description: str | None = None
+    profile_avatar: str | None = None
+    profile_applied: str | None = None
+    profile_applied_at: str | None = None
+    profile_name_changes: str | None = None
 
 
 class AccountCreate(BaseModel):
@@ -356,6 +375,26 @@ def _truncate(value: str | None) -> str | None:
     if value is None:
         return None
     return value[:_ERROR_LIMIT]
+
+
+def recent_name_changes(stored: str | None, now: datetime) -> list[datetime]:
+    """Channel-name changes of `profile_name_changes` that are still inside YouTube's limit window (unreadable data: none)."""
+    try:
+        raw = json.loads(stored) if stored else []
+    except ValueError:
+        return []
+    cutoff = now - timedelta(days=NAME_CHANGE_WINDOW_DAYS)
+    changes: list[datetime] = []
+    for item in raw if isinstance(raw, list) else []:
+        try:
+            moment = datetime.fromisoformat(str(item))
+        except ValueError:
+            continue
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        if moment > cutoff:
+            changes.append(moment)
+    return sorted(changes)
 
 
 class Database:
@@ -459,7 +498,7 @@ class Database:
         cursor = await conn.execute("PRAGMA table_info(accounts)")
         existing = {str(row[1]) for row in await cursor.fetchall()}
         await cursor.close()
-        for column, ddl in (*_ACCOUNT_AUTH_COLUMNS, *_ACCOUNT_LIFECYCLE_COLUMNS):
+        for column, ddl in (*_ACCOUNT_AUTH_COLUMNS, *_ACCOUNT_LIFECYCLE_COLUMNS, *_ACCOUNT_PROFILE_COLUMNS):
             if column not in existing:
                 try:
                     await conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
@@ -1488,6 +1527,62 @@ class Database:
             )
             if cursor.rowcount == 0:
                 raise RecordNotFoundError(f"account {account_id} not found")
+
+    async def set_account_profile_draft(
+        self,
+        account_id: int,
+        name: str | None | _Unset = UNSET,
+        description: str | None | _Unset = UNSET,
+        avatar: str | None | _Unset = UNSET,
+    ) -> None:
+        """Store what the operator wants the channel profile to be; a field that is not passed keeps its value."""
+        fields = {
+            column: value
+            for column, value in (("profile_name", name), ("profile_description", description), ("profile_avatar", avatar))
+            if not isinstance(value, _Unset)
+        }
+        if not fields:
+            return
+        assignments = ", ".join(f"{column} = ?" for column in fields)
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                f"UPDATE accounts SET {assignments} WHERE id = ?", (*fields.values(), account_id)
+            )
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account id={account_id} not found")
+
+    async def record_account_profile_applied(
+        self, account_id: int, applied: dict[str, str | None], name_changed: bool
+    ) -> None:
+        """The profile as it is now live on YouTube (`applied`: name / description / avatar).
+
+        A name change is also logged, keeping only the changes still inside YouTube's 14-day window.
+        """
+        moment = datetime.now(timezone.utc)
+        now = moment.isoformat()
+        async with self._transaction() as conn:
+            row = await (
+                await conn.execute("SELECT profile_name_changes FROM accounts WHERE id = ?", (account_id,))
+            ).fetchone()
+            if row is None:
+                raise RecordNotFoundError(f"account {account_id} not found")
+            changes = recent_name_changes(row["profile_name_changes"], moment)
+            if name_changed:
+                changes.append(moment)
+            await conn.execute(
+                """
+                UPDATE accounts
+                SET profile_applied = ?, profile_applied_at = ?, profile_name_changes = ?, last_used_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(applied, ensure_ascii=False),
+                    now,
+                    json.dumps([change.isoformat() for change in changes]),
+                    now,
+                    account_id,
+                ),
+            )
 
     async def record_account_error(self, account_id: int) -> None:
         async with self._transaction() as conn:

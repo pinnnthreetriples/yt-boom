@@ -24,6 +24,8 @@ edges:
     condition: when importing accounts or managing DPAPI credentials
   - target: patterns/account-warming-heartbeat.md
     condition: when inspecting session health or warming fresh accounts
+  - target: patterns/channel-profile.md
+    condition: when changing an account's YouTube channel nickname, description or avatar
   - target: patterns/debug-browser-interaction.md
     condition: when diagnosing browser automation or selector issues
 last_updated: 2026-11-01
@@ -48,7 +50,8 @@ Then read this file fully before doing anything else in this session.
 - Multi-account parallel orchestration supporting `each` and `share` routing modes
 - Account lifecycle engine (`modules/lifecycle_engine.py`): quarantine 0-24h, aging 24-48h (no comments), probation 48-72h (1/day, 3h cooldown), mature 72h+ (5/day, 45-90 min); 3 consecutive errors restrict an account; `--lifecycle` and `--warm-quarantined` CLI
 - Wizard stage 1 «Аккаунты» menu: `5` import accounts (file or pasted `login:password:TOTP` lines, then pick who to warm up), `6` warm up all quarantine/aging accounts, `8` read-only lifecycle table (`modules/account_menu_logic.py`)
-- Comprehensive automated test suite (659 passing unit and integration tests)
+- Channel profile (`modules/profile_manager.py`): wizard stage 1 `9` «Профиль канала» → account (Space/Enter) → card with nickname / description / avatar edit rows saved as a DB draft (`accounts.profile_*`), «Применить на YouTube» publishes it through YouTube Studio in the account's own Camoufox profile; `--apply-profile <name>` does the same from the CLI
+- Comprehensive automated test suite (709 passing unit and integration tests)
 
 **Not yet built:**
 - Real-time WebRTC audio stream generation for interactive live events
@@ -73,6 +76,7 @@ Load the relevant file based on the current task. Always load `context/architect
 | Posting YouTube sub-comment replies | `patterns/youtube-reply-flow.md` |
 | Authenticating Google accounts | `patterns/google-auth-login.md` |
 | Managing credentials and fingerprints | `patterns/account-management.md` |
+| Changing a channel nickname / description / avatar | `patterns/channel-profile.md` |
 | Debugging browser interactions | `patterns/debug-browser-interaction.md` |
 | Any specific task | Check `patterns/INDEX.md` for a matching pattern |
 
