@@ -139,6 +139,37 @@ class TestAccountLineParsing(unittest.TestCase):
         acc = parse_account_line("bob@gmail.com:pw:1.2.3.4:8080")
         self.assertEqual((acc.password, acc.totp_secret, acc.proxy), ("pw", None, "1.2.3.4:8080"))
 
+    def test_free_form_lines_split_by_spaces_and_tabs(self):
+        acc = parse_account_line("bob@gmail.com	pw123")
+        self.assertEqual((acc.email, acc.password, acc.totp_secret), ("bob@gmail.com", "pw123", None))
+        acc = parse_account_line("bob@gmail.com    pw123   JBSWY3DP")
+        self.assertEqual((acc.password, acc.totp_secret), ("pw123", "JBSWY3DP"))
+        acc = parse_account_line("bob@gmail.com pw123 jbsw y3dp")
+        self.assertEqual(acc.totp_secret, "JBSWY3DP")
+
+    def test_free_form_extras_are_recognised_by_shape_in_any_order(self):
+        for line in (
+            "bob@gmail.com pw JBSWY3DP rescue@mail.ru 1.2.3.4:8080:user:pass",
+            "bob@gmail.com pw 1.2.3.4:8080:user:pass rescue@mail.ru JBSWY3DP",
+        ):
+            acc = parse_account_line(line)
+            self.assertEqual(
+                (acc.password, acc.totp_secret, acc.recovery_email, acc.proxy),
+                ("pw", "JBSWY3DP", "rescue@mail.ru", "1.2.3.4:8080:user:pass"), line,
+            )
+        acc = parse_account_line("bob@gmail.com pw http://u:p@1.2.3.4:8080 country=PL locale=pl-PL")
+        self.assertEqual((acc.totp_secret, acc.proxy, acc.expected_country, acc.locale), (None, "http://u:p@1.2.3.4:8080", "PL", "pl-PL"))
+
+    def test_free_form_rejects_bad_lines_without_echoing_them(self):
+        for bad in ("bob@gmail.com SECRETPW not_a_secret", "bob@gmail.com SECRETPW 1.2.3.4:8080 5.6.7.8:80", "nomail SECRETPW JBSWY3DP"):
+            with self.assertRaises(ValueError, msg=bad) as caught:
+                parse_account_line(bad)
+            self.assertNotIn("SECRETPW", str(caught.exception))
+
+    def test_password_with_a_space_keeps_working_in_the_colon_form(self):
+        acc = parse_account_line("bob@gmail.com:my pass:JBSWY3DP")
+        self.assertEqual((acc.password, acc.totp_secret), ("my pass", "JBSWY3DP"))
+
     def test_invalid_lines(self):
         for bad in ("", "just-a-name", "nomail:pw:JBSWY3DP", "bob@gmail.com::JBSWY3DP", "bob@gmail.com:"):
             with self.assertRaises(ValueError, msg=bad):

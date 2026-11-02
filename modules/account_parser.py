@@ -81,6 +81,40 @@ def _geo_fields(country: str | None, locale: str | None) -> tuple[str | None, st
     return iso, tag
 
 
+def _free_form_to_colon_line(text: str) -> str:
+    """`email password [totp] [recovery@mail] [proxy] [country=PL] [locale=pl-PL]` (spaces/tabs, any order after the
+    password) -> the colon form. Extra fields are told apart by shape: a proxy has `://` or `host:port`, the recovery
+    e-mail has '@', `country=` / `locale=` are keys, anything else is the TOTP secret (groups like `JBSW Y3DP` are joined).
+    """
+    tokens = text.split()
+    if len(tokens) < 2 or "@" not in tokens[0]:
+        raise ValueError("формат: email пароль [totp_secret] [recovery_email] [proxy]")
+    email, password, extras = tokens[0], tokens[1], tokens[2:]
+    secret_parts: list[str] = []
+    recovery_email = proxy = None
+    geo: list[str] = []
+    for token in extras:
+        proxy_match = _PROXY_TAIL.search(f":{token}")
+        if "=" in token and token.split("=", 1)[0].lower() in ("country", "locale"):
+            geo.append(token)
+        elif proxy_match is not None and proxy_match.start() == 0:
+            if proxy is not None:
+                raise ValueError("в строке два прокси")
+            proxy = token
+        elif "@" in token:
+            if recovery_email is not None:
+                raise ValueError("в строке две резервные почты")
+            recovery_email = token
+        else:
+            secret_parts.append(token)
+    pieces = [email, password, "".join(secret_parts)]
+    if recovery_email is not None or proxy is not None:
+        pieces.append(recovery_email or "")
+    if proxy is not None:
+        pieces.append(proxy)
+    return ":".join([*pieces, *geo])
+
+
 def parse_account_line(
     line: str, proxy: str | None = None, country: str | None = None, locale: str | None = None
 ) -> ParsedAccount:
@@ -90,6 +124,8 @@ def parse_account_line(
     piece before the optional recovery email (the only piece with '@') and the optional proxy. The secret may be
     left out (`email:password`); a secret that is present must be valid
     Base32, so a mis-split line (a proxy mistaken for the secret) is rejected instead of stored.
+    Instead of colons the fields may be separated by spaces or tabs (`email password totp ...`), in any order after
+    the password; see `_free_form_to_colon_line`.
     The proxy is `scheme://...`, `host:port`, `user:pass@host:port` or `host:port:user:pass` (IPv6 in brackets).
     `country` (the account's expected country: ISO code or name) and `locale` are the last `key=value` pieces of the
     line; the `country` / `locale` arguments are the defaults when the line has none.
@@ -97,6 +133,8 @@ def parse_account_line(
     text = line.strip()
     if not text:
         raise ValueError("пустая строка аккаунта")
+    if not _EMAIL_PREFIX.match(text) and re.search(r"\s", text):
+        text = _free_form_to_colon_line(text)
     email, separator, rest = text.partition(":")
     email = email.strip()
     if not separator or "@" not in email:
