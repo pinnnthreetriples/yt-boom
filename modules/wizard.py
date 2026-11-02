@@ -783,8 +783,8 @@ def _read_secret_line(prompt: str) -> str:
 
 def _read_account_paste() -> list[str]:
     """Pasted `login:password:TOTP_SECRET` lines, one per account, until an empty line."""
-    safe_print(color(" Вставьте строки login:password[:TOTP_SECRET] — по одной на аккаунт; TOTP не обязателен.", CLR_DIM))
-    safe_print(color(" Пустая строка — конец.", CLR_DIM))
+    safe_print(color(" Вставьте по строке на аккаунт: почта, пароль, дальше по желанию TOTP, резервная почта, прокси.", CLR_DIM))
+    safe_print(color(" Разделитель — пробел, табуляция или двоеточие. Пустая строка — конец.", CLR_DIM))
     lines: list[str] = []
     while True:
         line = _read_secret_line(f" {len(lines) + 1:>3} › ")
@@ -806,7 +806,7 @@ def _drain_console_input() -> None:
 
 def _read_accounts_file() -> list[str] | None:
     """Ask for a path (default accounts.txt) and read it; None = cancelled or unreadable (the reason is shown)."""
-    path = prompt_user("Путь к файлу с аккаунтами (login:password[:TOTP_SECRET] в строке)", "accounts.txt").strip("\"' ")
+    path = prompt_user("Путь к файлу с аккаунтами (почта, пароль и т. д. в строке)", "accounts.txt").strip("\"' ")
     if not path:
         return None
     try:
@@ -1014,7 +1014,7 @@ def _setup_import(config_path: Path) -> tuple[str, str] | None:
 
     rows: list[MenuRow | None] = [
         ("1", "Из файла", "accounts.txt — строка на аккаунт", CLR_DIM),
-        ("2", "Вставить строки", "login:password[:TOTP], пустая строка — конец", CLR_DIM),
+        ("2", "Вставить строки", "почта пароль [TOTP], пустая строка — конец", CLR_DIM),
         None,
         ("0", "← Отмена", "", ""),
     ]
