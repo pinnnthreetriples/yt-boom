@@ -279,6 +279,39 @@ class TestScreens(_FlowCase):
         self.assertIn("/v3/signin/weird", message)
         self.assertNotIn("SECRET_TOKEN", message)
 
+    async def test_phone_verification_screen_fails_at_once_without_a_click(self):
+        # live capture of accounts.google.com/uplevelingstep/selection: QR and SMS tiles plus a footer action button
+        url = "https://accounts.google.com/uplevelingstep/selection?token=SECRET_TOKEN"
+        shown = frozenset({ga.UPLEVELING_TILES[0], 'button[jsname="NakZHc"]'})
+        screen = Screen(url, exact=shown, contains=('has-text("Skip")', 'has-text("Cancel")'))
+        page = FakePage({"verify": screen}, "verify")
+        started = time.monotonic()
+        with self.assertRaises(ga.GoogleAuthError) as caught:
+            await self.run_form(page)
+        self.assertLess(time.monotonic() - started, ga.UNKNOWN_SCREEN_SECONDS)  # not the idle timeout of an unknown screen
+        message = str(caught.exception)
+        self.assertIn("QR/SMS", message)
+        self.assertIn("/uplevelingstep/selection", message)
+        self.assertNotIn("SECRET_TOKEN", message)
+        self.assertEqual(page.clicks, [])  # the footer button and the tiles are never pressed
+        self.assertEqual(page.typed, [])
+
+    async def test_phone_verification_tiles_are_recognised_without_the_path(self):
+        screen = Screen("https://accounts.google.com/v3/signin/new", exact=frozenset(ga.UPLEVELING_TILES))
+        page = FakePage({"x": screen}, "x")
+        with self.assertRaisesRegex(ga.GoogleAuthError, "QR/SMS"):
+            await self.run_form(page)
+        self.assertEqual(page.clicks, [])
+
+    async def test_recovery_contact_email_field_is_not_taken_for_the_login_field(self):
+        # any `type="email"` input that is not the identifier field (a recovery contact suggestion) must stay untouched
+        screen = Screen("https://accounts.google.com/v3/signin/speedbump/recoverycontact", contains=('type="email"',))
+        page = FakePage({"x": screen}, "x")
+        with self.assertRaisesRegex(ga.GoogleAuthError, "неизвестный экран"):
+            await self.run_form(page)
+        self.assertEqual(page.typed, [])
+        self.assertEqual(page.clicks, [])
+
     async def test_screen_that_never_advances_is_reported_as_stuck(self):
         stuck = Screen(
             "https://accounts.google.com/v3/signin/speedbump/sticky", contains=('has-text("Skip")',),
