@@ -58,9 +58,10 @@ def _proxy_text(record: ProxyRecord) -> str:
     return f"через прокси{label} {record.address}" + (f" ({country})" if country else "")
 
 
-async def describe_proxy_routes(db: Database) -> ProxyRoutes:
+async def describe_proxy_routes(db: Database, accounts: list[str] | None = None, active_only: bool = False) -> ProxyRoutes:
     """The search route and one route per account, for the wizard tables. Never raises for an unreadable proxy:
-    that becomes kind "unavailable" with the reason (the bot itself refuses to start such an account / search)."""
+    that becomes kind "unavailable" with the reason (the bot itself refuses to start such an account / search).
+    `accounts` limits the account routes to these names, `active_only` to the active accounts."""
     proxies = {record.id: record for record in await db.list_proxies()}
     search_id = next((record.id for record in proxies.values() if record.is_search), None)
     stored_search = await db.get_setting(SEARCH_PROXY_KEY)
@@ -76,9 +77,68 @@ async def describe_proxy_routes(db: Database) -> ProxyRoutes:
     else:
         search = ProxyRoute("direct", "напрямую, с вашего IP")
     routes: list[tuple[str, ProxyRoute]] = []
-    for account in await db.list_accounts():
+    for account in await db.list_accounts(is_active=True if active_only else None):
+        if accounts is not None and account.name not in accounts:
+            continue
         routes.append((account.name, account_route(account, proxies.get(account.proxy_id or -1))))
     return ProxyRoutes(search, routes)
+
+
+@dataclass(frozen=True)
+class RouteSummary:
+    """Two lines for the launch screen and the run log: where the search goes out and how the accounts post.
+    `*_warn`: something goes out from the user's own IP or cannot start."""
+
+    search: str
+    search_warn: bool
+    accounts: str
+    accounts_warn: bool
+
+
+def accounts_word(count: int) -> str:
+    """«1 аккаунт», «3 аккаунта», «5 аккаунтов»."""
+    tail = count % 100
+    if 11 <= tail <= 14 or tail % 10 in (0, 5, 6, 7, 8, 9):
+        word = "аккаунтов"
+    else:
+        word = "аккаунт" if tail % 10 == 1 else "аккаунта"
+    return f"{count} {word}"
+
+
+def summarize_routes(routes: ProxyRoutes, max_names: int = 3) -> RouteSummary:
+    """«через прокси 1.2.3.4:8080 (PL)» / «⚠ напрямую, с вашего IP» for the search, and
+    «5 аккаунтов через прокси, 1 с вашего IP (alice)» for the accounts (names of those that are not on a proxy)."""
+
+    def names(items: list[str]) -> str:
+        shown = ", ".join(items[:max_names])
+        return f" ({shown}{f' и ещё {len(items) - max_names}' if len(items) > max_names else ''})"
+
+    search = routes.search
+    search_text = search.text if search.kind == "proxy" else f"⚠ {search.text}"
+    via = [name for name, route in routes.accounts if route.kind == "proxy"]
+    direct = [name for name, route in routes.accounts if route.kind == "direct"]
+    broken = [name for name, route in routes.accounts if route.kind == "unavailable"]
+    if not routes.accounts:
+        return RouteSummary(search_text, search.kind != "proxy", "аккаунтов нет", False)
+    parts = [f"{accounts_word(len(via))} через прокси"] if via else []
+    if direct:
+        parts.append(f"{len(direct) if via else accounts_word(len(direct))} с вашего IP{names(direct)}")
+    if broken:
+        parts.append(f"{len(broken)} не запустится — прокси не читается{names(broken)}")
+    return RouteSummary(search_text, search.kind != "proxy", ", ".join(parts), bool(direct or broken))
+
+
+async def log_proxy_routes(db: Database, accounts: list[str] | None = None) -> RouteSummary | None:
+    """Log at the start of a run where the search goes out and how the active accounts post (`accounts`: only these).
+    Never fatal: a failure to describe the routes is logged at debug level and gives None."""
+    try:
+        summary = summarize_routes(await describe_proxy_routes(db, accounts, active_only=accounts is None))
+    except Exception as exc:
+        logger.debug("Маршруты прокси не описаны: {}", type(exc).__name__)
+        return None
+    logger.log("WARNING" if summary.search_warn else "INFO", "Поиск: {}", summary.search)
+    logger.log("WARNING" if summary.accounts_warn else "INFO", "Ответы: {}", summary.accounts)
+    return summary
 
 
 def account_route(account: AccountRecord, record: ProxyRecord | None = None) -> ProxyRoute:
@@ -203,11 +263,15 @@ __all__ = [
     "ConfigMigrationReport",
     "ProxyRoute",
     "ProxyRoutes",
+    "RouteSummary",
     "ProxyUnavailableError",
     "account_route",
+    "accounts_word",
     "describe_proxy_routes",
+    "log_proxy_routes",
     "migrate_config_proxies",
     "run_config_proxy_migration",
     "strip_config_proxies",
+    "summarize_routes",
     "sync_config_accounts",
 ]

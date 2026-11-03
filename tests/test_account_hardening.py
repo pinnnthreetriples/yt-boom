@@ -30,7 +30,6 @@ from modules.google_authenticator import GoogleAuthError, read_session_owner, wr
 from modules.multi_account_orchestrator import MultiAccountOrchestrator
 from modules.totp_helper import generate_totp, normalize_secret, validate_totp_secret
 from modules.validator import _is_youtube_comment
-from modules.wizard import mask_proxy
 from modules.youtube_runner import YouTubeRunner
 from secret_store import DPAPI_PREFIX, SecretStoreError, protect_secret, reveal_secret
 
@@ -105,11 +104,9 @@ class TestMaskProxy(unittest.TestCase):
             "socks5://user:SECRETPW@[::1]:1080",
             "1.2.3.4:abc:user:SECRETPW",  # unparseable: masked entirely
         ):
-            for masked in (mask_proxy(proxy), mask_proxy_url(proxy)):
-                self.assertNotIn("SECRETPW", masked, proxy)
-        self.assertEqual(mask_proxy("1.2.3.4:8080:user:SECRETPW"), "http://user:***@1.2.3.4:8080")
-        self.assertEqual(mask_proxy("1.2.3.4:8080"), "http://1.2.3.4:8080")
-        self.assertEqual(mask_proxy(None), "Прямое соединение (без прокси)")
+            self.assertNotIn("SECRETPW", mask_proxy_url(proxy), proxy)
+        self.assertEqual(mask_proxy_url("1.2.3.4:8080:user:SECRETPW"), "http://user:***@1.2.3.4:8080")
+        self.assertEqual(mask_proxy_url("1.2.3.4:8080"), "http://1.2.3.4:8080")
 
 
 class TestAccountLineFormats(unittest.TestCase):

@@ -13,11 +13,9 @@ from modules.wizard import (
     WizardBack,
     account_menu,
     print_step_header,
-    prompt_proxy_details,
     run_step_by_step_wizard,
     step_account,
     step_deepseek,
-    step_proxy,
     step_reply_mode,
 )
 from tests.tui_keys import DOWN, ENTER, ESC, SPACE, UP, scripted_keys
@@ -68,80 +66,13 @@ class TestHeader(unittest.TestCase):
         self.assertTrue(lines[-1].startswith(" очень длинная"))
 
 
-class TestProxyScreen(SetupScreenCase):
-    def accounts(self):
-        from modules.wizard import load_accounts
-        return load_accounts(self.config_path)
-
-    def test_enter_continues_when_every_account_has_proxy(self):
-        result, output = self.run_keys(lambda: step_proxy(self.config_path), ENTER)
-        self.assertIsNone(result)
-        self.assertIn("у 1 из 1 аккаунтов", output)
-        self.assertRegex(output, r"default +http://1\.2\.3\.4:8080")  # the seeded account inherits browser.proxy
-        self.assertNotIn("Этап", output)  # stage numbers only inside the wizard
-
-    def test_remove_proxy_of_single_account(self):
-        self.accounts()
-        self.run_keys(lambda: step_proxy(self.config_path), DOWN, DOWN, DOWN, ENTER, UP, UP, UP, ENTER)
-        self.assertIsNone(self.accounts()[0].proxy_url)
-        self.assertNotIn("proxy_url", self.raw()["browser"]["accounts"][0])  # proxies live only in the library
-
-    def test_check_result_stays_under_menu_then_esc_goes_back(self):
-        with patch("modules.wizard.check_proxy_connectivity", return_value=(True, "Внешний IP: 9.9.9.9")):
-            with self.assertRaises(WizardBack):
-                self.run_keys(lambda: step_proxy(self.config_path), DOWN, DOWN, DOWN, DOWN, ENTER, ESC)
-
-    def test_assign_proxy_step_by_step_with_type_by_arrows(self):
-        with patch("modules.wizard.check_proxy_connectivity", return_value=(True, "ok")):
-            _, output = self.run_keys(
-                lambda: step_proxy(self.config_path), DOWN, DOWN, ENTER, DOWN, DOWN, ENTER, UP, UP, ENTER,
-                inputs=["5.6.7.8:1080", "user", "pw"],
-            )
-        self.assertEqual(self.accounts()[0].proxy_url, "socks5://user:pw@5.6.7.8:1080")
-        self.assertNotIn("proxy_url", self.raw()["browser"]["accounts"][0])  # never a password in config.yaml
-        self.assertIn("«default»: прокси сохранён", output)
-
-    def test_several_accounts_pick_one_and_cursor_starts_on_missing_proxy(self):
-        from modules.wizard import _save_account
-        self.accounts()  # seeds «default» (with the inherited proxy)
-        _save_account(self.config_path, "bot_2", str(self.root / "sessions" / "bot_2"), None)
-        with patch("modules.wizard.check_proxy_connectivity", return_value=(True, "ok")):
-            _, output = self.run_keys(
-                lambda: step_proxy(self.config_path), ENTER, DOWN, ENTER, DOWN, DOWN, ENTER, UP, UP, ENTER,
-                inputs=["9.9.9.9:3128", ""],
-            )
-        by_name = {a.name: a.proxy_url for a in self.accounts()}
-        self.assertEqual(by_name, {"default": "http://1.2.3.4:8080", "bot_2": "socks5://9.9.9.9:3128"})
-        self.assertIn("у 1 из 2 аккаунтов", output)
-        self.assertIn("«bot_2»: прокси сохранён", output)
-
-    def test_ctrl_c_in_input_stays_in_section(self):
-        self.run_keys(lambda: step_proxy(self.config_path), DOWN, DOWN, ENTER, UP, UP, ENTER, inputs=[WizardBack()])
-        self.assertEqual(self.accounts()[0].proxy_url, "http://1.2.3.4:8080")
-
-    def test_no_accounts_asks_to_add_them_first(self):
-        with patch("modules.wizard.load_accounts", return_value=[]):
-            result, output = self.run_keys(lambda: step_proxy(self.config_path), DOWN, DOWN, ENTER, UP, UP, ENTER)
-        self.assertIsNone(result)
-        self.assertIn("сначала добавьте их на этапе «Аккаунты»", output)
-
-    def test_prompt_proxy_details_esc_on_type_cancels(self):
-        result, _ = self.run_keys(prompt_proxy_details, ESC, inputs=["5.6.7.8:1080", ""])
-        self.assertIsNone(result)
-
-    def test_prompt_proxy_details_plain_fallback_keeps_number_answers(self):
-        with patch("modules.wizard.prompt_user", side_effect=["5.6.7.8:1080", "", "2"]), \
-             patch("sys.stdout", io.StringIO()):
-            self.assertEqual(prompt_proxy_details(), "https://5.6.7.8:1080")
-
-
 class TestAccountScreens(SetupScreenCase):
     def test_fresh_config_lists_default_account_and_continue_is_default(self):
         result, output = self.run_keys(lambda: step_account(self.config_path, self.root / "sessions"), ENTER)
         self.assertFalse(result)
         self.assertIn("Аккаунты", output)
         self.assertIn("Аккаунтов  1 · вошли 0 из 1", output)
-        self.assertRegex(output, r"default(?:\x1b\[[0-9;]*m| )+○ нет входа(?:\x1b\[[0-9;]*m| )+http://1\.2\.3\.4:8080")
+        self.assertRegex(output, r"default(?:\x1b\[[0-9;]*m| )+○ нет входа(?:\x1b\[[0-9;]*m| )+\[\?\?\] 1\.2\.3\.4:8080")
         for moved in ("Проверить вход", "Переименовать", "Выйти из аккаунта"):
             self.assertNotIn(moved, output)  # per-account actions live in the account's own menu
 
@@ -335,8 +266,8 @@ class TestLaunchSummary(SetupScreenCase):
         self.assertEqual(text, "свой текст: «первый» · и ещё 2")
         self.assertEqual(_reply_templates_row([])[1], "warn")
 
-    def test_logged_in_accounts_are_named_and_proxy_row_warns_without_proxy(self):
-        from modules.wizard import _logged_in_names, _proxy_row, _save_account
+    def test_logged_in_accounts_are_named_and_proxy_summary_warns_without_proxy(self):
+        from modules.wizard import _logged_in_names, _proxy_summary, _save_account
         from config import load_config
         self.assertEqual(_logged_in_names(load_config(self.config_path)), [])  # no DB yet, no main session
         _save_account(self.config_path, "kiri", str(self.root / "s" / "kiri"), None)
@@ -344,9 +275,11 @@ class TestLaunchSummary(SetupScreenCase):
         cfg = load_config(self.config_path)
         with patch("modules.wizard.check_youtube_session", side_effect=lambda p: (Path(p).name == "kiri", "")):
             self.assertEqual(_logged_in_names(cfg), ["kiri"])
-        self.assertEqual(_proxy_row(cfg), ("Прокси", "прокси: 1 из 2", "warn"))
+        self.assertEqual(_proxy_summary(cfg), ("1 прокси · у 1 из 2 акк.", "warn"))
+        _save_account(self.config_path, "kiri", str(self.root / "s" / "kiri"), "http://1.1.1.1:80")
+        self.assertEqual(_proxy_summary(load_config(self.config_path)), ("1 прокси · у 2 из 2 акк.", ""))
         _save_account(self.config_path, "mim", str(self.root / "s" / "mim"), None)
-        self.assertEqual(_proxy_row(load_config(self.config_path))[2:], ("warn",))
+        self.assertEqual(_proxy_summary(load_config(self.config_path))[1], "warn")
 
 
 class TestStepByStepWizard(SetupScreenCase):

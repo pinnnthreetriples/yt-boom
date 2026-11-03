@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 from loguru import logger
 
@@ -191,14 +191,24 @@ async def check_proxy(proxy: Any, timeout: float = CHECK_TIMEOUT) -> ProxyCheckR
 
 
 async def check_proxies(
-    proxies: Sequence[Any], concurrency: int = CHECK_CONCURRENCY, timeout: float = CHECK_TIMEOUT
+    proxies: Sequence[Any],
+    concurrency: int = CHECK_CONCURRENCY,
+    timeout: float = CHECK_TIMEOUT,
+    on_done: Callable[[int, int], None] | None = None,
 ) -> list[ProxyCheckResult]:
-    """`check_proxy` for each, at most `concurrency` at a time; results in the input order."""
+    """`check_proxy` for each, at most `concurrency` at a time; results in the input order.
+    `on_done(finished, total)` is called after every finished check (a progress line)."""
     gate = asyncio.Semaphore(max(1, concurrency))
+    finished = 0
 
     async def one(item: Any) -> ProxyCheckResult:
+        nonlocal finished
         async with gate:
-            return await check_proxy(item, timeout)
+            result = await check_proxy(item, timeout)
+        finished += 1
+        if on_done is not None:
+            on_done(finished, len(proxies))
+        return result
 
     return list(await asyncio.gather(*(one(item) for item in proxies)))
 

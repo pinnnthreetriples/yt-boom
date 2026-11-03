@@ -23,7 +23,7 @@ from modules.interaction_simulator import InteractionConfig, InteractionSimulato
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.profile_manager import ProfileEditor
-from modules.proxy_library import run_config_proxy_migration
+from modules.proxy_library import log_proxy_routes, run_config_proxy_migration
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.session_heartbeat import check_account_heartbeat, check_session_offline, HeartbeatStatus
 from modules.youtube_collector import YouTubeCollector, extract_video_id
@@ -775,6 +775,7 @@ async def run_video_pool_cli(
     db = Database(cfg.app.db_path)
     await db.connect()
     await db.init_schema()
+    await log_proxy_routes(db)
 
     orchestrator = MultiAccountOrchestrator(
         config_or_path=cfg,
@@ -909,6 +910,7 @@ async def run_reply_bot(
         logger.error("{}", exc)
         await db.close()
         return
+    await log_proxy_routes(db, [owner.name] if owner is not None else [])
     collector = YouTubeCollector(cfg.collector, search_proxy)
 
     runner_kwargs: dict[str, Any] = {
@@ -1235,6 +1237,7 @@ async def run_multi_video_pipeline(
         logger.error("{}", exc)
         await db.close()
         return
+    await log_proxy_routes(db, [owner.name] if owner is not None else [])
     collector = YouTubeCollector(cfg.collector, search_proxy)
 
     runner_kwargs: dict[str, Any] = {
