@@ -200,6 +200,7 @@ class Controller:
         self.notice: Notice | None = None
         self.pending_run: Run | None = None
         self.quit = False
+        self.on_icons: Callable[[], Notice | None] | None = None  # I: switch colour / plain icons
         self.view = View(rows=[])
         self.status_now: list[Cell] = []
         self.warns: list[bool] = [False] * len(tabs)
@@ -376,6 +377,9 @@ class Controller:
             self.marked = []
         elif key.upper() == "Q" and self._depth() == 0:
             self.quit = True
+        elif key.upper() == "I" and self.on_icons and not any(h.key == "I" for h in self.view.hotkeys):
+            self.notice = self.on_icons()
+            self.refresh()
         else:
             hotkey = next((h for h in self.view.hotkeys if h.key == (key.upper() if len(key) == 1 else key)), None)
             if hotkey:
@@ -481,16 +485,19 @@ def render(c: Controller) -> list[Frag]:
         out.extend(frags)
         out.append(("", "\n"))
 
-    # tabs + status on the right
+    # tabs (every one named, the current one highlighted) + status on the right, or under them if no room
     tabs: list[Frag] = [("", " ")]
     for i, tab in enumerate(c.tabs):
         on = i == c.tab
-        label = f" {tab.icon} {tab.name} " if on else f" {tab.icon} "
-        tabs.append(("class:tab-on" if on else "class:tab", label))
+        tabs.append(("class:tab-on" if on else "class:tab", f" {tab.icon} {tab.name} "))
         tabs.append(("class:warn", "•" if c.warns[i] else " "))
     status = cells_frags(c.status_now)
-    gap = max(2, WIDTH - width(frags_text(tabs)) - width(frags_text(status)))
-    line(tabs + [("", " " * gap)] + status)
+    gap = WIDTH - width(frags_text(tabs)) - width(frags_text(status))
+    if gap >= 2:
+        line(tabs + [("", " " * gap)] + status)
+    else:
+        line(tabs)
+        line([("", " " * max(1, WIDTH - width(frags_text(status))))] + status)
     line([])
 
     view = c.view
@@ -603,6 +610,8 @@ def _keys_hint(c: Controller) -> str:
     keys = c.view.keys
     if c._depth():
         keys = (keys + " · " if keys else "") + "Esc назад"
+    else:
+        keys = "Tab вкладки · " + keys
     return (keys + " · ? клавиши").strip(" ·")
 
 
@@ -614,6 +623,7 @@ HELP: list[tuple[str, str]] = [
     ("Enter", "действия / изменить"),
     ("Esc", "назад / отмена"),
     ("X", "отметить несколько (где можно)"),
+    ("I", "значки: цветные / простые"),
     ("Q", "выход"),
 ]
 
@@ -624,7 +634,7 @@ HELP: list[tuple[str, str]] = [
 STYLE = {
     "ok": "ansigreen", "warn": "ansiyellow", "err": "ansired bold", "dim": "ansibrightblack",
     "accent": "ansicyan", "key": "ansiyellow bold", "marker": "ansicyan bold", "selected": "bold",
-    "tab": "ansibrightblack", "tab-on": "reverse bold", "cursor": "ansicyan",
+    "tab": "", "tab-on": "reverse bold", "cursor": "ansicyan",
 }
 
 

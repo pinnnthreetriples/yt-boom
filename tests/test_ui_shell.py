@@ -65,12 +65,26 @@ class ShellCase(unittest.TestCase):
     def test_first_frame_shows_tabs_status_rows_and_hint(self):
         out = screen(self.c)
         self.assertIn(" 1 Первая ", out)
-        self.assertIn(" 2 •", out)  # the inactive tab shows only its icon, its warning dot stays
-        self.assertNotIn("Вторая", out)
+        self.assertIn(" 2 Вторая •", out)  # every tab is named; the warning dot stays
         self.assertIn("● готов", out)
         self.assertIn(" ▸ альфа", out)
         self.assertIn("Строка А", out)
+        self.assertIn("Tab вкладки", out)
         self.assertIn("? клавиши", out)
+
+    def test_a_long_status_moves_under_the_tabs(self):
+        c = Controller(self.tabs, status=lambda: [Cell("очень длинное состояние программы " * 2, "warn")])
+        first, second = screen(c).split(chr(10))[:2]
+        self.assertIn("Первая", first)
+        self.assertNotIn("состояние", first)
+        self.assertIn("состояние", second)
+
+    def test_i_switches_the_icons(self):
+        calls: list[int] = []
+        self.c.on_icons = lambda: calls.append(1) or Notice("ok", "Значки: цветные")
+        self.keys("I")
+        self.assertEqual(calls, [1])
+        self.assertEqual(self.c.notice.text, "Значки: цветные")
 
     def test_arrows_move_and_wrap(self):
         self.keys("down")
@@ -262,6 +276,22 @@ class TextHelpers(unittest.TestCase):
         self.assertEqual(icons.quota(5, 5), "●")
         self.assertEqual(icons.quota(1, 5), "◔")
         self.assertEqual(icons.quota(0, 0), "·")
+
+    def test_detection_follows_the_override_and_windows_terminal(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"YTBOT_ICONS": "plain", "WT_SESSION": "x"}):
+            self.assertFalse(icons._pick_emoji())
+        with patch.dict("os.environ", {"YTBOT_ICONS": "", "WT_SESSION": "x"}):
+            self.assertTrue(icons._pick_emoji())
+        with patch.dict("os.environ", {"YTBOT_ICONS": "", "WT_SESSION": "", "TERM_PROGRAM": ""}), \
+             patch("modules.ui.icons.sys.platform", "win32"), \
+             patch("modules.ui.icons._console_is_pseudo", return_value=True):
+            self.assertTrue(icons._pick_emoji())  # start_bot.bat handed to Windows Terminal: no WT_SESSION
+        with patch.dict("os.environ", {"YTBOT_ICONS": "", "WT_SESSION": "", "TERM_PROGRAM": ""}), \
+             patch("modules.ui.icons.sys.platform", "win32"), \
+             patch("modules.ui.icons._console_is_pseudo", return_value=False):
+            self.assertFalse(icons._pick_emoji())
 
     def test_icon_sets(self):
         icons.use_emoji(True)
