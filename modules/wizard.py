@@ -475,6 +475,25 @@ def _setup_account_actions(
     return None
 
 
+def _confirm_country_mismatch(message: str) -> bool:
+    """Question before a sign-in whose proxy exit country differs from the expected one; the cursor starts on «Отменить»."""
+    picks: list[MenuRow | None] = [
+        ("1", "Отменить вход", "безопасный вариант", CLR_DIM),
+        ("2", "Продолжить вход", "на ваш риск", CLR_DIM),
+    ]
+    header = [f" {color(line, CLR_YELLOW)}" for line in message.splitlines()]
+    try:
+        pick, _ = arrow_menu(lambda: picks, header, 0, esc_key="0")
+    except WizardBack:
+        return False
+    return pick == "2"
+
+
+async def _confirm_country_mismatch_async(message: str) -> bool:
+    """The wizard signs in inside `asyncio.run`: the blocking menu runs in a thread so the event loop stays free."""
+    return await asyncio.to_thread(_confirm_country_mismatch, message)
+
+
 def _setup_auto_login(config_path: Path, acc: Any) -> tuple[str, str] | None:
     """«Войти автоматически»: sign `acc` in with its stored email, password and (if any) TOTP secret.
 
@@ -499,7 +518,9 @@ def _setup_auto_login(config_path: Path, acc: Any) -> tuple[str, str] | None:
             return "err", f"Строка не принята: {exc}"
     tui.status_line("info", f"Автоматический вход «{acc.name}»…")
     try:
-        ok = asyncio.run(auth_account_cli(acc.name, str(config_path)))
+        ok = asyncio.run(
+            auth_account_cli(acc.name, str(config_path), confirm_country=_confirm_country_mismatch_async)
+        )
     except Exception as exc:
         return "err", f"«{acc.name}»: вход не удался ({exc.__class__.__name__}), подробности в логе"
     return ("ok", f"«{acc.name}»: вход выполнен") if ok else ("err", f"«{acc.name}»: вход не удался, подробности в логе")

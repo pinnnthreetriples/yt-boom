@@ -101,7 +101,7 @@ class TestMultiAccountCLI(unittest.IsolatedAsyncioTestCase):
         ]
         with patch("sys.argv", test_args), patch("youtube_bot.interactive_login", new_callable=AsyncMock) as mock_login:
             main()
-            mock_login.assert_called_once_with(str(self.config_path), account_name="login_bot_acc")
+            mock_login.assert_called_once_with(str(self.config_path), account_name="login_bot_acc", allow_country_mismatch=False)
 
     async def test_interactive_login_passes_correct_session_and_proxy(self):
         # Insert configured account with proxy

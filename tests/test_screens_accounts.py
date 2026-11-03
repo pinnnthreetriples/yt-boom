@@ -13,6 +13,8 @@ import yaml
 
 from database import ActivityLogCreate, Database
 from modules.wizard import (
+    _confirm_country_mismatch,
+    _confirm_country_mismatch_async,
     _setup_account_actions,
     _setup_accounts,
     _threads_summary,
@@ -125,6 +127,21 @@ class TestAccounts(ScreenCase):
         for line in lines:
             self.assertLessEqual(len(line), 70, line)
 
+    def test_country_mismatch_question_defaults_to_cancel(self):
+        msg = "Аккаунт «bob»: ожидаемая страна PL, а прокси выходит из страны US.\nРиск."
+        for keys, expected in (((ENTER,), False), ((ESC,), False), ((DOWN, ENTER), True)):
+            with self.subTest(keys=keys):
+                result, screen, _ = self.run_keys(lambda cfg: _confirm_country_mismatch(msg), keys)
+                self.assertIs(result, expected)
+        self.assertIn("Отменить вход", screen)
+        self.assertIn("Продолжить вход", screen)
+        self.assertIn("ожидаемая страна PL", screen)
+
+    def test_country_mismatch_question_does_not_block_the_event_loop(self):
+        with patch("modules.wizard._confirm_country_mismatch", return_value=True) as ask:
+            self.assertTrue(asyncio.run(_confirm_country_mismatch_async("msg")))
+        ask.assert_called_once_with("msg")
+
     def test_login_picks_account_with_arrows(self):
         self.seed_accounts("first", "second")
         with patch("youtube_bot.interactive_login", new_callable=AsyncMock) as login:
@@ -170,7 +187,7 @@ class TestAccounts(ScreenCase):
                                     email="bob@gmail.com", password="pw")
         self.db(_seed)
         notice, auth = self.auto_login("bob")
-        auth.assert_called_once_with("bob", str(self.config_path))
+        auth.assert_called_once_with("bob", str(self.config_path), confirm_country=_confirm_country_mismatch_async)
         self.assertEqual(notice[0], "ok")
 
     def test_auto_login_failure_is_reported(self):
@@ -186,7 +203,7 @@ class TestAccounts(ScreenCase):
         notice, auth = self.auto_login("bob", typed="bob@gmail.com secretpw")
         saved = self.db(lambda db: db.get_account("bob"))
         self.assertEqual((saved.email, saved.password, saved.totp_secret), ("bob@gmail.com", "secretpw", None))
-        auth.assert_called_once_with("bob", str(self.config_path))
+        auth.assert_called_once_with("bob", str(self.config_path), confirm_country=_confirm_country_mismatch_async)
         self.assertEqual(notice[0], "ok")
 
     def test_auto_login_without_password_and_empty_input_does_nothing(self):
