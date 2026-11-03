@@ -191,6 +191,20 @@ class LaunchCase(unittest.TestCase):
         self.assertEqual(notice.kind, "err")
         self.assertIn("сеть", notice.text)
 
+    def test_icon_choice_is_remembered(self):
+        from modules.ui.app import _load_icon_choice, _switch_icons, build_tabs
+
+        c = Controller(build_tabs(self.ctx))
+        notice = _switch_icons(self.ctx, c)  # plain → colour
+        self.assertTrue(icons.EMOJI)
+        self.assertEqual(notice.text, "Значки: цветные")
+        self.assertIn("🚀", frags_text(render(c)))
+        icons.use_emoji(False)
+        with patch.dict("os.environ", {"YTBOT_ICONS": ""}):
+            _load_icon_choice(self.ctx)
+        self.assertTrue(icons.EMOJI)
+        icons.use_emoji(False)
+
     def test_setup_row_leads_to_its_tab(self):
         other = Tab("Аккаунты", "A", lambda: build_tab(self.ctx).build())
         c = Controller([build_tab(self.ctx), other])

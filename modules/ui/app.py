@@ -7,7 +7,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from modules.ui.icons import icon
-from modules.ui.shell import Cell, Controller, Run, Step, Tab, run_shell
+from modules.ui.shell import Cell, Controller, Notice, Run, Step, Tab, run_shell
 
 
 def in_thread(fn: Callable[[], Any]) -> Any:
@@ -109,5 +109,40 @@ def run_app(config_path: Path) -> None:
     from modules.wizard import clear_terminal
 
     ctx = AppContext(config_path)
+    _load_icon_choice(ctx)
     controller = Controller(build_tabs(ctx), status=lambda: status_cells(ctx))
+    controller.on_icons = lambda: _switch_icons(ctx, controller)
     run_shell(controller, _run, clear_terminal)
+
+
+ICONS_SETTING = "ui_icons"
+
+
+def _load_icon_choice(ctx: AppContext) -> None:
+    """A set picked with «I» earlier wins over the detection (unless YTBOT_ICONS forces one)."""
+    import os
+
+    from modules.ui import icons
+
+    if os.environ.get("YTBOT_ICONS"):
+        return
+    try:
+        saved = ctx.db(lambda db: db.get_setting(ICONS_SETTING))
+    except Exception:
+        return
+    if saved in {"emoji", "plain"}:
+        icons.use_emoji(saved == "emoji")
+
+
+def _switch_icons(ctx: AppContext, controller: Controller) -> Notice:
+    """«I»: colour emoji ↔ plain symbols, remembered in the database."""
+    from modules.ui import icons
+
+    icons.use_emoji(not icons.EMOJI)
+    choice = "emoji" if icons.EMOJI else "plain"
+    try:
+        ctx.db(lambda db: db.set_setting(ICONS_SETTING, choice))
+    except Exception:
+        pass
+    controller.tabs = build_tabs(ctx)  # tab icons are taken when the tabs are built
+    return Notice("ok", "Значки: цветные" if icons.EMOJI else "Значки: простые символы")
