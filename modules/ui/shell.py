@@ -80,8 +80,11 @@ class Screen:
 
 @dataclass
 class Run:
-    work: Callable[[], "Notice | None"]
+    """Blocking work outside the menu; what it returns is shown next (a Notice, or a question, a screen…)."""
+
+    work: Callable[[], "Step"]
     title: str = ""
+    row_id: str = ""  # filled by the shell: a question returned by the work is shown under this row
 
 
 @dataclass
@@ -282,15 +285,17 @@ class Controller:
             self.refresh()
         elif isinstance(step, Run):
             self.menu, self.edit, self.confirm = None, None, None
+            step.row_id = row_id
             self.pending_run = step
         else:  # None: the action closed itself
             self.menu, self.edit, self.confirm = None, None, None
             self.refresh()
 
-    def finish_run(self, notice: Notice | None) -> None:
-        self.pending_run = None
-        self.notice = notice
+    def finish_run(self, result: Step) -> None:
+        """The outer loop ran the work: show what it returned (a Notice, or the next step)."""
+        run, self.pending_run = self.pending_run, None
         self.refresh()
+        self.apply(result, run.row_id if run else "")
 
     # ---- keys
 
@@ -517,14 +522,13 @@ def render(c: Controller) -> list[Frag]:
                     for d in m.detail():
                         line([("", "          ")] + cells_frags(d, "dim"))
         if c.confirm is not None and row.id == c.confirm_row:
-            choices: list[Frag] = [("", "      ")] + cells_frags(c.confirm.question) + [("", "   ")]
-            for i, choice in enumerate(c.confirm.choices):
-                on = i == c.confirm.selected
-                choices += [("class:marker" if on else "", "▸ " if on else "  "), ("class:selected" if on else "", choice), ("", "   ")]
-            line(choices)
+            line([("", "      ")] + _confirm_frags(c.confirm))
         if c.edit is not None and row.id == c.edit.row_id:
             _render_edit(c.edit, line)
-    if c.edit is not None and not any(r.id == c.edit.row_id for r in view.rows):
+    row_ids = {r.id for r in view.rows}
+    if c.confirm is not None and c.confirm_row not in row_ids:  # a question after a Run whose row is gone
+        line([("", "   ")] + _confirm_frags(c.confirm))
+    if c.edit is not None and c.edit.row_id not in row_ids:
         _render_edit(c.edit, line)
     if c.marking and view.marks:
         line([])
@@ -554,12 +558,22 @@ def render(c: Controller) -> list[Frag]:
         left = [("class:dim", " " + hint)] if hint else []
     keys = _keys_hint(c)
     gap = WIDTH - width(frags_text(left)) - width(keys)
+    if gap < 2 and width(frags_text(left)) > WIDTH:
+        left = [(left[0][0], fit(frags_text(left), WIDTH))]
     if gap < 2:
         line(left)
         line([("", " " * max(0, WIDTH - width(keys))), ("class:dim", keys)])
     else:
         line(left + [("", " " * gap), ("class:dim", keys)])
     return out
+
+
+def _confirm_frags(confirm: Confirm) -> list[Frag]:
+    frags: list[Frag] = cells_frags(confirm.question) + [("", "   ")]
+    for i, choice in enumerate(confirm.choices):
+        on = i == confirm.selected
+        frags += [("class:marker" if on else "", "▸ " if on else "  "), ("class:selected" if on else "", choice), ("", "   ")]
+    return frags
 
 
 def _render_edit(edit: _Edit, line: Callable[[list[Frag]], None]) -> None:
@@ -612,8 +626,10 @@ STYLE = {
 }
 
 
-def run_shell(controller: Controller, on_run: Callable[[Run], "Notice | None"], clear: Callable[[], None]) -> None:
+def run_shell(controller: Controller, on_run: Callable[[Run], Step], clear: Callable[[], None]) -> None:
     """Show the shell until Q; a `Run` step leaves the menu, runs through `on_run` and comes back."""
+    from concurrent.futures import ThreadPoolExecutor
+
     from prompt_toolkit.application import Application
     from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
     from prompt_toolkit.keys import Keys
@@ -626,7 +642,9 @@ def run_shell(controller: Controller, on_run: Callable[[Run], "Notice | None"], 
     kb = KeyBindings()
 
     def feed(key: str, event: KeyPressEvent) -> None:
-        controller.press(key)
+        # tabs read the database through asyncio.run, which cannot run inside prompt_toolkit's own event loop
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(controller.press, key).result()
         if controller.quit or controller.pending_run:
             event.app.exit()
 
@@ -668,7 +686,9 @@ def run_shell(controller: Controller, on_run: Callable[[Run], "Notice | None"], 
             run = controller.pending_run
             clear()
             try:
-                notice = on_run(run)
+                result = on_run(run)
             except KeyboardInterrupt:
-                notice = Notice("warn", "Прервано")
-            controller.finish_run(notice)
+                result = Notice("warn", "Прервано")
+            except Exception as exc:  # the work failed: say so, keep the interface
+                result = Notice("err", fit(f"Ошибка: {exc.__class__.__name__}: {exc}", WIDTH - 2))
+            controller.finish_run(result)

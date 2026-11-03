@@ -203,6 +203,53 @@ class ShellCase(unittest.TestCase):
         self.assertIn("Ошибка экрана: RuntimeError: нет базы", screen(c))
 
 
+class LiveShell(unittest.TestCase):
+    """run_shell on a real prompt_toolkit application (keys from a pipe)."""
+
+    def test_tabs_may_use_asyncio_run_while_the_menu_runs(self):
+        import asyncio
+
+        from modules.ui.shell import run_shell
+        from tests.tui_keys import DOWN, scripted_keys
+
+        builds: list[int] = []
+
+        async def read() -> int:
+            return len(builds)
+
+        def build() -> View:
+            builds.append(asyncio.run(read()))  # like the tabs' database reads
+            return View(rows=[Row("a", [Cell("альфа")]), Row("b", [Cell("бета")], values=["1", "2"], on_value=lambda i: None)])
+
+        c = Controller([Tab("Т", "т", build)])
+        with scripted_keys(DOWN, "[C", "q"):
+            run_shell(c, lambda run: run.work(), lambda: None)
+        self.assertTrue(c.quit)
+        self.assertGreaterEqual(len(builds), 2)  # built at start and again after ← →
+
+    def test_a_run_step_leaves_the_menu_and_comes_back_with_its_result(self):
+        from modules.ui.shell import run_shell
+        from tests.tui_keys import ENTER, scripted_keys
+
+        ran: list[str] = []
+
+        def work():
+            ran.append("x")
+            return Notice("ok", "сделано")
+
+        c = Controller([Tab("Т", "т", lambda: View(rows=[Row("a", [Cell("альфа")], enter=lambda: Run(work))]))])
+
+        def on_run(run):
+            result = run.work()
+            c.quit = True  # stop after the first run: the pipe has no more keys
+            return result
+
+        with scripted_keys(ENTER):
+            run_shell(c, on_run, lambda: None)
+        self.assertEqual(ran, ["x"])
+        self.assertEqual(c.notice.text, "сделано")
+
+
 class TextHelpers(unittest.TestCase):
     def test_emoji_take_two_columns_and_fit_keeps_the_width(self):
         self.assertEqual(width("🌳"), 2)

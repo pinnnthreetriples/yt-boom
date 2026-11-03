@@ -7,7 +7,20 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from modules.ui.icons import icon
-from modules.ui.shell import Cell, Controller, Notice, Run, Tab, run_shell
+from modules.ui.shell import Cell, Controller, Run, Step, Tab, run_shell
+
+
+def in_thread(fn: Callable[[], Any]) -> Any:
+    """Call `fn` (it may use asyncio.run) from a key handler: prompt_toolkit's event loop is running there."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return fn()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(fn).result()
 
 
 class AppContext:
@@ -31,7 +44,7 @@ class AppContext:
         """Run `fn(db)` (awaited if it is a coroutine) on a connected Database."""
         from modules.wizard import _pools_db
 
-        return _pools_db(self.config_path, fn)
+        return in_thread(lambda: _pools_db(self.config_path, fn))
 
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
         """Read-only sqlite3 query, safe inside the menu; [] without a database."""
@@ -83,7 +96,7 @@ def build_tabs(ctx: AppContext) -> list[Tab]:
     ]
 
 
-def _run(run: Run) -> Notice | None:
+def _run(run: Run) -> Step:
     from modules import tui
 
     if run.title:
