@@ -133,7 +133,7 @@ class TestTargetSection(TargetCase):
 
 class TestLaunchSection(TargetCase):
     def launch(self):
-        return step_launch(self.config_path, None, self.root / "sessions", "sk-test-key-123456", 2)
+        return step_launch(self.config_path, self.root / "sessions", "sk-test-key-123456", 2)
 
     def setUp(self):
         super().setUp()
@@ -144,7 +144,7 @@ class TestLaunchSection(TargetCase):
             result, output = self.run_keys(self.launch, (ENTER,))
         self.assertTrue(result)
         self.assertTrue(bot.call_args.kwargs["dry_run"])
-        for text in ("Запуск", "без прокси", "нет входа", "Ответ на ответ", "2 видео", "Пробный запуск завершён"):
+        for text in ("Запуск", "Поиск       ⚠ напрямую, с вашего IP", "Публикация  аккаунтов нет", "нет входа", "Ответ на ответ", "2 видео", "Пробный запуск завершён"):
             self.assertIn(text, output)
         self.assertNotIn("sk-test-key-123456", output)
 
@@ -259,7 +259,7 @@ class TestVideoPoolTarget(TargetCase):
 
     def test_step_launch_live_on_pool_and_summary(self):
         self.seed_pool()
-        launch = lambda: step_launch(self.config_path, None, self.root / "sessions", "sk-test-key-123456", 2)
+        launch = lambda: step_launch(self.config_path, self.root / "sessions", "sk-test-key-123456", 2)
         with patch("youtube_bot.run_video_pool_cli", new_callable=AsyncMock) as pools:
             pools.return_value = 0
             _, output = self.run_keys(launch, (DOWN, ENTER), ["y", "y", ""])
@@ -274,7 +274,7 @@ class TestVideoPoolTarget(TargetCase):
             for name in ("first", "second"):
                 await db.upsert_account(name, str(self.root / "sessions" / name), None, True)
         self.db(seed)
-        launch = lambda: step_launch(self.config_path, None, self.root / "sessions", "sk-test-key-123456", 2)
+        launch = lambda: step_launch(self.config_path, self.root / "sessions", "sk-test-key-123456", 2)
         # ↓↓ «Потоки» opens the threads screen, then Esc leaves the section
         with patch("modules.wizard.step_threads") as threads, self.assertRaises(WizardBack):
             self.run_keys(launch, (DOWN, DOWN, ENTER, ESC))

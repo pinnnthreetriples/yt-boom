@@ -1,6 +1,7 @@
 """Shared console UI layer: arrow-key menus (prompt_toolkit) and compact output helpers (Rich)."""
 from __future__ import annotations
 
+import re
 import shutil
 import sys
 from typing import Callable, Iterable
@@ -57,6 +58,22 @@ def fit(text: str, width: int) -> str:
     return text if len(text) <= width else text[: max(0, width - 1)] + "…"
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def visible_len(text: str) -> int:
+    """Length of text as shown: ANSI color codes take no columns."""
+    return len(_ANSI_RE.sub("", text))
+
+
+def _label_frags(label: str, selected: bool) -> StyleAndTextTuples:
+    """A row label; it may carry ANSI colors (a colored `[PL]` tag), kept under the selection highlight."""
+    if "\x1b" not in label:
+        return [("class:selected" if selected else "", label)]
+    frags = to_formatted_text(ANSI(label))
+    return [(f"{style} class:selected" if selected else style, text, *rest) for style, text, *rest in frags]
+
+
 def _style_classes(style: str) -> str:
     return " ".join(f"class:{name}" for name in style.split())
 
@@ -109,7 +126,7 @@ def select_menu(
         return [r[0] if r else "" for r in state["rows"]]
 
     def label_width() -> int:
-        return max((len(r[1]) + 2 for r in state["rows"] if r and r[2]), default=16)
+        return max((visible_len(r[1]) + 2 for r in state["rows"] if r and r[2]), default=16)
 
     def help_items() -> list[tuple[str, str]]:
         return help_lines or [(r[0], r[1]) for r in state["rows"] if r]
@@ -128,9 +145,9 @@ def select_menu(
             if r is not None:
                 _, label, value, style = r
                 on = i == state["sel"]
-                frags += [("class:marker", " ▸ ") if on else ("", "   "), ("class:selected" if on else "", label)]
+                frags += [("class:marker", " ▸ ") if on else ("", "   "), *_label_frags(label, on)]
                 if value:
-                    frags += [("", " " * max(1, lw - len(label))), (_style_classes(style), fit(value, MAX_WIDTH - lw - 3))]
+                    frags += [("", " " * max(1, lw - visible_len(label))), (_style_classes(style), fit(value, MAX_WIDTH - lw - 3))]
             frags.append(("", "\n"))
         if state["detail"] and detail is not None:
             for line in detail(keys()[state["sel"]]):
@@ -226,7 +243,9 @@ def _plain_menu(state, build, header, keys, label_width, help_items, actions, as
             if r is None:
                 out.print()
                 continue
-            line = Text.assemble(" ", (f"[{r[0]}]", "key"), " ", f"{r[1]:<{lw}}")
+            label = Text.from_ansi(r[1])
+            label.pad_right(max(0, lw - visible_len(r[1])))
+            line = Text.assemble(" ", (f"[{r[0]}]", "key"), " ", label)
             if r[2]:
                 line.append(" " + r[2], style=r[3] or None)
             out.print(line)
@@ -242,6 +261,117 @@ def _plain_menu(state, build, header, keys, label_width, help_items, actions, as
             continue
         ks = keys()
         return choice, ks.index(choice) if choice and choice in ks else state["sel"]
+
+
+# --------------------------------------------------------------------------- checklist
+
+# Checklist item: (label, status value, style names); the label may carry ANSI colors like a menu row label.
+CheckItem = tuple[str, str, str]
+
+
+def checklist(
+    items: list[CheckItem],
+    checked: Iterable[int] = (),
+    header: list[str] | None = None,
+    save_label: str = "Сохранить",
+    interactive: bool | None = None,
+    ask_fn: Callable[[str], str] | None = None,
+) -> set[int] | None:
+    """Tick any number of items; returns the ticked indexes, or None when cancelled.
+
+    ↑↓ move, Enter/Space on an item ticks or unticks it, Enter on «Сохранить» returns, «Отмена» / Esc cancels.
+    Without a console it prints a numbered list; an answer of numbers (`1 3`) toggles them, an empty answer saves,
+    `0` cancels. Header lines may contain ANSI colors.
+    """
+    header = header or []
+    state = {"on": {i for i in checked if 0 <= i < len(items)}, "sel": 0}
+    save, cancel = len(items), len(items) + 1
+    lw = max((visible_len(label) + 2 for label, _, _ in items), default=16)
+
+    if interactive is None:
+        interactive = is_interactive()
+    if not interactive:
+        return _plain_checklist(items, state["on"], header, lw, ask_fn or ask)
+
+    def render() -> StyleAndTextTuples:
+        frags: StyleAndTextTuples = []
+        for line in header:
+            frags += to_formatted_text(ANSI(line)) + [("", "\n")]
+        for i, (label, value, style) in enumerate(items):
+            on = i == state["sel"]
+            box = "[x] " if i in state["on"] else "[ ] "
+            frags += [("class:marker", " ▸ ") if on else ("", "   "), ("class:ok" if i in state["on"] else "class:dim", box)]
+            frags += _label_frags(label, on)
+            if value:
+                frags += [("", " " * max(1, lw - visible_len(label))), (_style_classes(style), fit(value, MAX_WIDTH - lw - 7))]
+            frags.append(("", "\n"))
+        frags.append(("", "\n"))
+        for i, text in ((save, f"{save_label} · отмечено {len(state['on'])}"), (cancel, "Отмена")):
+            on = i == state["sel"]
+            frags += [("class:marker", " ▸ ") if on else ("", "   "), ("class:selected" if on else "", text), ("", "\n")]
+        return frags
+
+    kb = KeyBindings()
+
+    def move(step: int) -> None:
+        state["sel"] = (state["sel"] + step) % (len(items) + 2)
+
+    kb.add("up")(lambda e: move(-1))
+    kb.add("down")(lambda e: move(1))
+
+    @kb.add("enter")
+    @kb.add(" ")
+    def _pick(event: KeyPressEvent) -> None:
+        sel = state["sel"]
+        if sel < len(items):
+            state["on"] ^= {sel}
+        else:
+            event.app.exit(result=set(state["on"]) if sel == save else None)
+
+    @kb.add("escape", eager=True)
+    def _esc(event: KeyPressEvent) -> None:
+        event.app.exit(result=None)
+
+    @kb.add("c-c")
+    def _ctrl_c(event: KeyPressEvent) -> None:
+        event.app.exit(exception=KeyboardInterrupt())
+
+    control = FormattedTextControl(render, show_cursor=False)
+    app: Application[set[int] | None] = Application(
+        layout=Layout(HSplit([Window(control, dont_extend_height=True, wrap_lines=False)])),
+        key_bindings=kb,
+        style=_PT_STYLE,
+        full_screen=False,
+        mouse_support=False,
+        erase_when_done=ERASE_WHEN_DONE,
+    )
+    app.ttimeoutlen = 0.05
+    return app.run()
+
+
+def _plain_checklist(
+    items: list[CheckItem], on: set[int], header: list[str], lw: int, ask_fn: Callable[[str], str]
+) -> set[int] | None:
+    """Non-interactive checklist: numbered list, the answer toggles numbers until an empty answer."""
+    out = _out()
+    while True:
+        for line in header:
+            out.print(Text.from_ansi(line))
+        for i, (label, value, style) in enumerate(items, 1):
+            text = Text.from_ansi(label)
+            text.pad_right(max(0, lw - visible_len(label)))
+            line = Text.assemble(" ", (f"[{i}]", "key"), " ", "[x] " if i - 1 in on else "[ ] ", text)
+            if value:
+                line.append(" " + value, style=style or None)
+            out.print(line)
+        answer = ask_fn("Номера через пробел — отметить/снять, Enter — сохранить, 0 — отмена").strip()
+        if not answer:
+            return set(on)
+        if answer == "0":
+            return None
+        for word in answer.replace(",", " ").split():
+            if word.isdigit() and 1 <= int(word) <= len(items):
+                on ^= {int(word) - 1}
 
 
 # --------------------------------------------------------------------------- output helpers

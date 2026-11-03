@@ -28,7 +28,7 @@ edges:
     condition: when changing an account's YouTube channel nickname, description or avatar
   - target: patterns/debug-browser-interaction.md
     condition: when diagnosing browser automation or selector issues
-last_updated: 2026-11-01
+last_updated: 2026-11-03
 ---
 
 # Session Bootstrap
@@ -51,6 +51,8 @@ Then read this file fully before doing anything else in this session.
 - Account lifecycle engine (`modules/lifecycle_engine.py`): quarantine 0-24h, aging 24-48h (no comments), probation 48-72h (1/day, 3h cooldown), mature 72h+ (5/day, 45-90 min); 3 consecutive errors restrict an account; `--lifecycle` and `--warm-quarantined` CLI
 - Wizard stage 1 «Аккаунты» menu: each account is its own row (Enter/Space opens «Проверить вход» / «Переименовать» / «Выйти из аккаунта» for that account); `1` add/log in, `5` import accounts (file or pasted `login:password:TOTP` lines, then pick who to warm up), `6` warm up all quarantine/aging accounts, `8` read-only lifecycle table (`modules/account_menu_logic.py`)
 - Channel profile (`modules/profile_manager.py`): wizard stage 1 `9` «Профиль канала» → account (Space/Enter) → card with nickname / description / avatar edit rows saved as a DB draft (`accounts.profile_*`), «Применить на YouTube» publishes it through YouTube Studio in the account's own Camoufox profile; `--apply-profile <name>` does the same from the CLI
+- Proxy library (`proxies` table, `accounts.proxy_id`, DPAPI-encrypted passwords; address assembled only by `config.compose_proxy_url`): one proxy serves any number of accounts; the search proxy (`app_settings.search_proxy_id`) serves only the InnerTube collector; an account uses only its own proxy or goes direct, and an assigned-but-unreadable proxy raises `ProxyUnavailableError` (fail-closed). Paste parsing `modules/proxy_paste.py`, shared check `modules/proxy_check.py`, yaml migration and route texts `modules/proxy_library.py`. SOCKS5 with a login cannot be used by Camoufox (Playwright refuses it)
+- Wizard stage 2 «Прокси» (`modules/proxy_screen.py`, opened by `wizard.step_proxy` and «Аккаунт → Прокси»): search row, accounts row, one row per proxy (Enter: card with ticks `tui.checklist`, check, change, search role, delete); «Добавить прокси» pastes many lines → shown → checked in parallel → saved → offered to proxy-less accounts. «с вашего IP» is shown in the dashboard «Прокси» row, account menu «Поиск», launch/preview «Поиск»/«Публикация» rows and the run log (`proxy_library.log_proxy_routes`)
 - Comprehensive automated test suite (709 passing unit and integration tests)
 
 **Not yet built:**

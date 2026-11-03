@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import re
 import string
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -295,10 +296,75 @@ def mask_proxy_url(proxy_url: str | None) -> str:
     return f"{scheme}://{user}{':***' if parsed.get('password') else ''}@{host_port}"
 
 
-def resolve_account_proxy(account_proxy: str | None, global_proxy: str | None) -> str | None:
-    """The proxy one account uses everywhere (sign-in, posting): its own, otherwise the global `browser.proxy`."""
-    own = account_proxy.strip() if account_proxy else ""
-    return own or (global_proxy or None)
+# Written to `accounts.proxy_url` for every account whose proxy lives in the `proxies` table. Older versions read
+# that column as the proxy itself: `parse_proxy` rejects this value, so an old build fails instead of going direct.
+PROXY_LIBRARY_MARKER = "library:see-proxies-table"
+
+
+@dataclass(frozen=True)
+class ProxyParts:
+    """One proxy split into the fields the `proxies` table stores. `scheme` None: not known yet (a check finds it)."""
+
+    scheme: str | None
+    host: str
+    port: int
+    login: str | None = None
+    password: str | None = None
+
+    def __repr__(self) -> str:  # the password never reaches a log line
+        return f"ProxyParts(scheme={self.scheme!r}, host={self.host!r}, port={self.port}, login={self.login!r})"
+
+
+def compose_proxy_url(scheme: str | None, host: str, port: int, login: str | None = None, password: str | None = None) -> str:
+    """The one place a proxy address is assembled: `scheme://login:password@host:port`, credentials percent-encoded
+    (so `@ : / %` in a password survive `parse_proxy` and libcurl), IPv6 hosts in brackets, no scheme -> http."""
+    host = host.strip().strip("[]")
+    address = f"[{host}]" if ":" in host else host
+    credentials = ""
+    if login:
+        credentials = quote(login, safe="") + (f":{quote(password, safe='')}" if password else "") + "@"
+    return f"{scheme or 'http'}://{credentials}{address}:{int(port)}"
+
+
+def split_proxy(proxy_url: str) -> ProxyParts:
+    """`ProxyParts` from any form `parse_proxy` accepts; `scheme` is None when the text names none. ValueError otherwise."""
+    text = (proxy_url or "").strip()
+    if not text or text == PROXY_LIBRARY_MARKER:
+        raise ValueError(_PROXY_ERROR)
+    parsed = parse_proxy(text)
+    assert parsed is not None
+    scheme, _, address = parsed["server"].partition("://")
+    host, _, port = address.rpartition(":")
+    if scheme == "socks5h":  # Playwright knows only socks5; DNS on the proxy is curl_proxy_url's job
+        scheme = "socks5"
+    return ProxyParts(
+        scheme.lower() if "://" in text else None,
+        host.strip("[]").lower(),
+        int(port),
+        parsed.get("username") or None,
+        parsed.get("password") or None,
+    )
+
+
+class ProxyUnavailableError(RuntimeError):
+    """An account (or the search) has a proxy assigned that cannot be read: it must not run at all, never go direct."""
+
+
+def resolve_account_proxy(account: Any) -> str | None:
+    """The proxy one account uses everywhere (sign-in, posting, warm-up, heartbeat): its own one, or None = direct.
+
+    There is no global fallback. An assigned proxy that cannot be read (`AccountRecord.proxy_unavailable`: DPAPI
+    could not decrypt it, the record was deleted or damaged) raises ProxyUnavailableError instead of going direct.
+    """
+    name = getattr(account, "name", "?")
+    own = (getattr(account, "proxy_url", None) or "").strip()
+    if getattr(account, "proxy_unavailable", False) or own == PROXY_LIBRARY_MARKER:
+        raise ProxyUnavailableError(
+            f"Аккаунт «{name}»: назначенный ему прокси не читается (запись удалена или повреждена, либо база "
+            "перенесена с другого компьютера/пользователя Windows и пароль не расшифровывается). Аккаунт не запущен, "
+            "чтобы не выйти в сеть с вашего IP: назначьте прокси заново на этапе «Прокси» мастера"
+        )
+    return own or None
 
 
 class AccountSettings(BaseModel):
@@ -536,11 +602,16 @@ __all__ = [
     "ConfigError",
     "DeepSeekSettings",
     "LimitsSettings",
+    "PROXY_LIBRARY_MARKER",
+    "ProxyParts",
+    "ProxyUnavailableError",
     "ProcessorSettings",
     "TargetSettings",
     "ValidatorSettings",
+    "compose_proxy_url",
     "load_config",
     "mask_proxy_url",
     "parse_proxy",
     "resolve_account_proxy",
+    "split_proxy",
 ]
