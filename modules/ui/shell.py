@@ -91,7 +91,14 @@ class Back:
     notice: Notice | None = None
 
 
-Step = Union[Menu, Field, Confirm, Screen, Run, Notice, Back, None]
+@dataclass
+class GoTab:
+    """Switch to another tab (the first-run list on «Запуск» leads to the tab that needs setting up)."""
+
+    tab: int
+
+
+Step = Union[Menu, Field, Confirm, Screen, Run, Notice, Back, GoTab, None]
 
 
 @dataclass
@@ -246,6 +253,7 @@ class Controller:
         """Show what an action returned."""
         if isinstance(step, Notice):
             self.menu, self.edit, self.confirm = None, None, None
+            self.marking, self.marked = False, []  # a bulk action is done with its rows
             self.notice = step
             self.refresh()
         elif isinstance(step, Menu):
@@ -266,6 +274,11 @@ class Controller:
             if self.stacks[self.tab]:
                 self.stacks[self.tab].pop()
             self.notice = step.notice
+            self.refresh()
+        elif isinstance(step, GoTab):
+            self._close_overlays()
+            self.expanded.clear()
+            self.tab = step.tab
             self.refresh()
         elif isinstance(step, Run):
             self.menu, self.edit, self.confirm = None, None, None

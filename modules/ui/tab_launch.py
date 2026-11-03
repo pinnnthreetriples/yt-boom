@@ -8,7 +8,7 @@ from typing import Any
 
 from modules.ui.app import AppContext
 from modules.ui.icons import icon
-from modules.ui.shell import Cell, Confirm, Hotkey, Notice, Row, Run, Screen, Tab, View, fit
+from modules.ui.shell import Cell, Confirm, GoTab, Hotkey, Notice, Row, Run, Screen, Tab, View, fit
 
 _SPLIT = [("each", "каждый — весь список"), ("share", "делят список")]
 _SPLIT_EXAMPLE = {
@@ -79,11 +79,31 @@ def build_tab(ctx: AppContext) -> Tab:
             values=["пробный", "боевой"], value_index=int(live), on_value=change, enter=enter,
         )
 
+    def setup_rows(cfg: Any) -> list[Row]:
+        """First run: what is missing before a launch makes sense, each row leads to its tab."""
+        from modules.wizard import _target_plan
+
+        missing: list[Row] = []
+        if not ctx.query("SELECT 1 FROM accounts LIMIT 1"):
+            missing.append(Row("setup-accounts", [Cell(icon("tab_accounts"), "", 3), Cell("добавить аккаунт")],
+                               hint="Нужен хотя бы один аккаунт · Enter — перейти", enter=lambda: GoTab(1)))
+        if _target_plan(cfg)[0] == "none":
+            missing.append(Row("setup-target", [Cell(icon("tab_target"), "", 3), Cell("тема поиска или ссылки на видео")],
+                               hint="Где искать видео · Enter — перейти", enter=lambda: GoTab(3)))
+        ai = getattr(cfg.processor, "reply_mode", "ai") == "ai"
+        if (ai and not cfg.deepseek.api_key) or (not ai and not getattr(cfg.processor, "custom_replies", [])):
+            missing.append(Row("setup-replies", [Cell(icon("tab_replies"), "", 3), Cell("ключ DeepSeek или свои шаблоны")],
+                               hint="Чем отвечать · Enter — перейти", enter=lambda: GoTab(4)))
+        if missing:
+            missing.insert(0, Row("setup-title", [Cell("Чтобы начать:", "dim")], selectable=False))
+            missing.append(Row("setup-gap", [Cell("")], selectable=False))
+        return missing
+
     def build() -> View:
         cfg = ctx.cfg()
         active = _active_count(ctx)
         threads = int(cfg.limits.max_concurrent_sessions)
-        rows = [start_row()]
+        rows = [*setup_rows(cfg), start_row()]
 
         if active >= 2:
             counts = [str(n) for n in range(1, active + 1)]

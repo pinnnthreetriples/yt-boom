@@ -2893,8 +2893,12 @@ def run_wizard_app(config_path_str: str = "config.yaml") -> None:
         safe_print(f"{color('[!]', CLR_RED)} Файл конфигурации не найден: {p}")
         return
 
+    if not tui.is_interactive():
+        safe_print(f"{color('[!]', CLR_YELLOW)} Интерфейсу нужна консоль: запустите start_bot.bat или youtube_bot.py --wizard в окне терминала.")
+        return
     try:
-        run_step_by_step_wizard(p)
-        run_dashboard(p)
+        from modules.ui.app import run_app
+
+        run_app(p)
     except (KeyboardInterrupt, EOFError, WizardBack):
         safe_print(f"\n\n{color('[!]', CLR_YELLOW)} Работа с мастером завершена.")
