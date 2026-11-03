@@ -154,7 +154,7 @@ def cells_frags(cells: list[Cell], extra_style: str = "") -> list[Frag]:
     for i, cell in enumerate(cells):
         text = cell.text
         if cell.width:
-            text = fit(text, cell.width)
+            text = fit(text, cell.width - 1)  # a cut text never touches the next column
             text += " " * (cell.width - width(text))
         elif i < len(cells) - 1:
             text += " "
@@ -557,6 +557,8 @@ def render(c: Controller) -> list[Frag]:
             hint = row.hint
         left = [("class:dim", " " + hint)] if hint else []
     keys = _keys_hint(c)
+    if WIDTH - width(frags_text(left)) - width(keys) < 2 and keys.endswith(" · ? клавиши"):
+        keys = keys[: -len(" · ? клавиши")]  # short of room: «?» still works, it just is not written
     gap = WIDTH - width(frags_text(left)) - width(keys)
     if gap < 2 and width(frags_text(left)) > WIDTH:
         left = [(left[0][0], fit(frags_text(left), WIDTH))]

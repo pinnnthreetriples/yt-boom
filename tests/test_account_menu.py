@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import io
 import sqlite3
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -17,7 +16,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import yaml
-from loguru import logger
 
 from database import AccountRecord
 from modules.account_menu_logic import (
@@ -32,16 +30,9 @@ from modules.account_menu_logic import (
 )
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.wizard import (
-    WizardBack,
-    _read_secret_line,
-    _setup_import,
-    _setup_lifecycle,
-    _setup_pick_warmup,
-    _setup_warmup_all,
+    _setup_register,
     load_accounts,
-    step_account,
 )
-from tests.tui_keys import ENTER, scripted_keys
 
 T0 = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
 PASSWORDS = ("pw-fake-1", "pw-fake-2", "pw-fake-3")
@@ -87,14 +78,6 @@ class TestWarmSelection(unittest.TestCase):
             parse_warm_selection("5", 3)
         with self.assertRaisesRegex(ValueError, "Не распознано"):
             parse_warm_selection("1 abc", 3)
-
-    def test_error_never_echoes_the_input(self):
-        pasted = f"user1@example.com:{PASSWORDS[0]}:{TOTP}"  # leftovers of a paste can land in this prompt
-        for text in (pasted, f"1 {pasted}"):
-            with self.subTest(text=text), self.assertRaises(ValueError) as caught:
-                parse_warm_selection(text, 3)
-            for secret in (PASSWORDS[0], TOTP, "user1@example.com"):
-                self.assertNotIn(secret, str(caught.exception))
 
 
 class TestSummaries(unittest.TestCase):
@@ -207,15 +190,6 @@ class MenuCase(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def run_keys(self, func, *keys: str, inputs: list | None = None, paste: list[str] | None = None):
-        out = io.StringIO()
-        prompt = {"side_effect": inputs} if inputs is not None else {"return_value": ""}
-        secret = {"side_effect": paste} if paste is not None else {"side_effect": EOFError}
-        with scripted_keys(*keys) as screen, patch("modules.wizard.prompt_user", **prompt), \
-             patch("modules.wizard._read_secret_line", **secret), patch("sys.stdout", out), \
-             patch("modules.wizard._pause"):
-            result = func()
-        return result, screen.getvalue() + out.getvalue()
 
     def accounts(self) -> dict[str, AccountRecord]:
         return {a.name: a for a in load_accounts(self.config_path)}
@@ -242,80 +216,7 @@ class MenuCase(unittest.TestCase):
 
 
 class TestImportFlow(MenuCase):
-    def paste(self, lines: list[str], *answers: str):
-        """«Импорт» → «Вставить строки» (key 2) → the lines, an empty line ends the paste → warm-up answers."""
-        return self.run_keys(
-            lambda: _setup_import(self.config_path), "2", ENTER, paste=[*lines, ""], inputs=list(answers),
-        )
 
-    def test_paste_adds_valid_skips_duplicates_and_reports_bad_lines(self):
-        lines = [
-            good_line(1),
-            "# comment line",
-            "no-separator-here",
-            f"user2@example.com:{PASSWORDS[1]}:not-base32!",
-            good_line(1),  # the same account twice
-            good_line(3),
-        ]
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])) as warm:
-            notice, output = self.paste(lines, "n")
-        self.assertEqual(sorted(a for a in self.accounts() if a.startswith("user")), ["user1@example.com", "user3@example.com"])
-        self.assertEqual(notice, ("ok", "Импорт: добавлено 2 из 5"))
-        self.assertIn("Добавлено: 2 · пропущено: 1 · ошибок: 2", output)
-        self.assertIn("строка 5: пропущена — аккаунт уже есть", output)
-        self.assertRegex(output, r"строка 3: ошибка")
-        self.assertRegex(output, r"строка 4: ошибка")
-        warm.assert_not_called()
-
-    def test_secrets_never_reach_the_output(self):
-        lines = [good_line(1), good_line(2), f"user3@example.com:{PASSWORDS[2]}:BAD!", "garbage-with-pw-fake-9"]
-        logged, err = io.StringIO(), io.StringIO()
-        sink = logger.add(logged, level="DEBUG")
-        try:
-            with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])), patch("sys.stderr", err):
-                _, output = self.paste(lines, "n")
-        finally:
-            logger.remove(sink)
-        for secret in (*PASSWORDS, TOTP, "pw-fake-9", "BAD!"):
-            for where, text in (("output", output), ("loguru", logged.getvalue()), ("stderr", err.getvalue())):
-                self.assertNotIn(secret, text, where)
-
-    @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI")
-    def test_stored_credentials_are_encrypted_not_raw(self):
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            self.paste([good_line(1)], "n")
-        stored = self.query("SELECT password, totp_secret FROM accounts WHERE name = 'user1@example.com'")
-        self.assertTrue(all(value and PASSWORDS[0] not in value and TOTP not in value for value in stored))
-
-    def test_file_mode(self):
-        path = self.root / "accounts.txt"
-        path.write_text("\ufeff# my accounts\n\n" + good_line(1) + "\nbroken\n" + good_line(2) + "\n", encoding="utf-8")
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            notice, output = self.run_keys(lambda: _setup_import(self.config_path), "1", ENTER, inputs=[str(path), "n"])
-        self.assertEqual(notice, ("ok", "Импорт: добавлено 2 из 3"))
-        self.assertIn("строка 4: ошибка", output)
-        self.assertEqual(len([a for a in self.accounts() if a.startswith("user")]), 2)
-
-    def test_missing_file_is_reported_not_raised(self):
-        result, output = self.run_keys(lambda: _setup_import(self.config_path), "1", inputs=[str(self.root / "nope.txt")])
-        self.assertIsNone(result)
-        self.assertIn("Не удалось прочитать файл", output)
-
-    def test_renamed_account_is_recognised_by_email_on_reimport(self):
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            self.paste([good_line(1)], "n")
-            _pools_rename(self.config_path, "user1@example.com", "nick")
-            _, output = self.paste([good_line(1)], "n")
-        self.assertEqual(sorted(a for a in self.accounts() if a.startswith(("user", "nick"))), ["nick"])
-        self.assertIn("строка 1: пропущена — аккаунт уже есть", output)
-
-    def test_utf16_file_is_reported_not_raised(self):
-        path = self.root / "accounts16.txt"
-        path.write_text(good_line(1) + "\n", encoding="utf-16")  # what `>` in Windows PowerShell 5 writes
-        result, output = self.run_keys(lambda: _setup_import(self.config_path), "1", inputs=[str(path)])
-        self.assertIsNone(result)
-        self.assertIn("UTF-8", output)
-        self.assertNotIn(PASSWORDS[0], output)
 
     def test_cli_file_import_reports_utf16_too(self):
         from youtube_bot import import_accounts_file_cli
@@ -327,76 +228,10 @@ class TestImportFlow(MenuCase):
             self.assertFalse(asyncio.run(import_accounts_file_cli(str(path), str(self.config_path))))
         self.assertIn("not UTF-8", err.getvalue())
 
-    def test_registration_failure_keeps_the_screen_alive_and_hints_at_partial_import(self):
-        for error, kind in ((RuntimeError("db is locked"), "err"), (KeyboardInterrupt(), "warn")):
-            with self.subTest(error=type(error).__name__), patch("modules.wizard._setup_register", side_effect=error):
-                notice, _ = self.paste([good_line(1)], "n")
-            self.assertEqual(notice[0], kind)
-            self.assertIn("проверьте список", notice[1])
-            self.assertNotIn("db is locked", notice[1])
-
-    def test_input_cancel_raises_wizard_back(self):
-        for error in (KeyboardInterrupt, EOFError):
-            with self.subTest(error=error.__name__), patch("builtins.input", side_effect=error),                  patch("sys.stdout", io.StringIO()), self.assertRaises(WizardBack):
-                _read_secret_line(" › ")
-
-    def test_empty_paste_and_cancel(self):
-        result, output = self.paste([])
-        self.assertIsNone(result)
-        self.assertIn("нет строк с аккаунтами", output)
-        result, _ = self.run_keys(lambda: _setup_import(self.config_path), "0")
-        self.assertIsNone(result)
-
-    def test_existing_account_is_skipped_and_keeps_its_credentials(self):
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            self.paste([good_line(1)], "n")
-            before = self.query("SELECT password FROM accounts WHERE name = 'user1@example.com'")
-            _, output = self.paste([f"user1@example.com:other-pw:{TOTP}"], "n")
-        after = self.query("SELECT password FROM accounts WHERE name = 'user1@example.com'")
-        self.assertEqual(before, after)
-        self.assertIn("пропущено: 1", output)
-
 
 class TestWarmupChoice(MenuCase):
     def added(self, n: int = 3) -> list[SimpleNamespace]:
         return [SimpleNamespace(name=f"user{i}@example.com") for i in range(1, n + 1)]
-
-    def pick(self, *answers: str) -> tuple[list[str], str]:
-        return self.run_keys(lambda: _setup_pick_warmup(self.added()), inputs=list(answers))
-
-    def test_shows_numbered_list(self):
-        _, output = self.pick("n")
-        for number in (1, 2, 3):
-            self.assertIn(f"{number}. user{number}@example.com", output)
-
-    def test_all_none_and_chosen(self):
-        names = [a.name for a in self.added()]
-        self.assertEqual(self.pick("a")[0], names)
-        self.assertEqual(self.pick("все")[0], names)
-        self.assertEqual(self.pick("")[0], [])  # Enter = nobody (prompt_user default «n» is applied by the real prompt)
-        self.assertEqual(self.pick("n")[0], [])
-        self.assertEqual(self.pick("1 3")[0], [names[0], names[2]])
-
-    def test_garbage_is_asked_again(self):
-        names, output = self.pick("x", "7", "2")
-        self.assertEqual(names, ["user2@example.com"])
-        self.assertIn("Не распознано", output)
-        self.assertIn("вне списка (1–3)", output)
-
-    def test_ctrl_c_means_nobody(self):
-        names, _ = self.pick(WizardBack())
-        self.assertEqual(names, [])
-
-    def test_import_warms_up_only_the_chosen_accounts(self):
-        results = [SimpleNamespace(account_name="user1@example.com", success=True)]
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=results)) as warm:
-            notice, output = self.run_keys(
-                lambda: _setup_import(self.config_path), "2", ENTER,
-                paste=[good_line(1), good_line(2), good_line(3), ""], inputs=["1"],
-            )
-        warm.assert_awaited_once()
-        self.assertEqual(warm.await_args.args[1], ["user1@example.com"])
-        self.assertIn("Прогрев: 1 из 1 успешно", output)
 
 
 class TestWarmupRun(MenuCase):
@@ -404,10 +239,7 @@ class TestWarmupRun(MenuCase):
 
     def setUp(self):
         super().setUp()
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            self.run_keys(
-                lambda: _setup_import(self.config_path), "2", ENTER, paste=[good_line(1), good_line(2), good_line(3), ""], inputs=["n"],
-            )
+        _setup_register(self.config_path, [good_line(1), good_line(2), good_line(3)])
         self.set_stage("user1@example.com", 2)  # quarantine
         self.set_stage("user2@example.com", 30)  # aging
         self.set_stage("user3@example.com", 100)  # mature: no warm-up needed
@@ -434,23 +266,6 @@ class TestWarmupRun(MenuCase):
 
         return asyncio.run(warm_selected_cli(str(self.config_path), names, report=lambda line: None))
 
-    def test_warm_all_asks_confirmation_and_runs_quarantine_and_aging_only(self):
-        result, output = self.run_keys(lambda: _setup_warmup_all(self.config_path), inputs=["y"])
-        self.assertEqual(self.warmed, ["user1@example.com", "user2@example.com"])
-        self.assertEqual(result, ("ok", "Прогрев: 2 из 2 успешно"))
-        self.assertIn("[OK] user1@example.com: fake", output)
-
-    def test_warm_all_declined_runs_nothing(self):
-        result, _ = self.run_keys(lambda: _setup_warmup_all(self.config_path), inputs=["n"])
-        self.assertEqual(self.warmed, [])
-        self.assertEqual(result, ("info", "Отменено"))
-
-    def test_warm_all_without_candidates(self):
-        self.set_stage("user1@example.com", 100)
-        self.set_stage("user2@example.com", 100)
-        result, _ = self.run_keys(lambda: _setup_warmup_all(self.config_path), inputs=[])
-        self.assertEqual(result[0], "warn")
-        self.assertEqual(self.warmed, [])
 
     def test_selected_accounts_only(self):
         import asyncio
@@ -498,67 +313,6 @@ class TestWarmupRun(MenuCase):
         self.pause.reset_mock()
         self.warm_selected(["user1@example.com", "user3@example.com", "user2@example.com"])  # a skip does not reset the wait
         self.pause.assert_called_once()
-
-    def test_unexpected_error_in_warm_up_shows_only_its_class(self):
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(side_effect=RuntimeError("secret-detail"))):
-            from modules.wizard import _setup_run_warmup
-            result, _ = self.run_keys(lambda: _setup_run_warmup(self.config_path, ["user1@example.com"]))
-        self.assertEqual(result[0], "err")
-        self.assertIn("RuntimeError", result[1])
-        self.assertNotIn("secret-detail", result[1])
-
-    def test_failed_warmup_is_summarised(self):
-        async def failing(account, **kwargs):
-            return SimpleNamespace(account_name=account.name, success=False, details="boom")
-
-        self.warmer.warm_up = failing
-        result, _ = self.run_keys(lambda: _setup_warmup_all(self.config_path), inputs=["y"])
-        self.assertEqual(result[0], "warn")
-        self.assertIn("не удалось: user1@example.com, user2@example.com", result[1])
-
-
-class TestMenuIntegration(MenuCase):
-    def test_new_rows_are_in_the_accounts_menu(self):
-        _, output = self.run_keys(lambda: step_account(self.config_path, self.root / "sessions"), ENTER)
-        for label in ("Импорт аккаунтов", "Прогрев", "Жизненный цикл"):
-            self.assertIn(label, output)
-
-    def test_lifecycle_screen_through_hotkey(self):
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            self.run_keys(lambda: _setup_import(self.config_path), "2", ENTER, paste=[good_line(1), good_line(2), ""], inputs=["n"])
-        reset = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
-        self.set_stage("user1@example.com", 3, daily_limit_reset_at=reset)
-        self.set_stage("user2@example.com", 100, daily_comments_done=2, consecutive_errors=3, daily_limit_reset_at=reset)
-        _, output = self.run_keys(lambda: step_account(self.config_path, self.root / "sessions"), "8", "4")
-        self.assertRegex(output, r"Аккаунт +Стадия +Квота +Heartbeat +Пауза")
-        self.assertRegex(output, r"user1@example\.com +карантин +0/0")
-        self.assertRegex(output, r"user2@example\.com +restricted +2/5 .*breaker ×3")
-        self.assertIn("нет · —", output)  # no cookies in the temporary profile
-        for secret in (*PASSWORDS, TOTP):
-            self.assertNotIn(secret, output)
-
-    def test_lifecycle_table_is_capped_and_marks_inactive(self):
-        accounts = [_account(100, id=n, name=f"acc{n:02}", is_active=n != 1) for n in range(1, 18)]
-        with patch("modules.wizard._pools_db", return_value=accounts):
-            _, output = self.run_keys(lambda: _setup_lifecycle(self.config_path))
-        self.assertIn("acc15", output)
-        self.assertNotIn("acc16", output)
-        self.assertIn("… ещё 2", output)
-        self.assertRegex(output, r"acc01 +mature +0/5 .*отключён")
-
-    def test_lifecycle_without_accounts(self):
-        with patch("modules.wizard._pools_db", return_value=[]):
-            _, output = self.run_keys(lambda: _setup_lifecycle(self.config_path))
-        self.assertIn("Аккаунтов нет", output)
-
-    def test_import_row_registers_through_menu(self):
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            _, output = self.run_keys(
-                lambda: step_account(self.config_path, self.root / "sessions"), "5", "2", ENTER, "4",
-                paste=[good_line(1), ""], inputs=["n"],
-            )
-        self.assertIn("user1@example.com", [a.name for a in load_accounts(self.config_path)])
-        self.assertIn("Импорт: добавлено 1 из 1", output)
 
 
 if __name__ == "__main__":

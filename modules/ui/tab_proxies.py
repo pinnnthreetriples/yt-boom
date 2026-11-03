@@ -189,7 +189,7 @@ def main_view(ctx: AppContext) -> View:
 
     return View(
         rows=rows, top=top,
-        keys="Пробел подробнее · + добавить · C проверить · S поиск",
+        keys="Enter · Пробел · + · C проверить · S поиск",
         hotkeys=[
             Hotkey("+", lambda _r: add_field(ctx)),
             Hotkey("C", lambda _r: _check_all(ctx)),

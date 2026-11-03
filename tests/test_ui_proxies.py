@@ -15,7 +15,6 @@ from unittest.mock import patch
 
 import yaml
 
-import secret_store
 from config import load_config
 from database import Database
 from modules import proxy_screen
@@ -23,7 +22,7 @@ from modules.proxy_check import ProxyCheckResult, _as_parts, browser_proxy_warni
 from modules.ui import tab_proxies
 from modules.ui.app import AppContext
 from modules.ui.shell import Confirm, Controller, Field, Menu, frags_text, render
-from modules.wizard import _save_account
+from modules.wizard import _pools_db
 
 
 def ok(ip: str, country: str | None, ms: int = 140, scheme: str = "http") -> ProxyCheckResult:
@@ -84,7 +83,7 @@ class ProxyTabCase(unittest.TestCase):
 
     def accounts(self, *names: str) -> None:
         for name in names:
-            _save_account(self.config_path, name, str(self.root / "sessions" / name), None)
+            _pools_db(self.config_path, lambda db, n=name: db.upsert_account(n, session_path=str(self.root / "sessions" / n)))
 
     def add(self, url: str, check: ProxyCheckResult | None = None, country: str | None = None) -> int:
         async def go(db):

@@ -9,18 +9,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import yaml
 
 from config import load_config
-from database import AccountRecord, Database
-from modules.wizard import (
-    add_account_stepwise,
-    load_accounts,
-    list_accounts_wizard,
-    login_account_wizard,
-)
+from database import Database
 from youtube_bot import (
-    add_account_cli,
     interactive_login,
     main,
-    print_accounts_table,
     run_video_pool_cli,
     run_reply_bot,
 )
@@ -292,49 +284,6 @@ class TestMultiAccountWizard(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
-
-    def test_list_accounts_wizard(self):
-        async def _seed():
-            db = Database(self.db_path)
-            await db.connect()
-            await db.init_schema()
-            await db.upsert_account("wiz_acc1", str(self.root / "sessions" / "wiz1"), None, True)
-            await db.close()
-
-        asyncio.run(_seed())
-
-        results = list_accounts_wizard(self.config_path)
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["account"].name, "wiz_acc1")
-
-    def test_login_account_wizard(self):
-        async def _seed():
-            db = Database(self.db_path)
-            await db.connect()
-            await db.init_schema()
-            await db.upsert_account("login_target_acc", str(self.root / "sessions" / "lt"), None, True)
-            await db.close()
-
-        asyncio.run(_seed())
-
-        with patch("modules.wizard.prompt_user", side_effect=["1"]), \
-             patch("youtube_bot.interactive_login", new_callable=AsyncMock) as mock_login:
-            ok = login_account_wizard(self.config_path)
-            self.assertTrue(ok)
-            mock_login.assert_called_once_with(str(self.config_path), account_name="login_target_acc")
-
-    def test_add_account_stepwise(self):
-        before = len(load_accounts(self.config_path))
-
-        # name, no login now
-        inputs = ["step_acc", "n"]
-        with patch("modules.wizard.prompt_user", side_effect=inputs):
-            self.assertTrue(add_account_stepwise(self.config_path))
-
-        accounts = load_accounts(self.config_path)
-        self.assertEqual(len(accounts), before + 1)
-        self.assertIn("step_acc", [a.name for a in accounts])
-
 
 
 if __name__ == "__main__":

@@ -167,7 +167,7 @@ def build_tab(ctx: AppContext) -> Tab:
                         hint="Добавить аккаунты: строки «почта пароль 2FA» или файл", enter=lambda: add_field(ctx))]
         return View(
             rows=rows,
-            keys="Enter действия · Пробел подробнее · + добавить · X отметить",
+            keys="Enter · Пробел · + добавить · X отметить",
             hotkeys=[
                 Hotkey("+", lambda _r: add_field(ctx)),
                 Hotkey("=", lambda _r: add_field(ctx)),  # the same key without Shift

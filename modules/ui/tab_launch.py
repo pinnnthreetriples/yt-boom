@@ -231,7 +231,7 @@ def journal_view(ctx: AppContext, state: dict[str, Any]) -> View:
             Cell(f"стр. {state['page'] + 1}/{pages}", "dim")]]
     return View(
         rows=rows, top=top, title=[Cell(f"{icon('journal')} журнал")],
-        keys="←→ фильтр · Enter запись · N/P страницы · C очистить",
+        keys="←→ фильтр · N/P стр. · C очистить",
         hotkeys=[Hotkey("N", lambda _r: page(1)), Hotkey("P", lambda _r: page(-1)), Hotkey("C", lambda _r: clear())],
     )
 
