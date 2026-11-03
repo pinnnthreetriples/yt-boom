@@ -335,7 +335,7 @@ class TestImportAccountsFile(_DbCase):
 
     async def test_one_bad_line_and_one_failed_account_do_not_stop_the_rest(self):
         results = {"a@gmail.com": True, "b@gmail.com": False, "c@gmail.com": True}
-        authenticate = AsyncMock(side_effect=lambda db, cfg, account: results[account.email])
+        authenticate = AsyncMock(side_effect=lambda db, cfg, account, *_: results[account.email])
         ok, errors = await self._import(
             ["# comment", "", self._good("a"), "broken line SECRETPW", self._good("b"), self._good("c")], authenticate
         )
@@ -350,7 +350,7 @@ class TestImportAccountsFile(_DbCase):
         self.assertTrue(ok)
 
     async def test_second_import_skips_authenticated_accounts_unless_forced(self):
-        async def authenticate(db, cfg, account):
+        async def authenticate(db, cfg, account, *_):
             await db.set_account_auth_status(account.id, "authenticated")
             return True
 
@@ -368,7 +368,7 @@ class TestImportAccountsFile(_DbCase):
         self.assertEqual(forced.await_count, 2)
 
     async def test_changed_password_makes_the_account_sign_in_again(self):
-        async def authenticate(db, cfg, account):
+        async def authenticate(db, cfg, account, *_):
             await db.set_account_auth_status(account.id, "authenticated")
             return True
 

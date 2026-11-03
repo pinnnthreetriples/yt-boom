@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import random
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 from loguru import logger
 
@@ -42,25 +43,70 @@ def setup_cli_logging(level: str = "INFO", log_file: str | None = None) -> None:
     setup_bot_logging(level=level, log_file=log_file)
 
 
-async def _login_country_allowed(account_name: str, expected: str | None, proxy: str | None) -> tuple[bool, str | None]:
-    """Fail closed before a sign-in: the exit country of the proxy must be the account's expected one.
+CountryConfirm = Callable[[str], "bool | Awaitable[bool]"]  # gets the explanation, answers "continue the sign-in?"
 
-    Returns (allowed, exit country). Without an expected country nothing is checked and the login goes on as before.
+
+def _stdin_is_interactive() -> bool:
+    return sys.stdin.isatty()
+
+
+def _ask_continue_in_console(message: str) -> bool:
+    """Console question; Enter, anything but yes, Ctrl+C or a closed stdin all mean «отменить»."""
+    print(f"\n{message}\n", file=sys.stderr)
+    try:
+        answer = input("Отменить вход или продолжить? [О]тменить / [П]родолжить (по умолчанию — отменить): ")
+    except (KeyboardInterrupt, EOFError):
+        return False
+    return answer.strip().lower() in {"п", "продолжить", "p", "y", "yes", "да", "continue"}
+
+
+async def _login_country_allowed(
+    account_name: str,
+    expected: str | None,
+    proxy: str | None,
+    allow_mismatch: bool = False,
+    confirm: CountryConfirm | None = None,
+) -> tuple[bool, str | None]:
+    """Before a sign-in compare the proxy's exit country with the account's expected one.
+
+    A mismatch (or an exit country that could not be found) no longer cancels silently: `allow_mismatch`
+    (`--allow-country-mismatch`) goes on with a warning, otherwise the person is asked (`confirm`, or the console
+    when stdin is one; the default answer is «отменить»), and with nobody to ask the sign-in is cancelled.
+    Returns (allowed, exit country). Without an expected country nothing is checked. Asked at most once per call.
     """
     verdict, exit_country = await check_account_exit(expected, proxy)
+    if verdict not in ("mismatch", "unknown"):
+        return True, exit_country
     if verdict == "mismatch":
-        logger.error(
-            "Вход аккаунта {!r} отменён: ожидаемая страна {}, а прокси выходит из страны {}. "
-            "Первый вход с IP чужой страны ставит аккаунт под риск блокировки: смените прокси или ожидаемую страну",
-            account_name, expected, exit_country,
+        problem = f"ожидаемая страна {expected}, а прокси выходит из страны {exit_country}"
+    else:
+        problem = (
+            f"не удалось определить страну выхода прокси (ожидается {expected}); проверьте прокси, "
+            "возможно, не скачана гео-база Camoufox"
         )
-    elif verdict == "unknown":
+    risk = "Первый вход с IP чужой страны может вызвать проверку или блокировку аккаунта Google"
+    if allow_mismatch:
+        logger.warning("Аккаунт {!r}: {}. {}. Вход продолжен по --allow-country-mismatch", account_name, problem, risk)
+        return True, exit_country
+    message = f"Аккаунт «{account_name}»: {problem}.\n{risk}."
+    if confirm is not None:
+        answer = confirm(message)
+        proceed = bool(await answer if inspect.isawaitable(answer) else answer)
+    elif _stdin_is_interactive():
+        proceed = await asyncio.to_thread(_ask_continue_in_console, message)
+    else:
         logger.error(
-            "Вход аккаунта {!r} отменён: не удалось определить страну выхода прокси (ожидается {}). "
-            "Проверьте прокси и повторите",
-            account_name, expected,
+            "Вход аккаунта {!r} отменён: {}. {}. Нет консоли для вопроса: чтобы войти всё равно, "
+            "запустите с --allow-country-mismatch, либо смените прокси или ожидаемую страну",
+            account_name, problem, risk,
         )
-    return verdict not in ("mismatch", "unknown"), exit_country
+        return False, exit_country
+    logger.log(
+        "WARNING" if proceed else "ERROR",
+        "Аккаунт {!r}: {}. Решение пользователя: {}",
+        account_name, problem, "вход продолжен" if proceed else "вход отменён",
+    )
+    return proceed, exit_country
 
 
 async def _warn_country_disagreement(
@@ -84,7 +130,12 @@ async def _warn_country_disagreement(
         )
 
 
-async def interactive_login(config_path: str = "config.yaml", account_name: str | None = None) -> None:
+async def interactive_login(
+    config_path: str = "config.yaml",
+    account_name: str | None = None,
+    allow_country_mismatch: bool = False,
+    confirm_country: CountryConfirm | None = None,
+) -> None:
     """Launch Camoufox headfully on YouTube so user can log in once to save cookies.
 
     The browser starts with the same options as automated runs (proxy, prefs, pinned fingerprint). When the
@@ -120,7 +171,10 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
         proxy_url = cfg.browser.proxy
 
     if acc is not None and acc.expected_country:
-        allowed, _ = await _login_country_allowed(acc.name, acc.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+        allowed, _ = await _login_country_allowed(
+            acc.name, acc.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy),
+            allow_country_mismatch, confirm_country,
+        )
         if not allowed:
             await db.close()
             return
@@ -296,9 +350,16 @@ async def add_credentials_account_cli(
         return True
 
 
-async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRecord) -> bool:
+async def _authenticate_account(
+    db: Database,
+    cfg: AppConfig,
+    account: AccountRecord,
+    allow_country_mismatch: bool = False,
+    confirm_country: CountryConfirm | None = None,
+) -> bool:
     """Sign the account in. `failed` is stored only when Google refused (GoogleAuthError); a browser, proxy or
-    network failure is logged and leaves the stored status alone."""
+    network failure is logged and leaves the stored status alone. A proxy exit country that differs from the expected
+    one is confirmed first (`_login_country_allowed`)."""
     if not account.email or not account.password:
         logger.error("У аккаунта {!r} не заданы email/пароль: добавьте его через --add-account email:password:totp", account.name)
         return False
@@ -308,7 +369,9 @@ async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRe
     proxy = resolve_account_proxy(account.proxy_url, cfg.browser.proxy)
     exit_country: str | None = None
     if account.auth_status != "authenticated" or force_relogin:  # a real sign-in follows: the country must match first
-        allowed, exit_country = await _login_country_allowed(account.name, account.expected_country, proxy)
+        allowed, exit_country = await _login_country_allowed(
+            account.name, account.expected_country, proxy, allow_country_mismatch, confirm_country
+        )
         if not allowed:
             return False
     else:
@@ -386,7 +449,13 @@ async def _find_account(db: Database, identifier: str) -> AccountRecord | None:
     return next((a for a in await db.list_accounts() if a.email and a.email.lower() == wanted), None)
 
 
-async def auth_account_cli(identifier: str, config_path: str = "config.yaml", headless: bool | None = None) -> bool:
+async def auth_account_cli(
+    identifier: str,
+    config_path: str = "config.yaml",
+    headless: bool | None = None,
+    allow_country_mismatch: bool = False,
+    confirm_country: CountryConfirm | None = None,
+) -> bool:
     """`--auth-account <name_or_email>`: sign the account into YouTube (proxy and fingerprint come from the account)."""
     cfg = load_config(config_path)
     if headless is not None:
@@ -396,8 +465,8 @@ async def auth_account_cli(identifier: str, config_path: str = "config.yaml", he
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found. Add it with --add-account email:password:totp", file=sys.stderr)
             return False
-        ok = await _authenticate_account(db, cfg, account)
-        print(f"[{'OK' if ok else 'FAILED'}] {account.name}: {'authenticated' if ok else 'authentication failed'}")
+        ok = await _authenticate_account(db, cfg, account, allow_country_mismatch, confirm_country)
+        print(f"[{'OK' if ok else 'FAILED'}] {account.name}:{'authenticated' if ok else 'authentication failed'}")
         return ok
 
 
@@ -446,7 +515,11 @@ async def register_account_lines(
 
 
 async def import_accounts_file_cli(
-    path: str, config_path: str = "config.yaml", headless: bool | None = None, force: bool = False
+    path: str,
+    config_path: str = "config.yaml",
+    headless: bool | None = None,
+    force: bool = False,
+    allow_country_mismatch: bool = False,
 ) -> bool:
     """`--import-accounts-file`: register every line of the file, then sign the accounts in one by one.
 
@@ -477,7 +550,7 @@ async def import_accounts_file_cli(
             if index:
                 await asyncio.sleep(_pause_between_accounts(account))
             logger.info("Авторизация аккаунта {!r} ({}/{})", account.name, index + 1, len(queue))
-            if not await _authenticate_account(db, cfg, account):
+            if not await _authenticate_account(db, cfg, account, allow_country_mismatch):
                 failed_auth += 1
         print(f"[{'OK' if not failed_auth else 'FAILED'}] Authenticated {len(queue) - failed_auth} of {len(queue)}")
     return not failed_lines and not failed_auth
@@ -618,6 +691,7 @@ async def warm_selected_cli(
     duration: float = 45.0,
     headless: bool | None = None,
     report: Callable[[str], None] = print,
+    allow_country_mismatch: bool = False,
 ) -> list[WarmUpResult]:
     """Wizard «прогрев выбранных»: the accounts called `names`, in that order.
 
@@ -640,7 +714,7 @@ async def warm_selected_cli(
                 results.append(WarmUpResult(name, False, None, 0.0, "account not found"))
             elif needs_sign_in:
                 worked = True
-                ok = await _authenticate_account(db, cfg, account)
+                ok = await _authenticate_account(db, cfg, account, allow_country_mismatch)
                 results.append(WarmUpResult(account.name, ok, None, 0.0, "signed in" if ok else "sign-in failed"))
             elif warm_candidates([account]):
                 worked = True
@@ -1606,9 +1680,10 @@ def main() -> None:
     parser.add_argument("--auth-account", type=str, default=None, metavar="NAME_OR_EMAIL", help="Sign the account into YouTube (Camoufox with its proxy and fixed fingerprint, TOTP 2FA)")
     parser.add_argument("--import-accounts-file", type=str, default=None, metavar="FILE", help="Import accounts from a text file (one email:password:totp[:recovery_email][:proxy][:country=PL][:locale=pl-PL] per line) and authenticate them one by one; accounts that are already authenticated are skipped")
     parser.add_argument("--force", action="store_true", help="With --import-accounts-file: sign in accounts that are already authenticated too")
+    parser.add_argument("--allow-country-mismatch", action="store_true", help="With --auth-account, --import-accounts-file, --login --account: sign in even when the proxy's exit country differs from the account's expected one (or cannot be determined), without asking; without the flag the console asks «отменить или продолжить», and with no console the sign-in is cancelled")
     parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (http://user:pass@ip:port or ip:port:user:pass) for adding account or session override")
     parser.add_argument("--session", type=str, default=None, help="Session directory path for adding account")
-    parser.add_argument("--country", type=str, default=None, help="With --add-account: the account's expected country (PL or Poland); a sign-in is refused when the proxy exits elsewhere")
+    parser.add_argument("--country", type=str, default=None, help="With --add-account: the account's expected country (PL or Poland); before a sign-in the proxy's exit country is compared with it (see --allow-country-mismatch)")
     parser.add_argument("--locale", type=str, default=None, help="With --add-account: browser language of the account (e.g. pl-PL); default is browser.locale")
     parser.add_argument("--heartbeat", "--check-session", dest="heartbeat", nargs="?", const="ALL", default=None, metavar="NAME_OR_ALL", help="Show session status from the LOGIN_INFO cookie, no network (default: all active accounts)")
     parser.add_argument("--heartbeat-online", action="store_true", help="With --heartbeat: also verify the session with an HTTP request to YouTube (Firefox-like, through the account proxy)")
@@ -1694,10 +1769,20 @@ def main() -> None:
         return
 
     if args.auth_account:
-        sys.exit(0 if asyncio.run(auth_account_cli(args.auth_account, args.config, args.headless or None)) else 1)
+        ok = asyncio.run(
+            auth_account_cli(
+                args.auth_account, args.config, args.headless or None, allow_country_mismatch=args.allow_country_mismatch
+            )
+        )
+        sys.exit(0 if ok else 1)
 
     if args.import_accounts_file:
-        ok = asyncio.run(import_accounts_file_cli(args.import_accounts_file, args.config, args.headless or None, args.force))
+        ok = asyncio.run(
+            import_accounts_file_cli(
+                args.import_accounts_file, args.config, args.headless or None, args.force,
+                allow_country_mismatch=args.allow_country_mismatch,
+            )
+        )
         sys.exit(0 if ok else 1)
 
     if args.status:
@@ -1709,7 +1794,9 @@ def main() -> None:
         return
 
     if args.login:
-        asyncio.run(interactive_login(args.config, account_name=args.account))
+        asyncio.run(
+            interactive_login(args.config, account_name=args.account, allow_country_mismatch=args.allow_country_mismatch)
+        )
         return
 
     if args.videos_file:
