@@ -809,14 +809,20 @@ class TestVisibilityHook(TestLifecyclePacing):
             self.assertEqual(log.info.call_count, expected)
             self.assertIn(account.id, orchestrator._gated_accounts)
 
-    async def test_default_collector_uses_the_global_proxy(self) -> None:
-        """Without an injected collector the pool collects through `browser.proxy`; no proxy means direct."""
-        for proxy in ("socks5://1.2.3.4:1080", None):
-            with self.subTest(proxy=proxy):
-                self.config.browser.proxy = proxy
-                with patch("modules.multi_account_orchestrator.YouTubeCollector") as collector_cls:
-                    MultiAccountOrchestrator(self.config, db=self.db, processor=MagicMock())
-                collector_cls.assert_called_once_with(self.config.collector, proxy)
+    async def test_default_collector_uses_the_search_proxy(self) -> None:
+        """Without an injected collector the pool collects through the library's search proxy (set in `ensure_db`);
+        a leftover `browser.proxy` is ignored and no search proxy means direct."""
+        record, _ = await self.db.add_proxy_url("socks5://1.2.3.4:1080")
+        for search_id, expected in ((record.id, "socks5://1.2.3.4:1080"), (None, None)):
+            with self.subTest(search=expected):
+                await self.db.set_search_proxy(search_id)
+                self.config.browser.proxy = "http://9.9.9.9:9"
+                collector = MagicMock(set_proxy=AsyncMock(), close=AsyncMock())
+                with patch("modules.multi_account_orchestrator.YouTubeCollector", return_value=collector) as collector_cls:
+                    orchestrator = MultiAccountOrchestrator(self.config, db=self.db, processor=MagicMock())
+                collector_cls.assert_called_once_with(self.config.collector, None)
+                await orchestrator.ensure_db()
+                collector.set_proxy.assert_awaited_once_with(expected)
 
 
 if __name__ == "__main__":

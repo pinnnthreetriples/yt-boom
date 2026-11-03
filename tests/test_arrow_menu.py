@@ -152,10 +152,11 @@ class TestDashboard(ConfigCase):
 class TestSubScreens(ConfigCase):
     def test_account_menu(self):
         with patch("modules.wizard.step_proxy") as proxy, patch("modules.wizard.step_account") as acc:
-            output = self.run_screen(account_menu, ENTER, DOWN, ENTER, DOWN, SPACE, ESC)
+            output = self.run_screen(account_menu, ENTER, DOWN, ENTER, DOWN, DOWN, SPACE, ESC)
         proxy.assert_called_once()
         acc.assert_called_once()
-        self.assertIn("без прокси", output)
+        self.assertIn("нет прокси · все с вашего IP", output)
+        self.assertIn("⚠ с вашего IP", output)
         self.assertTrue(self.headless())
 
     def test_dashboard_opens_account_section(self):

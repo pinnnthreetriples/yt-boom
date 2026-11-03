@@ -12,12 +12,9 @@ import yaml
 from config import load_config
 from modules.wizard import (
     check_deepseek_api,
-    check_proxy_connectivity,
     check_youtube_session,
     clear_youtube_session,
-    mask_proxy,
     mask_secret,
-    normalize_proxy,
     step_account,
     step_deepseek,
     step_launch,
@@ -28,49 +25,6 @@ from modules.wizard import (
 
 
 class TestWizardHelpers(unittest.TestCase):
-    def test_normalize_proxy_valid(self):
-        self.assertEqual(normalize_proxy("185.22.33.44:8080"), "http://185.22.33.44:8080")
-        self.assertEqual(normalize_proxy("user:pass@185.22.33.44:8080"), "http://user:pass@185.22.33.44:8080")
-        self.assertEqual(normalize_proxy("http://185.22.33.44:8080"), "http://185.22.33.44:8080")
-        self.assertEqual(
-            normalize_proxy("socks5://user:pass@185.22.33.44:1080"),
-            "socks5://user:pass@185.22.33.44:1080",
-        )
-
-    def test_normalize_proxy_direct_fallbacks(self):
-        self.assertIsNone(normalize_proxy(None))
-        self.assertIsNone(normalize_proxy(""))
-        self.assertIsNone(normalize_proxy("   "))
-        self.assertIsNone(normalize_proxy("none"))
-        self.assertIsNone(normalize_proxy("0"))
-        self.assertIsNone(normalize_proxy("direct"))
-        self.assertIsNone(normalize_proxy("off"))
-        self.assertIsNone(normalize_proxy("нет"))
-        self.assertIsNone(normalize_proxy("прямое"))
-
-    def test_normalize_proxy_invalid_formats(self):
-        with self.assertRaises(ValueError):
-            normalize_proxy("ftp://185.22.33.44:21")
-        with self.assertRaises(ValueError):
-            normalize_proxy("http://185.22.33.44")  # missing port
-        with self.assertRaises(ValueError):
-            normalize_proxy("http://185.22.33.44:999999")  # invalid port
-        with self.assertRaises(ValueError):
-            normalize_proxy("http://:8080")  # missing host
-
-    def test_mask_proxy(self):
-        self.assertEqual(mask_proxy(None), "Прямое соединение (без прокси)")
-        self.assertEqual(mask_proxy(""), "Прямое соединение (без прокси)")
-        self.assertEqual(mask_proxy("http://185.22.33.44:8080"), "http://185.22.33.44:8080")
-        self.assertEqual(
-            mask_proxy("http://myuser:secretpassword@185.22.33.44:8080"),
-            "http://myuser:***@185.22.33.44:8080",
-        )
-        self.assertEqual(
-            mask_proxy("socks5://admin:pwd@1.2.3.4:1080"),
-            "socks5://admin:***@1.2.3.4:1080",
-        )
-
     def test_mask_secret(self):
         self.assertEqual(mask_secret(None), "[не задан]")
         self.assertEqual(mask_secret(""), "[не задан]")
@@ -78,26 +32,6 @@ class TestWizardHelpers(unittest.TestCase):
         masked = mask_secret("sk-abcdefghijklmnopqrstuvwxyz123456")
         self.assertTrue(masked.startswith("sk-abcd..."))
         self.assertTrue(masked.endswith("3456"))
-
-    def test_check_proxy_connectivity_success(self):
-        with patch("curl_cffi.requests.get") as mock_get:
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = {"ip": "195.201.20.30"}
-            mock_get.return_value = mock_resp
-
-            ok, msg = check_proxy_connectivity("http://195.201.20.30:8080")
-            self.assertTrue(ok)
-            self.assertIn("195.201.20.30", msg)
-
-    def test_check_proxy_connectivity_failure(self):
-        with patch("curl_cffi.requests.get") as mock_get:
-            mock_get.side_effect = RuntimeError("Failed to connect")
-
-            ok, msg = check_proxy_connectivity("http://bad.proxy:8080")
-            self.assertFalse(ok)
-            self.assertIn("Не удалось подключиться к прокси", msg)
-
 
 class TestWizardSessionAndApi(unittest.TestCase):
     def setUp(self):
@@ -216,17 +150,30 @@ class TestWizardConfigUpdateAndSteps(unittest.TestCase):
         self.assertEqual(loaded.browser.proxy, "http://127.0.0.1:8080")
         self.assertEqual(loaded.collector.endpoints[0].url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
 
-    def test_step_proxy_leave_as_is(self):
-        with patch("modules.wizard.prompt_user", return_value="1"):
+    def test_step_proxy_continue_warns_once_then_leaves(self):
+        with patch("modules.wizard.prompt_user", return_value="1") as prompt:
             self.assertIsNone(step_proxy(self.config_path))
+        self.assertEqual(prompt.call_count, 2)  # «default» has no proxy: the first «Продолжить» only warns
 
-    def test_step_proxy_remove_account_proxy(self):
+    def test_step_proxy_plain_mode_picks_search_direct(self):
+        from database import Database
+
+        async def seed():
+            async with Database(load_config(self.config_path).app.db_path) as db:
+                record, _ = await db.add_proxy_url("http://1.2.3.4:8080")
+                await db.set_search_proxy(record.id)
+
         from modules.wizard import load_accounts
-        update_config_file(self.config_path, {"browser.proxy": "http://1.2.3.4:8080"})
-        self.assertEqual(load_accounts(self.config_path)[0].proxy_url, "http://1.2.3.4:8080")
-        with patch("modules.wizard.prompt_user", side_effect=["3", "1"]):
+        load_accounts(self.config_path)
+        asyncio.run(seed())
+        with patch("modules.wizard.prompt_user", side_effect=["S", "D", "1", "1"]):
             step_proxy(self.config_path)
-        self.assertIsNone(load_accounts(self.config_path)[0].proxy_url)
+
+        async def search():
+            async with Database(load_config(self.config_path).app.db_path) as db:
+                return await db.get_search_proxy()
+
+        self.assertIsNone(asyncio.run(search()))
 
     def test_step_deepseek_leave_as_is(self):
         with patch("modules.wizard.prompt_user", return_value="1"):
@@ -244,7 +191,6 @@ class TestWizardConfigUpdateAndSteps(unittest.TestCase):
              patch("youtube_bot.run_multi_video_pipeline", new_callable=AsyncMock) as mock_reply:
             result = step_launch(
                 self.config_path,
-                None,
                 self.root / "sessions",
                 "sk-dummy-key",
                 2,
@@ -285,7 +231,6 @@ class TestWizardConfigUpdateAndSteps(unittest.TestCase):
             with self.assertRaises(WizardBack):
                 step_launch(
                     self.config_path,
-                    None,
                     self.root / "sessions",
                     "sk-dummy-key",
                     2,

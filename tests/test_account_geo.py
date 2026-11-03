@@ -75,7 +75,7 @@ class TestGeoColumns(_DbCase):
             pass
         async with Database(path) as db:  # idempotent
             accounts = await db.list_accounts()
-        self.assertEqual([(a.name, a.proxy_url, a.expected_country, a.locale) for a in accounts], [("legacy", "h:1", None, None)])
+        self.assertEqual([(a.name, a.proxy_url, a.expected_country, a.locale) for a in accounts], [("legacy", "http://h:1", None, None)])  # moved into the proxy library
         check = sqlite3.connect(path)
         try:
             columns = {row[1] for row in check.execute("PRAGMA table_info(accounts)")}
@@ -134,7 +134,10 @@ class TestImportLineFormat(unittest.TestCase):
 
 
 class TestAuthenticateGuard(_DbCase):
-    async def _run(self, *, expected, exit_country, proxy="socks5://u:p@1.2.3.4:1080", auth_status=None, session_owner=None):
+    async def _run(
+        self, *, expected, exit_country, proxy="socks5://u:p@1.2.3.4:1080", auth_status=None, session_owner=None,
+        interactive=False, **kwargs
+    ):
         cfg = _cfg(self.root)
         session = self.root / "sessions" / "bob"
         session.mkdir(parents=True, exist_ok=True)
@@ -155,9 +158,10 @@ class TestAuthenticateGuard(_DbCase):
                  patch("youtube_bot.GoogleAuthenticator", authenticator), \
                  patch("youtube_bot._intro_warm_up", AsyncMock()), \
                  patch("modules.geo_guard.resolve_exit_country", resolve), \
+                 patch("youtube_bot._stdin_is_interactive", return_value=interactive), \
                  patch("youtube_bot.read_session_owner", return_value=session_owner), \
                  patch("youtube_bot.write_session_owner"):
-                result = await youtube_bot._authenticate_account(db, cfg, account)
+                result = await youtube_bot._authenticate_account(db, cfg, account, **kwargs)
             stored = await db.get_account("bob")
         return result, stored, runner_cls, authenticator, resolve
 
@@ -298,6 +302,7 @@ class TestInteractiveLoginGuard(_DbCase):
             await db.upsert_account("bob", str(self.root / "s"), proxy_url="socks5://u:p@1.2.3.4:1080", expected_country="PL")
         with patch("youtube_bot.load_config", return_value=cfg), \
              patch("youtube_bot.YouTubeRunner") as runner_cls, \
+             patch("youtube_bot._stdin_is_interactive", return_value=False), \
              patch("modules.geo_guard.resolve_exit_country", AsyncMock(return_value="US")):
             await youtube_bot.interactive_login("unused.yaml", account_name="bob")
         runner_cls.assert_not_called()

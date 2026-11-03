@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote
 
 import yaml
 
@@ -98,90 +98,22 @@ def mask_secret(secret: str | None, visible_start: int = 7, visible_end: int = 4
     return f"{s[:visible_start]}...{s[-visible_end:]}"
 
 
-def mask_proxy(proxy_str: str | None) -> str:
-    """Mask proxy credentials for safe console rendering (understands URL, user:pass@host:port and host:port:user:pass)."""
-    if not proxy_str:
-        return "Прямое соединение (без прокси)"
-    from config import mask_proxy_url
-
-    return mask_proxy_url(proxy_str)
+_proxy_tags: dict[int, str] = {}  # proxy id -> «[PL] 45.130.253.31:8000»; refreshed by load_accounts
 
 
-def normalize_proxy(user_input: str | None) -> str | None:
-    """
-    Parse and validate proxy URL entered by user.
-    Supports formats:
-      - '1.2.3.4:8080' -> 'http://1.2.3.4:8080'
-      - 'user:pass@1.2.3.4:8080' -> 'http://user:pass@1.2.3.4:8080'
-      - 'http://user:pass@1.2.3.4:8080'
-      - 'socks5://user:pass@1.2.3.4:1080'
-      - '' / 'none' / '0' / 'direct' -> None (direct connection)
-    """
-    if not user_input:
-        return None
-    val = user_input.strip()
-    if not val or val.lower() in {"none", "0", "direct", "off", "нет", "прямое"}:
-        return None
+def _account_proxy_text(acc: Any) -> str:
+    """Proxy cell of an account row: «[PL] 45.130.253.31:8000», «с вашего IP» or «🔒 прокси не читается»."""
+    if getattr(acc, "proxy_unavailable", False):
+        return "🔒 прокси не читается"
+    if not acc.proxy_url:
+        return "с вашего IP"
+    tag = _proxy_tags.get(getattr(acc, "proxy_id", None) or -1)
+    if tag:
+        return tag
+    from config import split_proxy
 
-    if "://" not in val:
-        val = f"http://{val}"
-
-    parsed = urlparse(val)
-    if parsed.scheme.lower() not in {"http", "https", "socks5", "socks5h"}:
-        raise ValueError(f"Неподдерживаемый протокол прокси: '{parsed.scheme}'. Используйте http:// или socks5://")
-    if not parsed.hostname:
-        raise ValueError("В адресе прокси не указан IP или домен сервера")
-    if not parsed.port or not (1 <= parsed.port <= 65535):
-        raise ValueError("В адресе прокси не указан или неверен порт (1-65535)")
-
-    return val
-
-
-def build_proxy_url(scheme: str, host_port: str, login: str = "", password: str = "") -> str:
-    """Assemble and validate a proxy URL from separately entered parts."""
-    auth = ""
-    if login:
-        auth = quote(login, safe="")
-        if password:
-            auth += ":" + quote(password, safe="")
-        auth += "@"
-    url = normalize_proxy(f"{scheme}://{auth}{host_port.strip()}")
-    if not url:
-        raise ValueError("Не указан адрес прокси")
-    return url
-
-
-def prompt_proxy_details() -> str | None:
-    """Ask for proxy parts one by one: IP:port, login, password, protocol. None = cancelled."""
-    safe_print(color(" Новый прокси · пустой ввод — отмена", CLR_DIM))
-
-    while True:
-        host_port = prompt_user(f"{color('1/4', CLR_CYAN)} IP:порт (45.130.253.31:8000)")
-        if not host_port:
-            return None
-        try:
-            build_proxy_url("http", host_port)
-            break
-        except ValueError as exc:
-            tui.status_line("err", str(exc))
-
-    login = prompt_user(f"{color('2/4', CLR_CYAN)} Логин (Enter — без авторизации)")
-    password = prompt_user(f"{color('3/4', CLR_CYAN)} Пароль (Enter — без пароля)") if login else ""
-
-    schemes = {"1": "http", "2": "https", "3": "socks5"}
-    kinds: list[MenuRow | None] = [("1", "HTTP", "", ""), ("2", "HTTPS", "", ""), ("3", "SOCKS5", "", "")]
-    while True:
-        kind, idx = arrow_menu(
-            lambda: kinds, [f" {color('4/4', CLR_CYAN)} Тип прокси"], esc_key="0",
-        )
-        kind = kind or kinds[idx][0]
-        if kind == "0":
-            return None
-        if kind in schemes:
-            break
-        tui.status_line("warn", "Выберите 1, 2 или 3")
-
-    return build_proxy_url(schemes[kind], host_port, login, password)
+    parts = split_proxy(acc.proxy_url)
+    return f"{parts.host}:{parts.port}"
 
 
 def format_target_mode_ru(mode: str) -> str:
@@ -194,37 +126,6 @@ def format_target_mode_ru(mode: str) -> str:
         "mixed": "Смешанный режим (главные + ответы) (mixed)",
     }
     return modes.get(str(mode).lower(), str(mode))
-
-
-def check_proxy_connectivity(proxy_url: str | None, timeout: float = 6.0) -> tuple[bool, str]:
-    """Test external network connectivity through given proxy."""
-    from curl_cffi import requests
-
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    tag = "Прокси" if proxy_url else "Прямое соединение"
-
-    try:
-        resp = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=timeout)
-        if resp.status_code == 200:
-            ip = resp.json().get("ip", "неизвестно")
-            return True, f"{tag} работает! Внешний IP: {ip}"
-    except Exception:
-        pass
-
-    try:
-        resp = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=timeout)
-        if resp.status_code == 200:
-            ip = resp.json().get("origin", "неизвестно")
-            return True, f"{tag} работает! Внешний IP: {ip}"
-    except Exception as exc:
-        err_msg = str(exc)
-        if "Failed to connect" in err_msg or "Connection refused" in err_msg:
-            return False, "Не удалось подключиться к прокси (сервер недоступен)"
-        if "timed out" in err_msg.lower():
-            return False, "Таймаут соединения (прокси отвечает слишком медленно)"
-        return False, f"Ошибка соединения: {err_msg[:60]}"
-
-    return False, "Не удалось проверить сетевое соединение"
 
 
 def check_youtube_session(session_root: Path) -> tuple[bool, str]:
@@ -432,121 +333,27 @@ def _setup_index(rows: list[MenuRow | None], key: str) -> int:
 
 
 def step_proxy(config_path: Path) -> None:
-    """Stage 2 «Прокси»: attach a proxy to each account from stage 1. «0»/Esc raises WizardBack."""
-    rows: list[MenuRow | None] = [
-        ("2", "Назначить прокси", "аккаунт → IP:порт → логин → пароль → тип", CLR_DIM),
-        ("3", "Убрать прокси", "аккаунт пойдёт напрямую", CLR_DIM),
-        ("4", "Проверить связь", "внешний IP через прокси аккаунта", CLR_DIM),
-        None,
-        ("1", "Продолжить →", "", ""),
-        ("0", "← Назад", "", ""),
-    ]
+    """Stage 2 «Прокси»: the proxy library (`modules.proxy_screen`). «0»/Esc raises WizardBack."""
+    from modules.proxy_screen import run_proxy_stage
 
-    selected: int | None = None
-    notice: tuple[str, str] | None = None
-    redraw = True
-    while True:
-        if redraw:
-            accounts = _setup_accounts(config_path)
-            _setup_screen(2, "Прокси", "у каждого аккаунта свой", [])
-            _setup_proxy_table(accounts)
-            if notice:
-                safe_print()
-                tui.status_line(*notice)
-            if selected is None:
-                missing = any(not acc.proxy_url for acc, _ in accounts)
-                selected = _setup_index(rows, "2" if missing else "1")
-            redraw, notice = False, None
-
-        choice, selected = _setup_menu(lambda: rows, selected)
-
-        if choice == "1":
-            return
-        if choice == "0":
-            raise WizardBack()
-
-        if choice in {"2", "3", "4"}:
-            if not accounts:
-                notice, redraw = ("warn", "Аккаунтов нет — сначала добавьте их на этапе «Аккаунты»"), True
-                continue
-            question = {"2": "Какому аккаунту назначить прокси?", "3": "У какого аккаунта убрать прокси?"}.get(
-                choice, "Чей прокси проверить?",
-            )
-            acc = accounts[0][0] if len(accounts) == 1 else _setup_pick_account(accounts, question)
-            if acc is None:
-                continue
-
-            if choice == "3":
-                _save_account(config_path, acc.name, acc.session_path, None, is_active=acc.is_active)
-                notice = ("ok", f"«{acc.name}»: прокси убран, прямое соединение")
-            elif choice == "4":
-                tui.status_line("info", f"Проверяем соединение «{acc.name}»…")
-                ok, msg = check_proxy_connectivity(acc.proxy_url)
-                notice = ("ok" if ok else "err", msg)
-            else:
-                notice = _setup_assign_proxy(config_path, acc)
-            redraw = True
-            continue
-
-        tui.status_line("warn", f"Неизвестная команда: {choice}")
-
-
-def _setup_assign_proxy(config_path: Path, acc: Any) -> tuple[str, str] | None:
-    """Ask the proxy parts for one account, test it and save; returns the notice (None = cancelled)."""
-    try:
-        norm = prompt_proxy_details()
-    except ValueError as exc:
-        return "err", f"Ошибка формата: {exc}"
-    except WizardBack:
-        return None
-    if not norm:
-        return None
-
-    tui.status_line("info", "Проверяем прокси…")
-    ok, msg = check_proxy_connectivity(norm)
-    tui.status_line("ok" if ok else "err", msg)
-    if not ok:
-        safe_print(color(" Проверьте логин/пароль и тип прокси (HTTP / SOCKS5)", CLR_DIM))
-        try:
-            if not _yes(prompt_user("Сохранить всё равно? (y/N)", "n")):
-                return None
-        except WizardBack:
-            return None
-    _save_account(config_path, acc.name, acc.session_path, norm, is_active=acc.is_active)
-    return "ok", f"«{acc.name}»: прокси сохранён"
-
-
-def _setup_proxy_table(accounts: list[tuple[Any, bool]]) -> None:
-    """Counter «прокси у N из M», then Аккаунт / Прокси per account (first 8, then «… ещё K»)."""
-    if not accounts:
-        tui.kv_table([("Аккаунтов", "пока нет — добавьте на этапе «Аккаунты»", "warn")])
-        return
-    with_proxy = sum(1 for acc, _ in accounts if acc.proxy_url)
-    tui.kv_table([("Прокси", f"у {with_proxy} из {len(accounts)} аккаунтов", "" if with_proxy else "warn")])
-    shown = accounts[:_SETUP_MAX_ACCOUNTS]
-    name_w = min(24, max(len("Аккаунт"), *(len(acc.name) for acc, _ in shown)))
-    proxy_w = MENU_WIDTH - 3 - name_w - 2
-    safe_print()
-    safe_print(color(f"   {'Аккаунт':<{name_w}}  Прокси", CLR_DIM))
-    for acc, _ in shown:
-        name = color(f"{_fit(acc.name, name_w):<{name_w}}", CLR_BOLD)
-        if acc.proxy_url:
-            proxy = _fit(mask_proxy(acc.proxy_url), proxy_w)
-        else:
-            proxy = color("без прокси", CLR_YELLOW)
-        safe_print(f"   {name}  {proxy}")
-    if len(accounts) > _SETUP_MAX_ACCOUNTS:
-        safe_print(color(f"   … ещё {len(accounts) - _SETUP_MAX_ACCOUNTS}", CLR_DIM))
+    run_proxy_stage(config_path)
 
 
 def _setup_account_rows(accounts: list[tuple[Any, bool]]) -> list[MenuRow | None]:
-    """One selectable row per account (key A1, A2, …): name, login state and proxy."""
-    proxy_w = MENU_WIDTH - 3 - 24 - 2 - 11 - 2
+    """One selectable row per account (key A1, A2, …): name, login state, proxy, stage/mode."""
+    from modules.account_menu_logic import account_status_label
+
+    name_w, status_w = 15, 15  # the proxy keeps 20 characters: «[PL] 255.255.255.255»
+    proxy_w = MENU_WIDTH - 3 - name_w - 2 - 11 - 2 - status_w - 2  # the status is the last column, after the proxy
     rows: list[MenuRow | None] = []
     for i, (acc, ok) in enumerate(accounts, 1):
-        proxy = _fit(mask_proxy(acc.proxy_url) if acc.proxy_url else "без прокси", proxy_w)
+        proxy = _account_proxy_text(acc)
+        if len(proxy) > proxy_w and proxy.rpartition(":")[2].isdigit():  # no room: the port goes, stage 2 shows it
+            proxy = proxy.rpartition(":")[0]
+        proxy = _fit(proxy, proxy_w)
         state = "● вошёл" if ok else "○ нет входа"
-        rows.append((f"A{i}", _fit(acc.name, 24), f"{state:<11}  {proxy}", CLR_GREEN if ok else CLR_YELLOW))
+        status = _fit(account_status_label(acc)[0], status_w)
+        rows.append((f"A{i}", _fit(acc.name, name_w), f"{state:<11}  {proxy:<{proxy_w}}  {status}", CLR_GREEN if ok else CLR_YELLOW))
     return rows
 
 
@@ -560,7 +367,8 @@ def step_account(config_path: Path, session_root: Path) -> bool:
         ("1", "Войти в аккаунт", "новый или уже добавленный", CLR_DIM),
         ("5", "Импорт аккаунтов", "файл или вставка строк", CLR_DIM),
         ("6", "Прогрев", "карантин и aging одним кликом", CLR_DIM),
-        ("8", "Жизненный цикл", "стадии, квоты, heartbeat", CLR_DIM),
+        ("7", "Режим для группы", "галочки: режим, в работе, автопрогрев", CLR_DIM),
+        ("8", "Жизненный цикл", "стадии, квоты, режимы", CLR_DIM),
         ("9", "Профиль канала", "аватарка, описание, никнейм", CLR_DIM),
         None,
         ("4", "Продолжить →", "", ""),
@@ -610,6 +418,11 @@ def step_account(config_path: Path, session_root: Path) -> bool:
             notice, redraw = _setup_warmup_all(config_path), True
             continue
 
+        if choice == "7":
+            notice = _setup_bulk_settings(config_path, accounts) if accounts else ("warn", "Аккаунтов нет")
+            redraw = True
+            continue
+
         if choice == "8":
             _setup_lifecycle(config_path)
             redraw = True
@@ -643,20 +456,22 @@ def step_account(config_path: Path, session_root: Path) -> bool:
 def _setup_account_actions(
     config_path: Path, session_root: Path, accounts: list[tuple[Any, bool]], entry: tuple[Any, bool],
 ) -> tuple[str, str] | None:
-    """Actions of one account: sign in automatically, check login, rename, log out.
+    """Actions of one account: sign in automatically, check login, rename, log out, and its work settings.
 
-    Returns the notice to show (None = nothing happened).
+    A card on top shows the stage, age, today's limit, next comment, last warm-up, mode and auto warm-up. The settings
+    rows (в работе / режим / автопрогрев / прогреть сейчас / снять ограничение) change the account and show the menu
+    again with a fresh card; the other rows act once. Returns the notice to show (None = nothing happened).
     """
+    notice: tuple[str, str] | None = None
     acc = entry[0]
-    rows: list[MenuRow | None] = [
-        ("4", "Войти автоматически", "по почте и паролю аккаунта", CLR_DIM),
-        ("1", "Проверить вход", "", ""),
-        ("2", "Переименовать", "имя для вас: ник или почта", CLR_DIM),
-        ("3", "Выйти из аккаунта", "удалить сохранённую сессию", CLR_DIM),
-        None,
-        ("0", "← Назад", "", ""),
-    ]
-    choice, _ = arrow_menu(lambda: rows, [f" {color(acc.name, CLR_BOLD)}"], esc_key="0")
+    while True:
+        choice = _setup_account_menu(acc, notice)
+        if choice not in _ACCOUNT_SETTING_KEYS:
+            break
+        notice = _setup_account_setting(config_path, acc, choice)
+        fresh = _pools_db(config_path, lambda db: db.get_account(acc.id))
+        acc = fresh or acc
+        clear_terminal()
     if choice == "4":
         return _setup_auto_login(config_path, acc)
     if choice == "1":
@@ -672,7 +487,176 @@ def _setup_account_actions(
             return None
         ok, msg = _setup_clear_session(session_root, acc)
         return ("ok" if ok else "err", msg)
+    return notice
+
+
+_ACCOUNT_SETTING_KEYS = ("5", "6", "7", "8", "9")
+
+
+def _setup_account_menu(acc: Any, notice: tuple[str, str] | None = None) -> str:
+    """Card + menu of one account; returns the chosen key («0»/Esc = back)."""
+    from modules.account_menu_logic import account_card_rows
+    from modules.lifecycle_engine import CIRCUIT_BREAKER_ERRORS, MODE_LABELS, AccountLifecycleEngine
+
+    tui.section_header(acc.name, "аккаунт")
+    tui.kv_table(account_card_rows(acc))
+    if notice:
+        safe_print()
+        tui.status_line(*notice)
+    rows: list[MenuRow | None] = [
+        ("4", "Войти автоматически", "по почте и паролю аккаунта", CLR_DIM),
+        ("1", "Проверить вход", "", ""),
+        ("2", "Переименовать", "имя для вас: ник или почта", CLR_DIM),
+        ("3", "Выйти из аккаунта", "удалить сохранённую сессию", CLR_DIM),
+        None,
+        ("5", f"В работе: {'да' if acc.is_active else 'нет'}", "переключить; выключенный не берётся в рассылку", CLR_DIM),
+        ("6", f"Режим: {MODE_LABELS[AccountLifecycleEngine.mode_of(acc)]}", "по возрасту / уже прогрет / без лимитов", CLR_DIM),
+        ("7", f"Автопрогрев: {'вкл' if acc.auto_warmup else 'выкл'}", "фоновый прогрев во время рассылки", CLR_DIM),
+        ("8", "Прогреть сейчас", "ручной прогрев, откроется браузер", CLR_DIM),
+    ]
+    if acc.consecutive_errors >= CIRCUIT_BREAKER_ERRORS:
+        rows.append(("9", "Снять ограничение", f"{acc.consecutive_errors} ошибок подряд — сбросить", CLR_YELLOW))
+    rows += [None, ("0", "← Назад", "", "")]
+    choice, _ = arrow_menu(lambda: rows, [""], esc_key="0")
+    return choice
+
+
+def _setup_pick_mode(current: str | None = None, question: str = "Режим возраста") -> str | None:
+    """Arrow picker of the age mode; the key of the mode (auto / mature / unlimited), None = cancelled."""
+    from modules.lifecycle_engine import MODE_LABELS
+
+    hints = {
+        "auto": "карантин 24 ч, aging 24-48 ч, дальше лимиты растут",
+        "mature": "купленный или старый аккаунт: сразу 5 в сутки, пауза 45-90 мин",
+        "unlimited": "без стадий, лимита и пауз; остаётся защита от 3 ошибок подряд",
+    }
+    keys = {"1": "auto", "2": "mature", "3": "unlimited"}
+    rows: list[MenuRow | None] = [
+        (key, f"{MODE_LABELS[mode]}{' ✓' if mode == current else ''}", hints[mode], CLR_DIM) for key, mode in keys.items()
+    ]
+    rows += [None, ("0", "← Отмена", "", "")]
+    choice = _pools_choice(rows, [color(f" {question}", CLR_BOLD)])
+    return keys.get(choice)
+
+
+def _setup_apply_settings(config_path: Path, accounts: list[Any], **changes: Any) -> int:
+    """Save mode / auto warm-up / in-work for `accounts`; returns how many were changed."""
+    from youtube_bot import apply_account_settings
+
+    return _pools_db(config_path, lambda db: apply_account_settings(db, accounts, **changes))
+
+
+def _setup_account_setting(config_path: Path, acc: Any, key: str) -> tuple[str, str] | None:
+    """One settings row of the account menu; returns the notice."""
+    from modules.lifecycle_engine import MODE_LABELS
+
+    try:
+        if key == "5":
+            _setup_apply_settings(config_path, [acc], is_active=not acc.is_active)
+            return "ok", f"«{acc.name}»: " + ("выключен — не берётся в рассылку и не прогревается" if acc.is_active else "в работе")
+        if key == "6":
+            from modules.lifecycle_engine import AccountLifecycleEngine
+
+            mode = _setup_pick_mode(AccountLifecycleEngine.mode_of(acc))
+            if mode is None:
+                return None
+            _setup_apply_settings(config_path, [acc], lifecycle_mode=mode)
+            return "ok", f"«{acc.name}»: режим «{MODE_LABELS[mode]}»"
+        if key == "7":
+            _setup_apply_settings(config_path, [acc], auto_warmup=not acc.auto_warmup)
+            return "ok", f"«{acc.name}»: автопрогрев " + ("выключен" if acc.auto_warmup else "включён")
+        if key == "8":
+            return _setup_warm_now(config_path, acc)
+        if key == "9":
+            if not _yes(prompt_user(f"Снять ограничение с «{acc.name}»? Счётчик ошибок обнулится (y/N)", "n")):
+                return None
+            from modules.lifecycle_engine import release_restriction
+
+            _pools_db(config_path, lambda db: release_restriction(db, acc))
+            return "ok", f"«{acc.name}»: ограничение снято"
+    except WizardBack:
+        return None
+    except Exception as exc:
+        return "err", f"«{acc.name}»: не удалось ({exc.__class__.__name__}), подробности в логе"
     return None
+
+
+def _confirm_country_mismatch(message: str) -> bool:
+    """Question before a sign-in whose proxy exit country differs from the expected one; the cursor starts on «Отменить»."""
+    picks: list[MenuRow | None] = [
+        ("1", "Отменить вход", "безопасный вариант", CLR_DIM),
+        ("2", "Продолжить вход", "на ваш риск", CLR_DIM),
+    ]
+    header = [f" {color(line, CLR_YELLOW)}" for line in message.splitlines()]
+    try:
+        pick, _ = arrow_menu(lambda: picks, header, 0, esc_key="0")
+    except WizardBack:
+        return False
+    return pick == "2"
+
+
+async def _confirm_country_mismatch_async(message: str) -> bool:
+    """The wizard signs in inside `asyncio.run`: the blocking menu runs in a thread so the event loop stays free."""
+    return await asyncio.to_thread(_confirm_country_mismatch, message)
+
+
+def _setup_warm_now(config_path: Path, acc: Any) -> tuple[str, str] | None:
+    """«Прогреть сейчас»: a manual warm-up of this one account (works in every mode, also when auto warm-up is off)."""
+    from youtube_bot import warm_up_cli
+
+    if not _yes(prompt_user(f"Прогреть «{acc.name}» (~{WARM_UP_SECONDS:.0f} с, откроется браузер)? (y/N)", "n")):
+        return None
+    try:
+        ok = asyncio.run(warm_up_cli(acc.name, str(config_path), duration=WARM_UP_SECONDS))
+    except KeyboardInterrupt:
+        return "warn", "Прогрев прерван"
+    return ("ok", f"«{acc.name}»: прогрев выполнен") if ok else ("err", f"«{acc.name}»: прогрев не удался, подробности в логе")
+
+
+def _setup_check_accounts(accounts: list[tuple[Any, bool]], question: str) -> list[Any]:
+    """Checkbox list of accounts (the shared `tui.checklist`); the ticked accounts, [] = cancelled or none ticked."""
+    from modules.account_menu_logic import account_status_label
+
+    items = [(_fit(acc.name, 22), account_status_label(acc)[0], "dim") for acc, _ in accounts]
+    header = [color(f" {question}", CLR_BOLD), color(" Enter/Пробел — отметить · Esc — отмена", CLR_DIM), ""]
+    picked = tui.checklist(items, (), header, save_label="Готово", interactive=_use_arrow_keys(), ask_fn=prompt_user)
+    return [accounts[i][0] for i in sorted(picked or ())]
+
+
+def _setup_bulk_settings(config_path: Path, accounts: list[tuple[Any, bool]]) -> tuple[str, str] | None:
+    """«Режим для нескольких»: tick accounts, then set their mode, in-work flag or auto warm-up in one go."""
+    from modules.lifecycle_engine import MODE_LABELS
+
+    picked = _setup_check_accounts(accounts, "Для каких аккаунтов (Enter — галочка)")
+    if not picked:
+        return None
+    rows: list[MenuRow | None] = [
+        ("1", "Режим…", "по возрасту / уже прогрет / без лимитов", CLR_DIM),
+        ("2", "В работе: да", "вернуть в рассылку", CLR_DIM),
+        ("3", "В работе: нет", "не брать в рассылку и не прогревать", CLR_DIM),
+        ("4", "Автопрогрев: вкл", "", CLR_DIM),
+        ("5", "Автопрогрев: выкл", "", CLR_DIM),
+        None,
+        ("0", "← Отмена", "", ""),
+    ]
+    choice = _pools_choice(rows, [color(f" Что поставить: аккаунтов {len(picked)}", CLR_BOLD)])
+    changes: dict[str, Any]
+    if choice == "1":
+        mode = _setup_pick_mode()
+        if mode is None:
+            return None
+        changes, what = {"lifecycle_mode": mode}, f"режим «{MODE_LABELS[mode]}»"
+    elif choice in ("2", "3"):
+        changes, what = {"is_active": choice == "2"}, "в работе: " + ("да" if choice == "2" else "нет")
+    elif choice in ("4", "5"):
+        changes, what = {"auto_warmup": choice == "4"}, "автопрогрев " + ("вкл" if choice == "4" else "выкл")
+    else:
+        return None
+    try:
+        count = _setup_apply_settings(config_path, picked, **changes)
+    except Exception as exc:
+        return "err", f"Не удалось сохранить ({exc.__class__.__name__}), подробности в логе"
+    return "ok", f"{what}: {count} из {len(picked)} акк."
 
 
 def _setup_auto_login(config_path: Path, acc: Any) -> tuple[str, str] | None:
@@ -699,7 +683,9 @@ def _setup_auto_login(config_path: Path, acc: Any) -> tuple[str, str] | None:
             return "err", f"Строка не принята: {exc}"
     tui.status_line("info", f"Автоматический вход «{acc.name}»…")
     try:
-        ok = asyncio.run(auth_account_cli(acc.name, str(config_path)))
+        ok = asyncio.run(
+            auth_account_cli(acc.name, str(config_path), confirm_country=_confirm_country_mismatch_async)
+        )
     except Exception as exc:
         return "err", f"«{acc.name}»: вход не удался ({exc.__class__.__name__}), подробности в логе"
     return ("ok", f"«{acc.name}»: вход выполнен") if ok else ("err", f"«{acc.name}»: вход не удался, подробности в логе")
@@ -781,10 +767,9 @@ def _setup_rename_in_config(config_path: Path, acc: Any, new_name: str) -> None:
                 item["name"] = new_name
                 found = True
     if not found:
-        target.append({
+        target.append({  # no proxy here: it lives in the encrypted proxy library
             "name": new_name,
             "session_path": str(acc.session_path),
-            "proxy_url": acc.proxy_url,
             "is_active": bool(acc.is_active),
         })
     config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
@@ -819,7 +804,7 @@ def _read_secret_line(prompt: str) -> str:
 
 def _read_account_paste() -> list[str]:
     """Pasted `login:password:TOTP_SECRET` lines, one per account, until an empty line."""
-    safe_print(color(" Вставьте по строке на аккаунт: почта, пароль, дальше по желанию TOTP, резервная почта, прокси.", CLR_DIM))
+    safe_print(color(" Вставьте по строке на аккаунт: почта, пароль, дальше по желанию TOTP, резервная почта, прокси, mode=mature|unlimited.", CLR_DIM))
     safe_print(color(" Разделитель — пробел, табуляция или двоеточие. Пустая строка — конец.", CLR_DIM))
     lines: list[str] = []
     while True:
@@ -855,13 +840,19 @@ def _read_accounts_file() -> list[str] | None:
         return None
 
 
-def _setup_register(config_path: Path, lines: list[str]) -> Any:
-    """Register the account lines through the CLI importer (existing accounts are skipped, not overwritten)."""
+def _setup_register(config_path: Path, lines: list[str], default_mode: str | None = None) -> Any:
+    """Register the account lines through the CLI importer (existing accounts are skipped, not overwritten).
+
+    `default_mode` is the age mode of the lines that have no `mode=` of their own.
+    """
     from config import load_config
     from youtube_bot import register_account_lines
 
     cfg = load_config(config_path)
-    return _pools_db(config_path, lambda db: register_account_lines(db, cfg, lines, skip_existing=True))
+    return _pools_db(
+        config_path,
+        lambda db: register_account_lines(db, cfg, lines, skip_existing=True, default_mode=default_mode),
+    )
 
 
 def _setup_profile(config_path: Path, accounts: list[tuple[Any, bool]]) -> tuple[str, str] | None:
@@ -1069,8 +1060,11 @@ def _setup_import(config_path: Path) -> tuple[str, str] | None:
         _pause()
         return None
 
+    mode = _setup_pick_mode("auto", "Эти аккаунты уже прогреты? (mode= в строке важнее)")
+    if mode is None:
+        return "info", "Импорт отменён"
     try:
-        result = _setup_register(config_path, lines)
+        result = _setup_register(config_path, lines, mode)
     except KeyboardInterrupt:
         return "warn", "Импорт прерван — часть аккаунтов могла добавиться, проверьте список"
     except Exception as exc:  # a broken DB or config: the lines are not in the message
@@ -1166,9 +1160,14 @@ def _setup_lifecycle(config_path: Path) -> None:
             f"   {cell(row.name, name_w, '')}  {cell(row.stage, stage_w, row.stage_style)}  {cell(row.quota, quota_w)}"
             f"  {cell(row.heartbeat, beat_w, row.heartbeat_style)}  {cell(row.pause, pause_w, row.pause_style)}".rstrip()
         )
+        in_work = color(row.in_work, styles.get(row.in_work_style, ""))
+        warm = color(row.auto_warmup, styles.get(row.auto_warmup_style, ""))
+        safe_print(color("     ↳ режим: ", CLR_DIM) + f"{row.mode}" + color(" · в работе: ", CLR_DIM) + in_work
+                   + color(" · автопрогрев: ", CLR_DIM) + warm)
     if len(rows) > len(shown):
         safe_print(color(f"   … ещё {len(rows) - len(shown)}", CLR_DIM))
     safe_print(color("   Квота — комментарии за сутки / лимит стадии. Heartbeat: сессия · последний прогрев.", CLR_DIM))
+    safe_print(color("   Режим, «в работе» и автопрогрев меняются в меню аккаунта (Enter на строке).", CLR_DIM))
     _pause()
 
 
@@ -1569,38 +1568,72 @@ def _target_pool_info(db_path: Any) -> tuple[int, str | None]:
     return int(count), (row[0] if row else None)
 
 
-def _accounts_proxy_counts(db_path: Any) -> tuple[int, int]:
-    """(accounts with a proxy, all accounts); read-only sqlite3 for the same reason as the pending count."""
+def _read_only_db(db_path: Any) -> sqlite3.Connection:
+    uri = f"file:{quote(Path(db_path).as_posix(), safe='/:')}?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=2.0)
+
+
+def _proxy_counts(db_path: Any) -> tuple[int, int, int]:
+    """(proxies in the library, accounts with a proxy, all accounts); read-only sqlite3 for the same reason as the
+    pending count. An account counts when it points into the proxy library (`proxy_id`)."""
     try:
-        uri = f"file:{quote(Path(db_path).as_posix(), safe='/:')}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        conn = _read_only_db(db_path)
         try:
             total, with_proxy = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(proxy_url IS NOT NULL AND proxy_url <> ''), 0) FROM accounts"
+                "SELECT COUNT(*), COALESCE(SUM(proxy_id IS NOT NULL), 0) FROM accounts"
             ).fetchone()
+            proxies = conn.execute("SELECT COUNT(*) FROM proxies").fetchone()[0]
         finally:
             conn.close()
     except sqlite3.Error:
-        return 0, 0
-    return int(with_proxy), int(total)
+        return 0, 0, 0
+    return int(proxies), int(with_proxy), int(total)
 
 
-def _proxy_summary(cfg: Any, fallback: str | None = None) -> str:
-    """Short proxy state for the dashboard: per-account proxies; the global one only while no account exists."""
-    with_proxy, total = _accounts_proxy_counts(cfg.app.db_path)
-    if total == 0:
-        return "через прокси" if (fallback or cfg.browser.proxy) else "без прокси"
-    if with_proxy == 0:
-        return "без прокси"
-    if total == 1 or with_proxy == total:
-        return "через прокси" if total == 1 else f"прокси у всех ({total})"
-    return f"прокси: {with_proxy} из {total}"
+def _proxy_summary(cfg: Any) -> tuple[str, str]:
+    """«3 прокси · у 5 из 6 акк.» and its style: yellow while any account posts from the user's own IP."""
+    proxies, with_proxy, total = _proxy_counts(cfg.app.db_path)
+    if not proxies:
+        return ("нет прокси · все с вашего IP", "warn") if total else ("нет прокси", "warn")
+    text = f"{proxies} прокси · у {with_proxy} из {total} акк." if total else f"{proxies} прокси · аккаунтов нет"
+    return text, "warn" if with_proxy < total else ""
 
 
-def _proxy_row(cfg: Any, fallback: str | None = None) -> tuple[str, str, str]:
-    """Summary row «Прокси»: yellow while any account goes without a proxy."""
-    text = _proxy_summary(cfg, fallback)
-    return "Прокси", text, "warn" if text == "без прокси" or text.startswith("прокси:") else ""
+def _search_summary(cfg: Any) -> tuple[str, str]:
+    """Where the video search goes out: «через [PL] 45.130.253.31:8000» or «⚠ с вашего IP» (yellow)."""
+    try:
+        conn = _read_only_db(cfg.app.db_path)
+        try:
+            row = conn.execute("SELECT value FROM app_settings WHERE key = 'search_proxy_id'").fetchone()
+            proxy = None
+            if row and str(row[0]).isdigit():
+                proxy = conn.execute(
+                    "SELECT host, port, COALESCE(country, last_exit_country) FROM proxies WHERE id = ?", (int(row[0]),)
+                ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return "⚠ с вашего IP", "warn"
+    if not row:
+        return "⚠ с вашего IP", "warn"
+    if proxy is None:
+        return "⚠ прокси поиска удалён", "warn"
+    host = f"[{proxy[0]}]" if ":" in proxy[0] else proxy[0]
+    return f"через [{proxy[2] or '??'}] {host}:{proxy[1]}", ""
+
+
+def _route_rows(config_path: Path) -> list[tuple[str, str, str]]:
+    """«Поиск» and «Публикация» rows of the launch summary: who goes out from the user's own IP."""
+    from modules.proxy_library import describe_proxy_routes, summarize_routes
+
+    try:
+        summary = summarize_routes(_pools_db(config_path, lambda db: describe_proxy_routes(db, active_only=True)))
+    except Exception as exc:
+        return [("Прокси", f"не прочитаны ({exc.__class__.__name__})", "err")]
+    return [
+        ("Поиск", summary.search, "warn" if summary.search_warn else ""),
+        ("Публикация", summary.accounts, "warn" if summary.accounts_warn else ""),
+    ]
 
 
 def _logged_in_names(cfg: Any) -> list[str]:
@@ -1767,7 +1800,6 @@ def _target_preview(config_path: Path, limit: int) -> None:
 
 def step_launch(
     config_path: Path,
-    proxy_val: str | None,
     session_root: Path,
     api_key: str,
     limit: int,
@@ -1808,7 +1840,7 @@ def step_launch(
             _target_pool_text(count, limit) if kind == "pool" else _TARGET_NONE
         )
         tui.kv_table([
-            _proxy_row(cfg, proxy_val),
+            *_route_rows(config_path),
             ("YouTube", f"● вошёл: {_fit(', '.join(names), 40)}" if names else "● вошёл" if logged_in else "○ нет входа",
              "ok" if logged_in else "warn"),
             ("Ответы", *reply),
@@ -2108,6 +2140,9 @@ def load_accounts(config_path: Path) -> list[Any]:
                         is_active=acc.is_active,
                     )
                 accounts = await db.list_accounts()
+            _proxy_tags.clear()
+            for record in await db.list_proxies():
+                _proxy_tags[record.id] = f"[{record.country or record.last_exit_country or '??'}] {record.address}"
             return accounts
         finally:
             await db.close()
@@ -2128,17 +2163,22 @@ def list_accounts_wizard(config_path: Path) -> list[dict[str, Any]]:
         is_logged, _ = check_youtube_session(Path(acc.session_path))
         name = color(f"{_fit(acc.name, 18):<18}", "" if acc.is_active else CLR_DIM)
         login = color(f"{'● да' if is_logged else '○ нет':<6}", CLR_DIM if is_logged else CLR_YELLOW)
-        proxy = _fit(mask_proxy(acc.proxy_url) if acc.proxy_url else "без прокси", 22)
+        proxy = _fit(_account_proxy_text(acc), 22)
         safe_print(f" {idx:<2} {name} {login} {acc.total_replies:>7}  {proxy}")
         results.append({"account": acc, "is_logged_in": is_logged})
     safe_print(color(f" Всего: {len(accounts)} · активных: {sum(1 for a in accounts if a.is_active)}", CLR_DIM))
     return results
 
 
+KEEP_PROXY: Any = object()  # `_save_account` leaves the stored proxy untouched (a new account starts without one)
+
+
 def _save_account(
-    config_path: Path, name: str, session_path: str, norm_proxy: str | None, is_active: bool = True,
+    config_path: Path, name: str, session_path: str, norm_proxy: str | None | Any, is_active: bool = True,
 ) -> None:
-    """Upsert an account into the DB and mirror it into config.yaml."""
+    """Upsert an account into the DB and mirror it into config.yaml. The proxy goes only to the DB (the encrypted
+    proxy library): the yaml entry never holds a proxy, an old `proxy_url` key there is dropped. `norm_proxy`
+    None removes the proxy, KEEP_PROXY keeps it."""
     from config import load_config
     from database import Database
 
@@ -2149,12 +2189,8 @@ def _save_account(
         await db.connect()
         await db.init_schema()
         try:
-            return await db.upsert_account(
-                name=name,
-                session_path=session_path,
-                proxy_url=norm_proxy,
-                is_active=is_active,
-            )
+            proxy_arg = {} if norm_proxy is KEEP_PROXY else {"proxy_url": norm_proxy}
+            return await db.upsert_account(name=name, session_path=session_path, is_active=is_active, **proxy_arg)
         finally:
             await db.close()
 
@@ -2168,13 +2204,12 @@ def _save_account(
         existing = next((a for a in accounts_list if isinstance(a, dict) and a.get("name") == name), None)
         if existing:
             existing["session_path"] = session_path
-            existing["proxy_url"] = norm_proxy
+            existing.pop("proxy_url", None)
             existing["is_active"] = is_active
         else:
             accounts_list.append({
                 "name": name,
                 "session_path": session_path,
-                "proxy_url": norm_proxy,
                 "is_active": is_active,
             })
         with open(config_path, "w", encoding="utf-8") as f:
@@ -2347,7 +2382,7 @@ def add_account_stepwise(config_path: Path) -> bool:
         tui.status_line("warn", f"«{name}» уже есть — его настройки будут обновлены")
 
     session_path = str(existing.session_path) if existing else f"test_sessions/{name}"
-    _save_account(config_path, name, session_path, existing.proxy_url if existing else None)
+    _save_account(config_path, name, session_path, KEEP_PROXY)  # an existing account keeps its proxy as it is
     tui.status_line("ok", f"Аккаунт «{name}» сохранён")
 
     if _pools_yes(f"{step(2)} Войти в аккаунт в браузере сейчас?"):
@@ -2485,7 +2520,7 @@ def run_step_by_step_wizard(config_path: Path) -> None:
                 elif stage == 4:
                     step_video(config_path, limit)
                 else:
-                    step_launch(config_path, cfg.browser.proxy, cfg.browser.session_root, cfg.deepseek.api_key, limit)
+                    step_launch(config_path, cfg.browser.session_root, cfg.deepseek.api_key, limit)
             except WizardBack:
                 stage -= 1
                 continue
@@ -2560,15 +2595,18 @@ def _dashboard_rows(config_path: Path, live: bool = False) -> list[MenuRow | Non
 
     account = " · ".join([
         "● вошёл" if is_logged_in else "○ нет входа",
-        _proxy_summary(cfg),
         "без окна" if getattr(cfg.browser, "headless", False) else "с окном",
     ])
+    proxies, proxy_style = _proxy_summary(cfg)
+    search, search_style = _search_summary(cfg)
+    proxy_warn = bool(proxy_style or search_style)
 
     return [
         ("L", "Запуск", "БОЕВОЙ  ←→" if live else "пробный  ←→", CLR_BOLD + CLR_RED if live else CLR_DIM),
         ("4", "Цель", target, CLR_YELLOW if kind == "none" else CLR_DIM),
         ("3", "Ответы", *reply),
         ("U", "Аккаунт", account, CLR_DIM if is_logged_in else CLR_YELLOW),
+        ("2", "Прокси", f"{proxies} · поиск {search}", CLR_YELLOW if proxy_warn else CLR_DIM),
         ("H", "История", "журнал и статистика", CLR_DIM),
         ("E", "Ещё…", "предпросмотр, мастер с нуля", CLR_DIM),
     ]
@@ -2603,6 +2641,7 @@ def _preview_comments(config_path: Path) -> None:
 
     cfg = load_config(config_path)
     tui.section_header("Предпросмотр", "ответы под комментариями")
+    tui.kv_table(_route_rows(config_path))
     _target_preview(config_path, cfg.limits.max_iterations_per_session or 2)
 
 
@@ -2682,9 +2721,12 @@ def account_menu(config_path: Path) -> None:
         login = f"вошли: {logged}" if logged else "○ нет входа"
         window = "без окна" if getattr(cfg.browser, "headless", False) else "с окном"
         threads = _threads_summary(cfg)
+        proxies, proxy_style = _proxy_summary(cfg)
+        search, search_style = _search_summary(cfg)
         return [
             ("1", "Аккаунты", f"{len(accounts)} · {login}" if accounts else "пока нет", CLR_DIM if logged else CLR_YELLOW),
-            ("2", "Прокси", _proxy_summary(cfg), CLR_DIM),
+            ("2", "Прокси", proxies, CLR_YELLOW if proxy_style else CLR_DIM),
+            ("S", "Поиск", search, CLR_YELLOW if search_style else CLR_DIM),
             *([("P", "Потоки", threads, CLR_DIM)] if threads else []),
             ("B", "Окно браузера", f"{window} · Enter — переключить", CLR_DIM),
             None,
@@ -2695,7 +2737,7 @@ def account_menu(config_path: Path) -> None:
     while True:
         accounts = _setup_accounts(config_path)
         clear_terminal()
-        tui.section_header("Аккаунт", "аккаунты · прокси · потоки · окно браузера")
+        tui.section_header("Аккаунт", "аккаунты · прокси · поиск · окно браузера")
         choice, selected = arrow_menu(
             rows, [""], selected,
             actions={"B": lambda: _toggle_headless(config_path)}, esc_key="0",
@@ -2708,7 +2750,7 @@ def account_menu(config_path: Path) -> None:
         if choice == "B":
             _toggle_headless(config_path)
             continue
-        if choice not in {"1", "2", "P"}:
+        if choice not in {"1", "2", "P", "S"}:
             continue
         cfg = load_config(config_path)
         clear_terminal()
@@ -2717,6 +2759,10 @@ def account_menu(config_path: Path) -> None:
                 step_account(config_path, cfg.browser.session_root)
             elif choice == "2":
                 step_proxy(config_path)
+            elif choice == "S":
+                from modules.proxy_screen import pick_search_proxy
+
+                pick_search_proxy(config_path)
             else:
                 step_threads(config_path)
         except WizardBack:

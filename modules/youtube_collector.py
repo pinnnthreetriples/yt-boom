@@ -284,6 +284,17 @@ class YouTubeCollector:
         )
         logger.debug("YouTube collector HTTP session opened")
 
+    @property
+    def proxy(self) -> str | None:
+        return self._proxy
+
+    async def set_proxy(self, proxy: str | None) -> None:
+        """Use `proxy` (None: direct) from the next request on; an open session with another proxy is closed."""
+        if proxy == self._proxy:
+            return
+        await self.close()
+        self._proxy = proxy
+
     async def close(self) -> None:
         session, self._session = self._session, None
         if session is not None:

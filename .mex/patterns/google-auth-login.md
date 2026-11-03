@@ -12,7 +12,7 @@ edges:
   - target: context/decisions.md
     condition: when reviewing 2FA and Material 3 design decisions
 grounds_to: []
-last_updated: 2026-11-01
+last_updated: 2026-11-03
 mex:
   id: mx_01M69VC00B4PVK7X08CM18XG49
   type: pattern
@@ -44,6 +44,13 @@ Automated sign-in to Google accounts requires navigating `accounts.google.com` w
 4. **Speedbumps**: interstitials (passkeys, phone additions, "Was it you?", "Try another way", the "Use another account" tile) have no structural handle and the login must stay fully automatic, so `DECLINE_BUTTONS`, `WAS_IT_YOU_BUTTONS`, `ACKNOWLEDGE_BUTTONS`, `TRY_ANOTHER_WAY` and `USE_ANOTHER_ACCOUNT` match by en/ru label. **Text matching is permitted only for these Google auth speedbump screens, never for YouTube UI.** Because step 2 forces `hl=en`, English labels are what the screens show for any account language (verified on the first screen with ru-RU / pl-PL / en-US browsers; screens after the password step can only be verified by a real login). If a screen still has no handler the flow raises `неизвестный экран`, and `GoogleAuthenticator(artifacts_dir=...)` first writes `google_unknown_screen_<ts>.html` there: the URL without query plus `dom_snapshot.sanitize_html` output (tags, ids, names, types, jsname, data-* names, button/link/heading texts; no values, emails, tokens, scripts) so a handler can be added. `tests/test_selector_guard.py` allowlists exactly these five constants and the `_buttons` helper; any other text selector fails it.
 5. **Ensure Channel**: Navigate to `channel_creation` to verify or create the YouTube channel identity.
 6. **Save Session Owner**: Record the authenticated email in `account_owner.txt` within the session directory.
+
+## Country check before the sign-in
+Before a real sign-in (`_authenticate_account`, `interactive_login`) `_login_country_allowed` compares the proxy's exit country with the account's `expected_country` (`geo_guard.check_account_exit`: `ok` / `mismatch` / `unknown` / `skipped`). `mismatch` and `unknown` **no longer cancel silently**; the person decides, once per sign-in:
+- `--allow-country-mismatch` (on `--auth-account`, `--import-accounts-file`, `--login --account`) → a warning in the log, the sign-in goes on without a question;
+- otherwise a `confirm_country` callback (the wizard's «Войти автоматически» passes an arrow menu «Отменить вход» / «Продолжить вход», cursor on «Отменить», run in a thread because the sign-in is inside `asyncio.run`) or, with a console stdin, the question «Отменить вход или продолжить?»; Enter / anything but yes / Ctrl+C = cancel;
+- no callback, no console, no flag (night runs) → cancelled, and the error log names `--allow-country-mismatch`.
+The message names the account, the expected and the real exit country (or «не удалось определить… возможно, не скачана гео-база Camoufox») and the risk; the decision is logged. `ok` / `skipped` ask nothing. The mailing (`warn_if_exit_mismatch`) only warns, unchanged. Tests: `tests/test_country_confirm.py`.
 
 ## Gotchas
 - **Material 3 Alert Elements**: Google places normal headers inside `[role="alert"]` and `[aria-live="assertive"]`. Do not flag them as errors; filter using `_NON_ERROR_STRINGS`.

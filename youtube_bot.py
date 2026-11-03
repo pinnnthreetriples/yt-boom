@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import random
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 from loguru import logger
 
-from config import AppConfig, load_config, mask_proxy_url, resolve_account_proxy
+from config import AppConfig, ProxyUnavailableError, load_config, mask_proxy_url, resolve_account_proxy
 from database import AccountRecord, ActivityLogCreate, Database, RecordNotFoundError
 from modules.collector import CollectorError
 from modules.account_parser import looks_like_credentials, parse_account_line
@@ -20,9 +21,16 @@ from modules.account_warmer import AccountWarmer, WarmUpResult
 from modules.geo_guard import check_account_exit, normalize_country, normalize_locale, resolve_exit_country, warn_if_exit_mismatch
 from modules.google_authenticator import GoogleAuthenticator, GoogleAuthError, read_session_owner, write_session_owner
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
-from modules.lifecycle_engine import AccountLifecycleEngine
+from modules.lifecycle_engine import (
+    CIRCUIT_BREAKER_ERRORS,
+    LIFECYCLE_MODES,
+    MODE_LABELS,
+    AccountLifecycleEngine,
+    release_restriction,
+)
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.profile_manager import ProfileEditor
+from modules.proxy_library import log_proxy_routes, run_config_proxy_migration
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.session_heartbeat import check_account_heartbeat, check_session_offline, HeartbeatStatus
 from modules.youtube_collector import YouTubeCollector, extract_video_id
@@ -42,25 +50,70 @@ def setup_cli_logging(level: str = "INFO", log_file: str | None = None) -> None:
     setup_bot_logging(level=level, log_file=log_file)
 
 
-async def _login_country_allowed(account_name: str, expected: str | None, proxy: str | None) -> tuple[bool, str | None]:
-    """Fail closed before a sign-in: the exit country of the proxy must be the account's expected one.
+CountryConfirm = Callable[[str], "bool | Awaitable[bool]"]  # gets the explanation, answers "continue the sign-in?"
 
-    Returns (allowed, exit country). Without an expected country nothing is checked and the login goes on as before.
+
+def _stdin_is_interactive() -> bool:
+    return sys.stdin.isatty()
+
+
+def _ask_continue_in_console(message: str) -> bool:
+    """Console question; Enter, anything but yes, Ctrl+C or a closed stdin all mean «отменить»."""
+    print(f"\n{message}\n", file=sys.stderr)
+    try:
+        answer = input("Отменить вход или продолжить? [О]тменить / [П]родолжить (по умолчанию — отменить): ")
+    except (KeyboardInterrupt, EOFError):
+        return False
+    return answer.strip().lower() in {"п", "продолжить", "p", "y", "yes", "да", "continue"}
+
+
+async def _login_country_allowed(
+    account_name: str,
+    expected: str | None,
+    proxy: str | None,
+    allow_mismatch: bool = False,
+    confirm: CountryConfirm | None = None,
+) -> tuple[bool, str | None]:
+    """Before a sign-in compare the proxy's exit country with the account's expected one.
+
+    A mismatch (or an exit country that could not be found) no longer cancels silently: `allow_mismatch`
+    (`--allow-country-mismatch`) goes on with a warning, otherwise the person is asked (`confirm`, or the console
+    when stdin is one; the default answer is «отменить»), and with nobody to ask the sign-in is cancelled.
+    Returns (allowed, exit country). Without an expected country nothing is checked. Asked at most once per call.
     """
     verdict, exit_country = await check_account_exit(expected, proxy)
+    if verdict not in ("mismatch", "unknown"):
+        return True, exit_country
     if verdict == "mismatch":
-        logger.error(
-            "Вход аккаунта {!r} отменён: ожидаемая страна {}, а прокси выходит из страны {}. "
-            "Первый вход с IP чужой страны ставит аккаунт под риск блокировки: смените прокси или ожидаемую страну",
-            account_name, expected, exit_country,
+        problem = f"ожидаемая страна {expected}, а прокси выходит из страны {exit_country}"
+    else:
+        problem = (
+            f"не удалось определить страну выхода прокси (ожидается {expected}); проверьте прокси, "
+            "возможно, не скачана гео-база Camoufox"
         )
-    elif verdict == "unknown":
+    risk = "Первый вход с IP чужой страны может вызвать проверку или блокировку аккаунта Google"
+    if allow_mismatch:
+        logger.warning("Аккаунт {!r}: {}. {}. Вход продолжен по --allow-country-mismatch", account_name, problem, risk)
+        return True, exit_country
+    message = f"Аккаунт «{account_name}»: {problem}.\n{risk}."
+    if confirm is not None:
+        answer = confirm(message)
+        proceed = bool(await answer if inspect.isawaitable(answer) else answer)
+    elif _stdin_is_interactive():
+        proceed = await asyncio.to_thread(_ask_continue_in_console, message)
+    else:
         logger.error(
-            "Вход аккаунта {!r} отменён: не удалось определить страну выхода прокси (ожидается {}). "
-            "Проверьте прокси и повторите",
-            account_name, expected,
+            "Вход аккаунта {!r} отменён: {}. {}. Нет консоли для вопроса: чтобы войти всё равно, "
+            "запустите с --allow-country-mismatch, либо смените прокси или ожидаемую страну",
+            account_name, problem, risk,
         )
-    return verdict not in ("mismatch", "unknown"), exit_country
+        return False, exit_country
+    logger.log(
+        "WARNING" if proceed else "ERROR",
+        "Аккаунт {!r}: {}. Решение пользователя: {}",
+        account_name, problem, "вход продолжен" if proceed else "вход отменён",
+    )
+    return proceed, exit_country
 
 
 async def _warn_country_disagreement(
@@ -84,7 +137,12 @@ async def _warn_country_disagreement(
         )
 
 
-async def interactive_login(config_path: str = "config.yaml", account_name: str | None = None) -> None:
+async def interactive_login(
+    config_path: str = "config.yaml",
+    account_name: str | None = None,
+    allow_country_mismatch: bool = False,
+    confirm_country: CountryConfirm | None = None,
+) -> None:
     """Launch Camoufox headfully on YouTube so user can log in once to save cookies.
 
     The browser starts with the same options as automated runs (proxy, prefs, pinned fingerprint). When the
@@ -111,16 +169,23 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
                 proxy_url = cfg_acc.proxy_url
             else:
                 session_dir = cfg.browser.session_root / account_name
-                proxy_url = cfg.browser.proxy
         else:
             session_dir = Path(acc.session_path)
-            proxy_url = acc.proxy_url
     else:
         session_dir = cfg.browser.session_root / "youtube"
-        proxy_url = cfg.browser.proxy
+    owner = acc if acc is not None else (None if account_name else await db.get_account("default"))
+    if owner is not None:  # only the account's own proxy, never a global one; unreadable: no login at all
+        try:
+            proxy_url = resolve_account_proxy(owner)
+        except ProxyUnavailableError as exc:
+            logger.error("{}", exc)
+            await db.close()
+            return
 
     if acc is not None and acc.expected_country:
-        allowed, _ = await _login_country_allowed(acc.name, acc.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+        allowed, _ = await _login_country_allowed(
+            acc.name, acc.expected_country, proxy_url, allow_country_mismatch, confirm_country,
+        )
         if not allowed:
             await db.close()
             return
@@ -135,7 +200,7 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
         cfg.browser,
         _resolve_youtube_target(cfg),
         session_dir=session_dir,
-        proxy=resolve_account_proxy(proxy_url, cfg.browser.proxy),
+        proxy=proxy_url,
         account_name=account_name or "default",
         locale=acc.locale if acc is not None else None,
     )
@@ -238,9 +303,11 @@ async def _register_credentials_account(
     proxy_url: str | None = None,
     country: str | None = None,
     locale: str | None = None,
+    default_mode: str | None = None,
 ) -> AccountRecord:
     """Register `email:password:totp[...]`. A known account keeps its session path, proxy, active flag, expected country
-    and locale unless told otherwise."""
+    and locale unless told otherwise. The age mode comes from the line's `mode=` or else `default_mode`; without
+    either a known account keeps its mode and a new one is "auto"."""
     parsed = parse_account_line(spec, proxy=proxy_url, country=country, locale=locale)
     account_name = (name or parsed.default_name).strip()
     existing = await db.get_account(account_name)
@@ -259,7 +326,12 @@ async def _register_credentials_account(
         upsert_args["expected_country"] = parsed.expected_country
     if parsed.locale is not None:
         upsert_args["locale"] = parsed.locale
-    return await db.upsert_account(**upsert_args)
+    account = await db.upsert_account(**upsert_args)
+    mode = parsed.lifecycle_mode or default_mode
+    if mode is not None and mode != account.lifecycle_mode:
+        await db.set_account_lifecycle_mode(account.id, mode)
+        account = account.model_copy(update={"lifecycle_mode": mode})
+    return account
 
 
 def mask_email(email: str | None) -> str:
@@ -296,19 +368,32 @@ async def add_credentials_account_cli(
         return True
 
 
-async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRecord) -> bool:
+async def _authenticate_account(
+    db: Database,
+    cfg: AppConfig,
+    account: AccountRecord,
+    allow_country_mismatch: bool = False,
+    confirm_country: CountryConfirm | None = None,
+) -> bool:
     """Sign the account in. `failed` is stored only when Google refused (GoogleAuthError); a browser, proxy or
-    network failure is logged and leaves the stored status alone."""
+    network failure is logged and leaves the stored status alone. A proxy exit country that differs from the expected
+    one is confirmed first (`_login_country_allowed`)."""
     if not account.email or not account.password:
         logger.error("У аккаунта {!r} не заданы email/пароль: добавьте его через --add-account email:password:totp", account.name)
         return False
     simulator = InteractionSimulator(InteractionConfig(key_delay_ms_min=50, key_delay_ms_max=100))
     owner = read_session_owner(account.session_path)
     force_relogin = owner is not None and owner != account.email.lower()  # the saved session is another account's
-    proxy = resolve_account_proxy(account.proxy_url, cfg.browser.proxy)
+    try:
+        proxy = resolve_account_proxy(account)
+    except ProxyUnavailableError as exc:  # fail closed: never sign in from the own IP instead
+        logger.error("{}", exc)
+        return False
     exit_country: str | None = None
     if account.auth_status != "authenticated" or force_relogin:  # a real sign-in follows: the country must match first
-        allowed, exit_country = await _login_country_allowed(account.name, account.expected_country, proxy)
+        allowed, exit_country = await _login_country_allowed(
+            account.name, account.expected_country, proxy, allow_country_mismatch, confirm_country
+        )
         if not allowed:
             return False
     else:
@@ -386,7 +471,13 @@ async def _find_account(db: Database, identifier: str) -> AccountRecord | None:
     return next((a for a in await db.list_accounts() if a.email and a.email.lower() == wanted), None)
 
 
-async def auth_account_cli(identifier: str, config_path: str = "config.yaml", headless: bool | None = None) -> bool:
+async def auth_account_cli(
+    identifier: str,
+    config_path: str = "config.yaml",
+    headless: bool | None = None,
+    allow_country_mismatch: bool = False,
+    confirm_country: CountryConfirm | None = None,
+) -> bool:
     """`--auth-account <name_or_email>`: sign the account into YouTube (proxy and fingerprint come from the account)."""
     cfg = load_config(config_path)
     if headless is not None:
@@ -396,8 +487,8 @@ async def auth_account_cli(identifier: str, config_path: str = "config.yaml", he
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found. Add it with --add-account email:password:totp", file=sys.stderr)
             return False
-        ok = await _authenticate_account(db, cfg, account)
-        print(f"[{'OK' if ok else 'FAILED'}] {account.name}: {'authenticated' if ok else 'authentication failed'}")
+        ok = await _authenticate_account(db, cfg, account, allow_country_mismatch, confirm_country)
+        print(f"[{'OK' if ok else 'FAILED'}] {account.name}:{'authenticated' if ok else 'authentication failed'}")
         return ok
 
 
@@ -416,9 +507,11 @@ class AccountImportResult:
 
 
 async def register_account_lines(
-    db: Database, cfg: AppConfig, lines: Iterable[str], skip_existing: bool = False
+    db: Database, cfg: AppConfig, lines: Iterable[str], skip_existing: bool = False, default_mode: str | None = None
 ) -> AccountImportResult:
     """Register every account line (blank lines and `#` comments are ignored); one bad line never stops the rest.
+
+    `default_mode` ("auto" / "mature" / "unlimited") is the age mode of every line without its own `mode=`.
 
     With `skip_existing` a line whose account is already in the database (or repeated earlier in the batch) is
     reported as skipped instead of overwriting its credentials.
@@ -436,7 +529,7 @@ async def register_account_lines(
                 if parsed.email.lower() in known_emails or await db.get_account(parsed.default_name) is not None:
                     result.skipped.append((number, "аккаунт уже есть"))
                     continue
-            account = await _register_credentials_account(db, cfg, line)
+            account = await _register_credentials_account(db, cfg, line, default_mode=default_mode)
             result.added.append(account)
             if account.email:
                 known_emails.add(account.email.lower())
@@ -446,7 +539,11 @@ async def register_account_lines(
 
 
 async def import_accounts_file_cli(
-    path: str, config_path: str = "config.yaml", headless: bool | None = None, force: bool = False
+    path: str,
+    config_path: str = "config.yaml",
+    headless: bool | None = None,
+    force: bool = False,
+    allow_country_mismatch: bool = False,
 ) -> bool:
     """`--import-accounts-file`: register every line of the file, then sign the accounts in one by one.
 
@@ -477,7 +574,7 @@ async def import_accounts_file_cli(
             if index:
                 await asyncio.sleep(_pause_between_accounts(account))
             logger.info("Авторизация аккаунта {!r} ({}/{})", account.name, index + 1, len(queue))
-            if not await _authenticate_account(db, cfg, account):
+            if not await _authenticate_account(db, cfg, account, allow_country_mismatch):
                 failed_auth += 1
         print(f"[{'OK' if not failed_auth else 'FAILED'}] Authenticated {len(queue) - failed_auth} of {len(queue)}")
     return not failed_lines and not failed_auth
@@ -511,7 +608,7 @@ async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml"
         all_alive = True
         for acc in accounts:
             if online:
-                res = await check_account_heartbeat(acc, default_proxy=cfg.browser.proxy, locale=cfg.browser.locale)
+                res = await check_account_heartbeat(acc, locale=cfg.browser.locale)
             else:
                 res = check_session_offline(acc.session_path, acc.name)
             status_str = "ALIVE" if res.is_alive else "EXPIRED"
@@ -618,6 +715,7 @@ async def warm_selected_cli(
     duration: float = 45.0,
     headless: bool | None = None,
     report: Callable[[str], None] = print,
+    allow_country_mismatch: bool = False,
 ) -> list[WarmUpResult]:
     """Wizard «прогрев выбранных»: the accounts called `names`, in that order.
 
@@ -640,7 +738,7 @@ async def warm_selected_cli(
                 results.append(WarmUpResult(name, False, None, 0.0, "account not found"))
             elif needs_sign_in:
                 worked = True
-                ok = await _authenticate_account(db, cfg, account)
+                ok = await _authenticate_account(db, cfg, account, allow_country_mismatch)
                 results.append(WarmUpResult(account.name, ok, None, 0.0, "signed in" if ok else "sign-in failed"))
             elif warm_candidates([account]):
                 worked = True
@@ -652,37 +750,130 @@ async def warm_selected_cli(
 
 
 async def lifecycle_cli(config_path: str = "config.yaml") -> None:
-    """`--lifecycle`: account ages, stages, quarantine hours left and today's comment quota."""
+    """`--lifecycle`: ages, stages, quarantine hours left, today's quota, mode, on/off and auto warm-up per account."""
     cfg = load_config(config_path)
     async with Database(cfg.app.db_path) as db:
         accounts = await db.list_accounts()
         now = datetime.now(timezone.utc)
-        width = 100
+        width = 128
         print("\n" + "=" * width)
-        print("                                 ACCOUNT LIFECYCLE")
+        print("                                           ACCOUNT LIFECYCLE")
         print("=" * width)
         if not accounts:
             print("  No accounts found in database.")
         else:
             print(
                 f"{'Account':<16} | {'Auth':<13} | {'Age':>7} | {'Stage':<11} | {'Quarantine':>10} | "
-                f"{'Today':>7} | {'Errors':>6} | {'Warm-ups':>8}"
+                f"{'Today':>7} | {'Errors':>6} | {'Warm-ups':>8} | {'Mode':<9} | {'Active':<6} | {'AutoWarm':<8}"
             )
             print("-" * width)
             for acc in accounts:
                 view = AccountLifecycleEngine.summarize(acc, now)
-                stage = view.stage
                 if view.age_hours is None:
                     age, left, quota = "-", "-", "-"
                 else:
                     age = f"{view.age_hours:.1f}h"
                     left = f"{view.quarantine_left:.1f}h"
-                    quota = f"{view.quota_done}/{view.quota_limit}"
+                    quota = f"{view.quota_done}/{'inf' if view.quota_limit is None else view.quota_limit}"
                 print(
-                    f"{acc.name:<16} | {acc.auth_status:<13} | {age:>7} | {stage:<11} | {left:>10} | "
-                    f"{quota:>7} | {acc.consecutive_errors:>6} | {acc.warmup_sessions_done:>8}"
+                    f"{acc.name:<16} | {acc.auth_status:<13} | {age:>7} | {_stage_text(view):<11} | {left:>10} | "
+                    f"{quota:>7} | {acc.consecutive_errors:>6} | {acc.warmup_sessions_done:>8} | "
+                    f"{AccountLifecycleEngine.mode_of(acc):<9} | {'yes' if acc.is_active else 'NO':<6} | "
+                    f"{'on' if acc.auto_warmup else 'off':<8}"
                 )
+            print("-" * width)
+            print("  Mode: auto = by age, mature = already warmed up (stage shown as mature*), unlimited = no stages and limits.")
         print("=" * width + "\n")
+
+
+_ON_OFF = {"on": True, "off": False, "1": True, "0": False, "yes": True, "no": False, "да": True, "нет": False}
+
+
+def _stage_text(view: Any) -> str:
+    """Stage column of `--lifecycle`: «mature*» when the mode, not the age, makes the account mature."""
+    return "mature*" if view.mode == "mature" and view.stage == "mature" else view.stage
+
+
+async def apply_account_settings(
+    db: Database,
+    accounts: Iterable[AccountRecord],
+    *,
+    lifecycle_mode: str | None = None,
+    auto_warmup: bool | None = None,
+    is_active: bool | None = None,
+) -> int:
+    """Set the given work settings (None = leave) on every account; returns how many accounts were changed.
+
+    Shared by the wizard (single and bulk changes). The config.yaml sync never overwrites these in the database.
+    """
+    changed = 0
+    for account in accounts:
+        if lifecycle_mode is not None:
+            await db.set_account_lifecycle_mode(account.id, lifecycle_mode)
+        if auto_warmup is not None:
+            await db.set_account_auto_warmup(account.id, auto_warmup)
+        if is_active is not None:
+            await db.set_account_active(account.id, is_active)
+        changed += 1
+    return changed
+
+
+async def _account_setting_cli(
+    identifier: str, config_path: str, change: Callable[[Database, AccountRecord], Awaitable[str]]
+) -> bool:
+    cfg = load_config(config_path)
+    async with Database(cfg.app.db_path) as db:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
+            return False
+        print(f"[OK] {account.name}: {await change(db, account)}")
+        return True
+
+
+async def set_mode_cli(identifier: str, mode: str, config_path: str = "config.yaml") -> bool:
+    """`--set-mode NAME auto|mature|unlimited`: the account's age mode."""
+    if mode not in LIFECYCLE_MODES:
+        print(f"[ERROR] Unknown mode {mode!r}: use {', '.join(LIFECYCLE_MODES)}.", file=sys.stderr)
+        return False
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        await db.set_account_lifecycle_mode(account.id, mode)
+        return f"mode = {mode} ({MODE_LABELS[mode]})"
+
+    return await _account_setting_cli(identifier, config_path, change)
+
+
+async def set_auto_warmup_cli(identifier: str, enabled: bool, config_path: str = "config.yaml") -> bool:
+    """`--auto-warmup NAME on|off`: whether a run may start a background warm-up of the account."""
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        await db.set_account_auto_warmup(account.id, enabled)
+        return f"auto warm-up {'on' if enabled else 'off'}"
+
+    return await _account_setting_cli(identifier, config_path, change)
+
+
+async def set_active_cli(identifier: str, enabled: bool, config_path: str = "config.yaml") -> bool:
+    """`--set-active NAME on|off`: «В работе»; a switched-off account is not used for a run and not warmed up."""
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        await db.set_account_active(account.id, enabled)
+        return "in work" if enabled else "switched off"
+
+    return await _account_setting_cli(identifier, config_path, change)
+
+
+async def reset_restricted_cli(identifier: str, config_path: str = "config.yaml") -> bool:
+    """`--reset-restricted NAME`: lift the circuit breaker (the error streak and the stage restart)."""
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        if account.consecutive_errors < CIRCUIT_BREAKER_ERRORS:
+            return "not restricted, nothing to reset"
+        await release_restriction(db, account)
+        return "restriction lifted"
+
+    return await _account_setting_cli(identifier, config_path, change)
 
 
 async def print_accounts_table(config_path: str = "config.yaml") -> None:
@@ -718,6 +909,8 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
             for acc in accounts:
                 status = "ACTIVE" if acc.is_active else "DISABLED"
                 proxy_display = mask_proxy_url(acc.proxy_url) if acc.proxy_url else "direct (no proxy)"
+                if acc.proxy_unavailable:
+                    proxy_display = "UNREADABLE: re-assign"
                 geo_display = acc.geo_country or "-"
                 if len(proxy_display) > 30:
                     proxy_display = proxy_display[:27] + "..."  # the masked form: never cut credentials open
@@ -763,6 +956,7 @@ async def run_video_pool_cli(
     db = Database(cfg.app.db_path)
     await db.connect()
     await db.init_schema()
+    await log_proxy_routes(db)
 
     orchestrator = MultiAccountOrchestrator(
         config_or_path=cfg,
@@ -782,7 +976,13 @@ async def list_sub_comments(video_url: str, config_path: str = "config.yaml", li
     """Fetch and list comments under comments for a YouTube video."""
     cfg = load_config(config_path)
     try:
-        async with YouTubeCollector(cfg.collector, cfg.browser.proxy) as collector:
+        async with Database(cfg.app.db_path) as db:
+            search_proxy = await db.search_proxy_url()
+    except ProxyUnavailableError as exc:
+        logger.error("{}", exc)
+        return
+    try:
+        async with YouTubeCollector(cfg.collector, search_proxy) as collector:
             sub_comments = await collector.fetch_video_sub_comments(video_url, max_sub_comments=limit)
     except CollectorError as exc:
         logger.error("Не удалось получить ответы под комментариями: {}", exc)
@@ -869,42 +1069,44 @@ async def run_reply_bot(
             cfg_acc = next((a for a in getattr(cfg.browser, "accounts", []) if a.name == account_name), None)
             if cfg_acc:
                 session_dir = cfg_acc.session_path
-                proxy_url = cfg_acc.proxy_url
                 resolved_acc_name = cfg_acc.name
             else:
                 session_dir = str(cfg.browser.session_root / account_name)
-                proxy_url = cfg.browser.proxy
                 resolved_acc_name = account_name
-            acc_record = await db.upsert_account(
-                name=resolved_acc_name,
-                session_path=str(session_dir),
-                proxy_url=proxy_url,
-                is_active=True,
-            )
+            upsert_args: dict[str, Any] = {"name": resolved_acc_name, "session_path": str(session_dir), "is_active": True}
+            if cfg_acc and cfg_acc.proxy_url:
+                upsert_args["proxy_url"] = cfg_acc.proxy_url
+            acc_record = await db.upsert_account(**upsert_args)
         else:
             session_dir = acc_record.session_path
-            proxy_url = acc_record.proxy_url
             resolved_acc_name = acc_record.name
 
-    # comments are fetched through the proxy the account posts from; no proxy anywhere: direct, as before
-    collector = YouTubeCollector(cfg.collector, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+    # the account posts only through its own proxy (or directly); comments are read through the search proxy.
+    # Without --account the main profile is the «default» account's.
+    owner = acc_record if account_name else await db.get_account("default")
+    try:
+        proxy_url = resolve_account_proxy(owner) if owner is not None else None
+        search_proxy = await db.search_proxy_url()
+    except ProxyUnavailableError as exc:
+        logger.error("{}", exc)
+        await db.close()
+        return
+    await log_proxy_routes(db, [owner.name] if owner is not None else [])
+    collector = YouTubeCollector(cfg.collector, search_proxy)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
         "rng": rng,
+        "proxy": proxy_url,  # explicit: YouTubeRunner must not fall back to browser.proxy
     }
     if session_dir is not None:
         runner_kwargs["session_dir"] = session_dir
-    if proxy_url is not None:
-        runner_kwargs["proxy"] = proxy_url
     if account_name is not None:
         runner_kwargs["account_name"] = resolved_acc_name
     if acc_record is not None:
         if acc_record.locale:
             runner_kwargs["locale"] = acc_record.locale
-        await warn_if_exit_mismatch(
-            acc_record.name, acc_record.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy)
-        )
+        await warn_if_exit_mismatch(acc_record.name, acc_record.expected_country, proxy_url)
 
     runner = YouTubeRunner(cfg.browser, yt_target, **runner_kwargs)
 
@@ -1194,42 +1396,44 @@ async def run_multi_video_pipeline(
             cfg_acc = next((a for a in getattr(cfg.browser, "accounts", []) if a.name == account_name), None)
             if cfg_acc:
                 session_dir = cfg_acc.session_path
-                proxy_url = cfg_acc.proxy_url
                 resolved_acc_name = cfg_acc.name
             else:
                 session_dir = str(cfg.browser.session_root / account_name)
-                proxy_url = cfg.browser.proxy
                 resolved_acc_name = account_name
-            acc_record = await db.upsert_account(
-                name=resolved_acc_name,
-                session_path=str(session_dir),
-                proxy_url=proxy_url,
-                is_active=True,
-            )
+            upsert_args: dict[str, Any] = {"name": resolved_acc_name, "session_path": str(session_dir), "is_active": True}
+            if cfg_acc and cfg_acc.proxy_url:
+                upsert_args["proxy_url"] = cfg_acc.proxy_url
+            acc_record = await db.upsert_account(**upsert_args)
         else:
             session_dir = acc_record.session_path
-            proxy_url = acc_record.proxy_url
             resolved_acc_name = acc_record.name
 
-    # comments are fetched through the proxy the account posts from; no proxy anywhere: direct, as before
-    collector = YouTubeCollector(cfg.collector, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+    # the account posts only through its own proxy (or directly); comments are read through the search proxy.
+    # Without --account the main profile is the «default» account's.
+    owner = acc_record if account_name else await db.get_account("default")
+    try:
+        proxy_url = resolve_account_proxy(owner) if owner is not None else None
+        search_proxy = await db.search_proxy_url()
+    except ProxyUnavailableError as exc:
+        logger.error("{}", exc)
+        await db.close()
+        return
+    await log_proxy_routes(db, [owner.name] if owner is not None else [])
+    collector = YouTubeCollector(cfg.collector, search_proxy)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
         "rng": rng,
+        "proxy": proxy_url,  # explicit: YouTubeRunner must not fall back to browser.proxy
     }
     if session_dir is not None:
         runner_kwargs["session_dir"] = session_dir
-    if proxy_url is not None:
-        runner_kwargs["proxy"] = proxy_url
     if account_name is not None:
         runner_kwargs["account_name"] = resolved_acc_name
     if acc_record is not None:
         if acc_record.locale:
             runner_kwargs["locale"] = acc_record.locale
-        await warn_if_exit_mismatch(
-            acc_record.name, acc_record.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy)
-        )
+        await warn_if_exit_mismatch(acc_record.name, acc_record.expected_country, proxy_url)
 
     runner = YouTubeRunner(cfg.browser, yt_target, **runner_kwargs)
 
@@ -1606,9 +1810,10 @@ def main() -> None:
     parser.add_argument("--auth-account", type=str, default=None, metavar="NAME_OR_EMAIL", help="Sign the account into YouTube (Camoufox with its proxy and fixed fingerprint, TOTP 2FA)")
     parser.add_argument("--import-accounts-file", type=str, default=None, metavar="FILE", help="Import accounts from a text file (one email:password:totp[:recovery_email][:proxy][:country=PL][:locale=pl-PL] per line) and authenticate them one by one; accounts that are already authenticated are skipped")
     parser.add_argument("--force", action="store_true", help="With --import-accounts-file: sign in accounts that are already authenticated too")
+    parser.add_argument("--allow-country-mismatch", action="store_true", help="With --auth-account, --import-accounts-file, --login --account: sign in even when the proxy's exit country differs from the account's expected one (or cannot be determined), without asking; without the flag the console asks «отменить или продолжить», and with no console the sign-in is cancelled")
     parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (http://user:pass@ip:port or ip:port:user:pass) for adding account or session override")
     parser.add_argument("--session", type=str, default=None, help="Session directory path for adding account")
-    parser.add_argument("--country", type=str, default=None, help="With --add-account: the account's expected country (PL or Poland); a sign-in is refused when the proxy exits elsewhere")
+    parser.add_argument("--country", type=str, default=None, help="With --add-account: the account's expected country (PL or Poland); before a sign-in the proxy's exit country is compared with it (see --allow-country-mismatch)")
     parser.add_argument("--locale", type=str, default=None, help="With --add-account: browser language of the account (e.g. pl-PL); default is browser.locale")
     parser.add_argument("--heartbeat", "--check-session", dest="heartbeat", nargs="?", const="ALL", default=None, metavar="NAME_OR_ALL", help="Show session status from the LOGIN_INFO cookie, no network (default: all active accounts)")
     parser.add_argument("--heartbeat-online", action="store_true", help="With --heartbeat: also verify the session with an HTTP request to YouTube (Firefox-like, through the account proxy)")
@@ -1617,6 +1822,10 @@ def main() -> None:
     parser.add_argument("--apply-profile", type=str, default=None, metavar="NAME_OR_EMAIL", help="Publish the channel profile saved in the wizard (nickname, description, avatar) to the account's YouTube channel")
     parser.add_argument("--lifecycle", action="store_true", help="Show account ages, lifecycle stages, quarantine hours left and daily comment quota")
     parser.add_argument("--warm-quarantined", action="store_true", help="Run organic warm-up, one account after another, for every account in quarantine or aging (uses --warm-up-duration)")
+    parser.add_argument("--set-mode", nargs=2, default=None, metavar=("NAME", "MODE"), help="Account age mode: auto (by age), mature (already warmed up: 5/day, 45-90 min) or unlimited (no stages and limits)")
+    parser.add_argument("--auto-warmup", nargs=2, default=None, metavar=("NAME", "on|off"), help="Allow (on) or forbid (off) the background warm-up of the account during a run")
+    parser.add_argument("--set-active", nargs=2, default=None, metavar=("NAME", "on|off"), help="Put the account in work (on) or switch it off (off): runs skip it and it is not warmed up")
+    parser.add_argument("--reset-restricted", type=str, default=None, metavar="NAME", help="Lift the circuit breaker of a restricted account (3 errors in a row)")
     parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
     parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt)")
     parser.add_argument("--concurrency", "-j", type=int, default=None, help="Accounts working at the same time (default: limits.max_concurrent_sessions)")
@@ -1630,6 +1839,7 @@ def main() -> None:
     args = parser.parse_args()
     setup_cli_logging(args.log_level)
     bind_to_kill_on_close_job()  # browser children die with this process, even on a crash
+    run_config_proxy_migration(args.config)  # proxies leave config.yaml for the encrypted library (idempotent)
 
     if args.heartbeat is not None:
         ok = asyncio.run(heartbeat_cli(args.heartbeat, args.config, online=args.heartbeat_online))
@@ -1654,6 +1864,19 @@ def main() -> None:
     if args.lifecycle:
         asyncio.run(lifecycle_cli(args.config))
         return
+
+    if args.set_mode:
+        sys.exit(0 if asyncio.run(set_mode_cli(args.set_mode[0], args.set_mode[1].lower(), args.config)) else 1)
+
+    for switch, handler in ((args.auto_warmup, set_auto_warmup_cli), (args.set_active, set_active_cli)):
+        if switch:
+            if switch[1].lower() not in _ON_OFF:
+                print(f"[ERROR] Expected on or off, got {switch[1]!r}.", file=sys.stderr)
+                sys.exit(1)
+            sys.exit(0 if asyncio.run(handler(switch[0], _ON_OFF[switch[1].lower()], args.config)) else 1)
+
+    if args.reset_restricted:
+        sys.exit(0 if asyncio.run(reset_restricted_cli(args.reset_restricted, args.config)) else 1)
 
     if args.warm_quarantined:
         ok = asyncio.run(
@@ -1694,10 +1917,20 @@ def main() -> None:
         return
 
     if args.auth_account:
-        sys.exit(0 if asyncio.run(auth_account_cli(args.auth_account, args.config, args.headless or None)) else 1)
+        ok = asyncio.run(
+            auth_account_cli(
+                args.auth_account, args.config, args.headless or None, allow_country_mismatch=args.allow_country_mismatch
+            )
+        )
+        sys.exit(0 if ok else 1)
 
     if args.import_accounts_file:
-        ok = asyncio.run(import_accounts_file_cli(args.import_accounts_file, args.config, args.headless or None, args.force))
+        ok = asyncio.run(
+            import_accounts_file_cli(
+                args.import_accounts_file, args.config, args.headless or None, args.force,
+                allow_country_mismatch=args.allow_country_mismatch,
+            )
+        )
         sys.exit(0 if ok else 1)
 
     if args.status:
@@ -1709,7 +1942,9 @@ def main() -> None:
         return
 
     if args.login:
-        asyncio.run(interactive_login(args.config, account_name=args.account))
+        asyncio.run(
+            interactive_login(args.config, account_name=args.account, allow_country_mismatch=args.allow_country_mismatch)
+        )
         return
 
     if args.videos_file:
