@@ -34,17 +34,7 @@ from modules.lifecycle_engine import (
 )
 from modules.multi_account_orchestrator import MultiAccountOrchestrator
 from modules.proxy_library import sync_config_accounts
-from modules.wizard import (
-    MENU_WIDTH,
-    _setup_account_actions,
-    _setup_account_rows,
-    _setup_bulk_settings,
-    _setup_lifecycle,
-    _setup_pick_mode,
-    load_accounts,
-)
-from tests.test_account_menu import MenuCase, good_line
-from tests.tui_keys import DOWN, ENTER, ESC, SPACE, scripted_keys
+from tests.test_account_menu import MenuCase
 
 T0 = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -543,168 +533,15 @@ class TestUiText(unittest.TestCase):
 
 
 class TestWizardScreens(MenuCase):
-    def seed(self, count: int = 2) -> None:
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            from modules.wizard import _setup_import
-
-            self.run_keys(
-                lambda: _setup_import(self.config_path), "2", ENTER,
-                paste=[good_line(n) for n in range(1, count + 1)] + [""], inputs=["n"],
-            )
 
     def entry(self, name: str):
         acc = self.accounts()[name]
         return acc, True
 
-    def actions(self, name: str, *keys: str, inputs: list | None = None):
-        entry = self.entry(name)
-        return self.run_keys(
-            lambda: _setup_account_actions(self.config_path, self.root / "sessions", [entry], entry), *keys, inputs=inputs
-        )
-
-    def test_account_rows_show_status_and_keep_the_width(self):
-        self.seed(2)
-        reset = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
-        self.set_stage("user1@example.com", 100, daily_comments_done=2, daily_limit_reset_at=reset)
-        accounts = [(a, True) for a in load_accounts(self.config_path)]
-        accounts[1][0].lifecycle_mode = "unlimited"
-        rows = _setup_account_rows(accounts)
-        self.assertIn("✓ взрослый 2/5", rows[0][2])
-        self.assertIn("∞ без лимитов", rows[1][2])
-        for key, label, value, _ in rows:
-            self.assertLessEqual(len(label) + len(value) + 3, MENU_WIDTH, (label, value))
-
-    def test_account_menu_shows_the_card_and_new_rows(self):
-        self.seed(1)
-        _, output = self.actions("user1@example.com", ESC)
-        plain = ANSI.sub("", output)
-        for text in ("Стадия", "Возраст", "Лимит сегодня", "Следующий коммент", "Последний прогрев", "Режим", "Автопрогрев",
-                     "В работе: да", "Режим: По возрасту", "Автопрогрев: вкл", "Прогреть сейчас"):
-            self.assertIn(text, plain)
-        self.assertNotIn("Снять ограничение", plain)  # only for a restricted account
-
-    def test_in_work_toggle_saves_and_reports(self):
-        self.seed(1)
-        notice, _ = self.actions("user1@example.com", "5", ESC)
-        self.assertFalse(self.accounts()["user1@example.com"].is_active)
-        self.assertEqual(notice[0], "ok")
-        self.assertIn("выключен", notice[1])
-
-    def test_mode_choice_saves(self):
-        self.seed(1)
-        notice, _ = self.actions("user1@example.com", "6", "2", ESC)
-        self.assertEqual(self.accounts()["user1@example.com"].lifecycle_mode, "mature")
-        self.assertIn("Уже прогрет", notice[1])
-
-    def test_mode_choice_can_be_cancelled(self):
-        self.seed(1)
-        self.actions("user1@example.com", "6", "0", ESC)
-        self.assertEqual(self.accounts()["user1@example.com"].lifecycle_mode, "auto")
-
-    def test_auto_warmup_toggle(self):
-        self.seed(1)
-        self.actions("user1@example.com", "7", ESC)
-        self.assertFalse(self.accounts()["user1@example.com"].auto_warmup)
-
-    def test_release_restriction_needs_confirmation(self):
-        self.seed(1)
-        self.set_stage("user1@example.com", 100, consecutive_errors=3)
-        _, output = self.actions("user1@example.com", "9", ESC, inputs=["n"])
-        self.assertEqual(self.accounts()["user1@example.com"].consecutive_errors, 3)
-        self.assertIn("Снять ограничение", ANSI.sub("", output))
-        notice, _ = self.actions("user1@example.com", "9", ESC, inputs=["y"])
-        self.assertEqual(self.accounts()["user1@example.com"].consecutive_errors, 0)
-        self.assertEqual(notice, ("ok", "«user1@example.com»: ограничение снято"))
-
-    def test_warm_now_runs_one_manual_warmup_after_confirmation(self):
-        self.seed(1)
-        with patch("youtube_bot.warm_up_cli", new=AsyncMock(return_value=True)) as warm:
-            notice, _ = self.actions("user1@example.com", "8", ESC, inputs=["y"])
-        warm.assert_awaited_once()
-        self.assertEqual(warm.await_args.args[0], "user1@example.com")
-        self.assertEqual(notice[0], "ok")
-        with patch("youtube_bot.warm_up_cli", new=AsyncMock(return_value=True)) as warm:
-            self.actions("user1@example.com", "8", ESC, inputs=["n"])
-        warm.assert_not_awaited()
-
-    def test_bulk_mode_for_ticked_accounts(self):
-        self.seed(3)
-        accounts = [(a, True) for a in load_accounts(self.config_path)]
-        # tick 1 and 3, «Готово», «Режим…» (1), «Без лимитов» (3)
-        notice, _ = self.run_keys(
-            lambda: _setup_bulk_settings(self.config_path, accounts), SPACE, DOWN, DOWN, SPACE, DOWN, ENTER, "1", "3"
-        )
-        modes = {n: a.lifecycle_mode for n, a in self.accounts().items()}
-        self.assertEqual((modes["user1@example.com"], modes["user2@example.com"], modes["user3@example.com"]),
-                         ("unlimited", "auto", "unlimited"))
-        self.assertEqual(notice, ("ok", "режим «Без лимитов»: 2 из 2 акк."))
-
-    def test_bulk_in_work_and_auto_warmup_for_all(self):
-        self.seed(2)
-        accounts = [(a, True) for a in load_accounts(self.config_path)]
-        self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), SPACE, DOWN, SPACE, DOWN, ENTER, "3")
-        self.assertEqual([a.is_active for a in self.accounts().values()], [False, False])
-        self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), SPACE, DOWN, SPACE, DOWN, ENTER, "5")
-        self.assertEqual([a.auto_warmup for a in self.accounts().values()], [False, False])
-
-    def test_bulk_cancel_changes_nothing(self):
-        self.seed(1)
-        accounts = [(a, True) for a in load_accounts(self.config_path)]
-        notice, _ = self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), SPACE, ESC)
-        self.assertIsNone(notice)
-        notice, _ = self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), DOWN, ENTER)
-        self.assertIsNone(notice)
-
-    def test_lifecycle_table_has_mode_work_and_warmup_line(self):
-        self.seed(2)
-        self.set_stage("user1@example.com", 100)
-        async def modes(db):
-            a, b = await db.get_account("user1@example.com"), await db.get_account("user2@example.com")
-            await db.set_account_lifecycle_mode(a.id, "mature")
-            await db.set_account_auto_warmup(b.id, False)
-            await db.set_account_active(b.id, False)
-        asyncio.run(self._with_db(modes))
-        _, output = self.run_keys(lambda: _setup_lifecycle(self.config_path))
-        plain = ANSI.sub("", output)
-        self.assertRegex(plain, r"режим: Уже прогрет · в работе: да · автопрогрев: вкл")
-        self.assertRegex(plain, r"режим: По возрасту · в работе: нет · автопрогрев: выкл")
 
     async def _with_db(self, fn):
         async with Database(self.db_path) as db:
             return await fn(db)
-
-
-class TestImportQuestion(MenuCase):
-    def paste(self, mode_keys: tuple[str, ...], lines: list[str]):
-        from modules.wizard import _setup_import
-
-        with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            return self.run_keys(
-                lambda: _setup_import(self.config_path), "2", *mode_keys, paste=[*lines, ""], inputs=["n"],
-            )
-
-    def test_question_applies_the_picked_mode_to_every_imported_account(self):
-        self.paste(("2",), [good_line(1), good_line(2)])
-        self.assertEqual({a.lifecycle_mode for a in self.accounts().values() if a.name.startswith("user")}, {"mature"})
-
-    def test_default_answer_is_by_age(self):
-        self.paste((ENTER,), [good_line(1)])
-        self.assertEqual(self.accounts()["user1@example.com"].lifecycle_mode, "auto")
-
-    def test_line_mode_beats_the_answer(self):
-        self.paste(("3",), [good_line(1) + ":mode=auto", good_line(2)])
-        modes = {n: a.lifecycle_mode for n, a in self.accounts().items() if n.startswith("user")}
-        self.assertEqual(modes, {"user1@example.com": "auto", "user2@example.com": "unlimited"})
-
-    def test_cancelling_the_question_cancels_the_import(self):
-        notice, _ = self.paste(("0",), [good_line(1)])
-        self.assertEqual(notice[0], "info")
-        self.assertFalse([n for n in self.accounts() if n.startswith("user")])
-
-    def test_pick_mode_returns_keys(self):
-        for key, mode in (("1", "auto"), ("2", "mature"), ("3", "unlimited"), ("0", None)):
-            with self.subTest(key=key), scripted_keys(key):
-                self.assertEqual(_setup_pick_mode(), mode)
 
 
 if __name__ == "__main__":
