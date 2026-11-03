@@ -107,6 +107,13 @@ def mask_proxy(proxy_str: str | None) -> str:
     return mask_proxy_url(proxy_str)
 
 
+def _account_proxy_text(acc: Any) -> str:
+    """Proxy cell of an account row: the masked address, «прокси не читается» or «без прокси» (never the marker)."""
+    if getattr(acc, "proxy_unavailable", False):
+        return "прокси не читается"
+    return mask_proxy(acc.proxy_url) if acc.proxy_url else "без прокси"
+
+
 def normalize_proxy(user_input: str | None) -> str | None:
     """
     Parse and validate proxy URL entered by user.
@@ -196,35 +203,16 @@ def format_target_mode_ru(mode: str) -> str:
     return modes.get(str(mode).lower(), str(mode))
 
 
-def check_proxy_connectivity(proxy_url: str | None, timeout: float = 6.0) -> tuple[bool, str]:
-    """Test external network connectivity through given proxy."""
-    from curl_cffi import requests
-
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    tag = "Прокси" if proxy_url else "Прямое соединение"
+def check_proxy_connectivity(proxy_url: str | None, timeout: float = 10.0) -> tuple[bool, str]:
+    """(ok, Russian message) through `proxy_url` (None: direct): the shared check, the same libcurl path the bot uses."""
+    from modules.proxy_check import check_proxy_url_sync
 
     try:
-        resp = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=timeout)
-        if resp.status_code == 200:
-            ip = resp.json().get("ip", "неизвестно")
-            return True, f"{tag} работает! Внешний IP: {ip}"
-    except Exception:
-        pass
-
-    try:
-        resp = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=timeout)
-        if resp.status_code == 200:
-            ip = resp.json().get("origin", "неизвестно")
-            return True, f"{tag} работает! Внешний IP: {ip}"
-    except Exception as exc:
-        err_msg = str(exc)
-        if "Failed to connect" in err_msg or "Connection refused" in err_msg:
-            return False, "Не удалось подключиться к прокси (сервер недоступен)"
-        if "timed out" in err_msg.lower():
-            return False, "Таймаут соединения (прокси отвечает слишком медленно)"
-        return False, f"Ошибка соединения: {err_msg[:60]}"
-
-    return False, "Не удалось проверить сетевое соединение"
+        result = check_proxy_url_sync(proxy_url, timeout)
+    except ValueError as exc:  # not a proxy address; the message never holds the address
+        return False, f"Ошибка формата прокси: {exc}"
+    message = result.message + (f". {result.browser_warning}" if result.browser_warning else "")
+    return result.ok, message
 
 
 def check_youtube_session(session_root: Path) -> tuple[bool, str]:
@@ -533,7 +521,7 @@ def _setup_proxy_table(accounts: list[tuple[Any, bool]]) -> None:
         if acc.proxy_url:
             proxy = _fit(mask_proxy(acc.proxy_url), proxy_w)
         else:
-            proxy = color("без прокси", CLR_YELLOW)
+            proxy = color(_account_proxy_text(acc), CLR_RED if getattr(acc, "proxy_unavailable", False) else CLR_YELLOW)
         safe_print(f"   {name}  {proxy}")
     if len(accounts) > _SETUP_MAX_ACCOUNTS:
         safe_print(color(f"   … ещё {len(accounts) - _SETUP_MAX_ACCOUNTS}", CLR_DIM))
@@ -544,7 +532,7 @@ def _setup_account_rows(accounts: list[tuple[Any, bool]]) -> list[MenuRow | None
     proxy_w = MENU_WIDTH - 3 - 24 - 2 - 11 - 2
     rows: list[MenuRow | None] = []
     for i, (acc, ok) in enumerate(accounts, 1):
-        proxy = _fit(mask_proxy(acc.proxy_url) if acc.proxy_url else "без прокси", proxy_w)
+        proxy = _fit(_account_proxy_text(acc), proxy_w)
         state = "● вошёл" if ok else "○ нет входа"
         rows.append((f"A{i}", _fit(acc.name, 24), f"{state:<11}  {proxy}", CLR_GREEN if ok else CLR_YELLOW))
     return rows
@@ -781,10 +769,9 @@ def _setup_rename_in_config(config_path: Path, acc: Any, new_name: str) -> None:
                 item["name"] = new_name
                 found = True
     if not found:
-        target.append({
+        target.append({  # no proxy here: it lives in the encrypted proxy library
             "name": new_name,
             "session_path": str(acc.session_path),
-            "proxy_url": acc.proxy_url,
             "is_active": bool(acc.is_active),
         })
     config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
@@ -1570,13 +1557,14 @@ def _target_pool_info(db_path: Any) -> tuple[int, str | None]:
 
 
 def _accounts_proxy_counts(db_path: Any) -> tuple[int, int]:
-    """(accounts with a proxy, all accounts); read-only sqlite3 for the same reason as the pending count."""
+    """(accounts with a proxy, all accounts); read-only sqlite3 for the same reason as the pending count.
+    An account counts when it points into the proxy library (`proxy_id`)."""
     try:
         uri = f"file:{quote(Path(db_path).as_posix(), safe='/:')}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
         try:
             total, with_proxy = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(proxy_url IS NOT NULL AND proxy_url <> ''), 0) FROM accounts"
+                "SELECT COUNT(*), COALESCE(SUM(proxy_id IS NOT NULL), 0) FROM accounts"
             ).fetchone()
         finally:
             conn.close()
@@ -2128,17 +2116,22 @@ def list_accounts_wizard(config_path: Path) -> list[dict[str, Any]]:
         is_logged, _ = check_youtube_session(Path(acc.session_path))
         name = color(f"{_fit(acc.name, 18):<18}", "" if acc.is_active else CLR_DIM)
         login = color(f"{'● да' if is_logged else '○ нет':<6}", CLR_DIM if is_logged else CLR_YELLOW)
-        proxy = _fit(mask_proxy(acc.proxy_url) if acc.proxy_url else "без прокси", 22)
+        proxy = _fit(_account_proxy_text(acc), 22)
         safe_print(f" {idx:<2} {name} {login} {acc.total_replies:>7}  {proxy}")
         results.append({"account": acc, "is_logged_in": is_logged})
     safe_print(color(f" Всего: {len(accounts)} · активных: {sum(1 for a in accounts if a.is_active)}", CLR_DIM))
     return results
 
 
+KEEP_PROXY: Any = object()  # `_save_account` leaves the stored proxy untouched (a new account starts without one)
+
+
 def _save_account(
-    config_path: Path, name: str, session_path: str, norm_proxy: str | None, is_active: bool = True,
+    config_path: Path, name: str, session_path: str, norm_proxy: str | None | Any, is_active: bool = True,
 ) -> None:
-    """Upsert an account into the DB and mirror it into config.yaml."""
+    """Upsert an account into the DB and mirror it into config.yaml. The proxy goes only to the DB (the encrypted
+    proxy library): the yaml entry never holds a proxy, an old `proxy_url` key there is dropped. `norm_proxy`
+    None removes the proxy, KEEP_PROXY keeps it."""
     from config import load_config
     from database import Database
 
@@ -2149,12 +2142,8 @@ def _save_account(
         await db.connect()
         await db.init_schema()
         try:
-            return await db.upsert_account(
-                name=name,
-                session_path=session_path,
-                proxy_url=norm_proxy,
-                is_active=is_active,
-            )
+            proxy_arg = {} if norm_proxy is KEEP_PROXY else {"proxy_url": norm_proxy}
+            return await db.upsert_account(name=name, session_path=session_path, is_active=is_active, **proxy_arg)
         finally:
             await db.close()
 
@@ -2168,13 +2157,12 @@ def _save_account(
         existing = next((a for a in accounts_list if isinstance(a, dict) and a.get("name") == name), None)
         if existing:
             existing["session_path"] = session_path
-            existing["proxy_url"] = norm_proxy
+            existing.pop("proxy_url", None)
             existing["is_active"] = is_active
         else:
             accounts_list.append({
                 "name": name,
                 "session_path": session_path,
-                "proxy_url": norm_proxy,
                 "is_active": is_active,
             })
         with open(config_path, "w", encoding="utf-8") as f:
@@ -2347,7 +2335,7 @@ def add_account_stepwise(config_path: Path) -> bool:
         tui.status_line("warn", f"«{name}» уже есть — его настройки будут обновлены")
 
     session_path = str(existing.session_path) if existing else f"test_sessions/{name}"
-    _save_account(config_path, name, session_path, existing.proxy_url if existing else None)
+    _save_account(config_path, name, session_path, KEEP_PROXY)  # an existing account keeps its proxy as it is
     tui.status_line("ok", f"Аккаунт «{name}» сохранён")
 
     if _pools_yes(f"{step(2)} Войти в аккаунт в браузере сейчас?"):

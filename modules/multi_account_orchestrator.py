@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
-from config import AppConfig, BrowserSettings, TargetSettings, load_config, resolve_account_proxy
+from config import AppConfig, BrowserSettings, ProxyUnavailableError, TargetSettings, load_config, resolve_account_proxy
 from database import (
     AccountRecord,
     ActivityLogCreate,
@@ -23,6 +23,7 @@ from modules.geo_guard import warn_if_exit_mismatch
 from modules.interaction_simulator import InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.pool_manager import PoolManager
+from modules.proxy_library import sync_config_accounts
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.ui_test_runner import SubmissionResult
 from modules.youtube_collector import YouTubeCollector, extract_video_id
@@ -66,7 +67,9 @@ class MultiAccountOrchestrator:
         self._dry_run = dry_run
         self._account_mode = account_mode or self._cfg.limits.account_mode
         self._rng = rng or random.Random()
-        self._collector = collector or YouTubeCollector(self._cfg.collector, self._cfg.browser.proxy)
+        # the search proxy lives in the database: `ensure_db` sets it on the collector made here
+        self._own_collector = collector is None
+        self._collector = collector or YouTubeCollector(self._cfg.collector, None)
         self._processor = processor or (
             DeepSeekProcessor(self._cfg.deepseek, self._cfg.processor, rng=self._rng)
             if getattr(self._cfg.processor, "reply_mode", "ai") == "ai"
@@ -143,17 +146,14 @@ class MultiAccountOrchestrator:
         if not self._db.is_connected:
             await self._db.connect()
         await self._db.init_schema()
+        if self._own_collector:  # ProxyUnavailableError: a search proxy is set but unreadable, never go direct
+            await self._collector.set_proxy(await self._db.search_proxy_url())
 
     async def sync_accounts_from_config(self) -> list[AccountRecord]:
-        """Ensure all accounts defined in config are registered in the database."""
+        """Register the accounts of config.yaml that the database lacks; never overwrites a stored proxy or active
+        flag (a yaml proxy is imported only for an account without one)."""
         await self.ensure_db()
-        for acc in self._cfg.browser.accounts:
-            await self._db.upsert_account(
-                name=acc.name,
-                session_path=acc.session_path,
-                proxy_url=acc.proxy_url,
-                is_active=acc.is_active,
-            )
+        await sync_config_accounts(self._db, self._cfg.browser.accounts)
         return await self._db.list_active_accounts()
 
     def create_runner(self, acc: AccountRecord) -> Any:
@@ -164,7 +164,7 @@ class MultiAccountOrchestrator:
             browser_settings=self._cfg.browser,
             target=self._yt_target,
             session_dir=acc.session_path,
-            proxy=resolve_account_proxy(acc.proxy_url, self._cfg.browser.proxy),
+            proxy=resolve_account_proxy(acc),
             account_name=acc.name,
             simulator=self._simulator,
             rng=self._rng,
@@ -176,9 +176,7 @@ class MultiAccountOrchestrator:
         runner = self._runners.get(acc.id)
         if runner is None:
             if acc.expected_country:  # once per account and process; only a warning, a running account is never blocked
-                await warn_if_exit_mismatch(
-                    acc.name, acc.expected_country, resolve_account_proxy(acc.proxy_url, self._cfg.browser.proxy)
-                )
+                await warn_if_exit_mismatch(acc.name, acc.expected_country, resolve_account_proxy(acc))
             while len(self._runners) >= self._concurrency:
                 idle_acc_id = next(
                     (
@@ -324,6 +322,14 @@ class MultiAccountOrchestrator:
         accounts = await self._db.list_active_accounts()
         if not accounts:
             accounts = await self.sync_accounts_from_config()
+        for acc in [acc for acc in accounts if acc.proxy_unavailable]:  # fail closed: never post from the own IP
+            accounts.remove(acc)
+            if acc.id not in self._skipped_logged:
+                self._skipped_logged.add(acc.id)
+                try:
+                    resolve_account_proxy(acc)
+                except ProxyUnavailableError as exc:
+                    logger.error("ИНФО | {}", exc)
         usable = [acc for acc in accounts if self._is_usable(acc) and await self._passes_lifecycle_gate(acc)]
         for acc in accounts:
             if acc not in usable and not self._is_usable(acc) and acc.id not in self._skipped_logged:

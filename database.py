@@ -8,13 +8,14 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterable, Literal, NamedTuple
 from urllib.parse import parse_qs, urlparse
 
 import aiosqlite
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
+from config import PROXY_LIBRARY_MARKER, ProxyParts, ProxyUnavailableError, compose_proxy_url, split_proxy
 from secret_store import SecretStoreError, protect_secret, reveal_secret
 
 NodeStatus = Literal["idle", "busy", "cooldown", "disabled"]
@@ -126,6 +127,35 @@ CREATE TABLE IF NOT EXISTS video_pool (
     last_processed_at TEXT
 );
 
+-- The proxy library: one row per proxy (host, port, login), assigned to any number of accounts via accounts.proxy_id.
+-- `password` is DPAPI-encrypted; `scheme` NULL = not known yet (a check finds it); `country` is the one the user
+-- gave (`country_source` 'user') or the detected exit country ('check'); `last_*` hold the latest check.
+CREATE TABLE IF NOT EXISTS proxies (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    scheme            TEXT,
+    host              TEXT    NOT NULL,
+    port              INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+    login             TEXT    NOT NULL DEFAULT '',
+    password          TEXT,
+    country           TEXT,
+    country_source    TEXT,
+    label             TEXT,
+    last_check_at     TEXT,
+    last_ok           INTEGER,
+    last_exit_ip      TEXT,
+    last_exit_country TEXT,
+    last_latency_ms   INTEGER,
+    last_error        TEXT,
+    created_at        TEXT    NOT NULL,
+    UNIQUE (host, port, login)
+);
+
+-- Small key/value settings (`search_proxy_id`, migration flags).
+CREATE TABLE IF NOT EXISTS app_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_accounts_name ON accounts(name);
 CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active);
 CREATE INDEX IF NOT EXISTS idx_video_pool_status ON video_pool(status, id);
@@ -166,6 +196,24 @@ _ACCOUNT_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("profile_applied_at", "TEXT"),
     ("profile_name_changes", "TEXT"),
 )
+
+# `accounts.proxy_id` -> `proxies.id`. `accounts.proxy_url` then holds PROXY_LIBRARY_MARKER (never an address).
+_ACCOUNT_PROXY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("proxy_id", "INTEGER REFERENCES proxies(id) ON DELETE SET NULL"),
+)
+
+# Every account read joins its proxy, so `AccountRecord.proxy_url` is the ready address (password decrypted).
+_ACCOUNT_SELECT = """
+    SELECT accounts.*, proxies.scheme AS px_scheme, proxies.host AS px_host, proxies.port AS px_port,
+           proxies.login AS px_login, proxies.password AS px_password
+    FROM accounts LEFT JOIN proxies ON proxies.id = accounts.proxy_id
+"""
+_PROXY_SELECT = """
+    SELECT proxies.*, (SELECT COUNT(*) FROM accounts WHERE accounts.proxy_id = proxies.id) AS accounts_count
+    FROM proxies
+"""
+SEARCH_PROXY_KEY = "search_proxy_id"
+PROXY_SCHEMES = ("http", "https", "socks5", "socks4")
 
 QUARANTINE_HOURS = 24
 DAILY_RESET_HOUR_UTC = 4
@@ -281,12 +329,18 @@ class ActivityLogCreate(BaseModel):
 
 
 class AccountRecord(BaseModel):
+    """One account. `proxy_url` is the ready address of its own proxy (decrypted; None = direct); `proxy_id` points
+    into the proxy library; `proxy_unavailable` = a proxy is assigned but cannot be read (the account must not run:
+    `config.resolve_account_proxy` raises ProxyUnavailableError)."""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     name: str
     session_path: str
-    proxy_url: str | None = None
+    proxy_url: str | None = Field(default=None, repr=False)
+    proxy_id: int | None = None
+    proxy_unavailable: bool = False
     is_active: bool = True
     total_replies: int = 0
     created_at: str
@@ -340,6 +394,53 @@ class AccountCreate(BaseModel):
     warmup_sessions_done: int = 0
     last_warmup_at: str | None = None
     consecutive_errors: int = 0
+
+
+class ProxyRecord(BaseModel):
+    """A proxy of the library. `password` is decrypted (None when absent or unreadable: `password_unavailable`).
+
+    `accounts_count`: accounts it is assigned to; `is_search`: it is the search proxy; `url`: the address the bot
+    uses (None while the password cannot be read); `address`: `host:port` for tables (never the password).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    scheme: str | None = None
+    host: str
+    port: int
+    login: str | None = None
+    password: str | None = Field(default=None, repr=False, exclude=True)
+    password_unavailable: bool = False
+    country: str | None = None
+    country_source: str | None = None
+    label: str | None = None
+    last_check_at: str | None = None
+    last_ok: bool | None = None
+    last_exit_ip: str | None = None
+    last_exit_country: str | None = None
+    last_latency_ms: int | None = None
+    last_error: str | None = None
+    created_at: str
+    accounts_count: int = 0
+    is_search: bool = False
+
+    @property
+    def address(self) -> str:
+        return f"[{self.host}]:{self.port}" if ":" in self.host else f"{self.host}:{self.port}"
+
+    @property
+    def url(self) -> str | None:
+        if self.password_unavailable:
+            return None
+        return compose_proxy_url(self.scheme, self.host, self.port, self.login, self.password)
+
+
+class ProxyDeleteResult(NamedTuple):
+    """What `Database.delete_proxy` did: accounts that lost the proxy (now direct) and whether it was the search one."""
+
+    detached_accounts: list[str]
+    was_search: bool
 
 
 class VideoPoolItem(BaseModel):
@@ -487,10 +588,85 @@ class Database:
                 await conn.executescript(_SCHEMA)
                 await conn.execute("PRAGMA user_version = 2")
                 await conn.commit()
+            cursor = await conn.execute("PRAGMA table_info(accounts)")
+            columns = {str(item[1]) for item in await cursor.fetchall()}
+            await cursor.close()
+            backed_up = False
+            if columns and "proxy_id" not in columns:  # first start with the proxy library: keep the old file
+                backed_up = await self._backup_before_migration(conn, "proxies") is not None
             await conn.executescript(_MULTI_ACCOUNT_SCHEMA)
             await self._ensure_account_columns(conn)
             await conn.commit()
+            await self._migrate_account_proxies(conn, backed_up)
         logger.debug("Database schema ensured at {}", self._path)
+
+    async def _migrate_account_proxies(self, conn: aiosqlite.Connection, backed_up: bool = False) -> None:
+        """Idempotent: plain-text `accounts.proxy_url` values (older versions) move into the proxy library.
+
+        Equal proxies merge into one record; the account gets `proxy_id` and the marker. A copy of the database file
+        (`<db>.bak-proxies-<date>`) is written first, unless `backed_up` (the schema upgrade of this start already
+        made one). A value that is not a proxy becomes the marker without a record:
+        the account then refuses to run instead of going direct. If DPAPI cannot encrypt (no Windows logon session),
+        nothing changes and the old values keep working until the next start.
+        """
+        pending = """
+            SELECT id, name, proxy_url FROM accounts
+            WHERE proxy_id IS NULL AND proxy_url IS NOT NULL AND TRIM(proxy_url) <> '' AND proxy_url <> ?
+        """
+        cursor = await conn.execute(pending, (PROXY_LIBRARY_MARKER,))
+        found = await cursor.fetchone()
+        await cursor.close()
+        if found is None:
+            return
+        if not backed_up:
+            await self._backup_before_migration(conn, "proxies")
+        moved = broken = 0
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await conn.execute(pending, (PROXY_LIBRARY_MARKER,))
+            rows = list(await cursor.fetchall())
+            await cursor.close()
+            for row in rows:
+                try:
+                    parts = split_proxy(row["proxy_url"])
+                except ValueError:
+                    logger.warning("Аккаунт {!r}: сохранённый прокси не разобран, аккаунт не запустится до нового прокси", row["name"])
+                    await conn.execute("UPDATE accounts SET proxy_url = ? WHERE id = ?", (PROXY_LIBRARY_MARKER, row["id"]))
+                    broken += 1
+                    continue
+                proxy_id, _ = await self._store_proxy(conn, parts)
+                await conn.execute(
+                    "UPDATE accounts SET proxy_id = ?, proxy_url = ? WHERE id = ?", (proxy_id, PROXY_LIBRARY_MARKER, row["id"])
+                )
+                moved += 1
+        except (SecretStoreError, OSError) as exc:
+            await conn.rollback()
+            logger.warning(
+                "Прокси аккаунтов не перенесены в библиотеку (пароль не зашифровать: {}); повтор при следующем запуске",
+                type(exc).__name__,
+            )
+            return
+        except BaseException:
+            await conn.rollback()
+            raise
+        await conn.commit()
+        logger.info("Прокси аккаунтов перенесены в библиотеку: аккаунтов {}, без разбираемого адреса {}", moved, broken)
+
+    async def _backup_before_migration(self, conn: aiosqlite.Connection, tag: str) -> Path | None:
+        """Consistent copy of the database (`VACUUM INTO`, WAL included) next to it: `<name>.bak-<tag>-<date>`."""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = self._path.with_name(f"{self._path.name}.bak-{tag}-{stamp}")
+        suffix = 1
+        while target.exists():
+            suffix += 1
+            target = self._path.with_name(f"{self._path.name}.bak-{tag}-{stamp}-{suffix}")
+        try:
+            await conn.execute("VACUUM INTO ?", (str(target),))
+        except aiosqlite.Error as exc:
+            logger.warning("Резервная копия базы перед миграцией не создана: {}", exc)
+            return None
+        logger.info("Резервная копия базы перед миграцией прокси: {}", target)
+        return target
 
     @staticmethod
     async def _ensure_account_columns(conn: aiosqlite.Connection) -> None:
@@ -498,13 +674,16 @@ class Database:
         cursor = await conn.execute("PRAGMA table_info(accounts)")
         existing = {str(row[1]) for row in await cursor.fetchall()}
         await cursor.close()
-        for column, ddl in (*_ACCOUNT_AUTH_COLUMNS, *_ACCOUNT_LIFECYCLE_COLUMNS, *_ACCOUNT_PROFILE_COLUMNS):
+        for column, ddl in (
+            *_ACCOUNT_AUTH_COLUMNS, *_ACCOUNT_LIFECYCLE_COLUMNS, *_ACCOUNT_PROFILE_COLUMNS, *_ACCOUNT_PROXY_COLUMNS
+        ):
             if column not in existing:
                 try:
                     await conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
                 except aiosqlite.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():  # another process added it first
                         raise
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_proxy ON accounts(proxy_id)")
         # accounts signed in before the lifecycle existed age from their creation, not from their next re-login
         await conn.execute(
             "UPDATE accounts SET authenticated_at = created_at WHERE auth_status = 'authenticated' AND authenticated_at IS NULL"
@@ -1245,15 +1424,344 @@ class Database:
 
     @staticmethod
     def _account_from_row(row: aiosqlite.Row) -> AccountRecord:
-        """AccountRecord with `password` / `totp_secret` decrypted (values of older versions are plain text)."""
+        """AccountRecord from an `_ACCOUNT_SELECT` row: `password` / `totp_secret` decrypted (values of older versions
+        are plain text), `proxy_url` assembled from the joined proxy record, `proxy_unavailable` when it cannot be."""
         data = dict(row)
+        joined = {key[3:]: data.pop(key) for key in list(data) if key.startswith("px_")}
         for field in ("password", "totp_secret"):
             try:
                 data[field] = reveal_secret(data.get(field))
             except SecretStoreError as exc:
                 logger.warning("Аккаунт {!r}: поле {} недоступно: {}", data.get("name"), field, exc)
                 data[field] = None
+        stored = (data.get("proxy_url") or "").strip()
+        data["proxy_url"], data["proxy_unavailable"] = None, False
+        if data.get("proxy_id") is not None:
+            if joined.get("host") is None:
+                data["proxy_unavailable"] = True  # the record is gone
+            else:
+                try:
+                    password = reveal_secret(joined.get("password"))
+                    data["proxy_url"] = compose_proxy_url(
+                        joined.get("scheme"), joined["host"], joined["port"], joined.get("login") or None, password
+                    )
+                except SecretStoreError as exc:
+                    logger.warning("Аккаунт {!r}: пароль прокси недоступен: {}", data.get("name"), exc)
+                    data["proxy_unavailable"] = True
+        elif stored == PROXY_LIBRARY_MARKER:
+            data["proxy_unavailable"] = True  # assigned once, the record is lost
+        elif stored:
+            data["proxy_url"] = stored  # written by an older version after the migration: still this account's proxy
         return AccountRecord.model_validate(data)
+
+    @staticmethod
+    def _proxy_from_row(row: aiosqlite.Row, search_id: int | None = None) -> ProxyRecord:
+        data = dict(row)
+        data["login"] = data.get("login") or None
+        try:
+            data["password"] = reveal_secret(data.get("password"))
+        except SecretStoreError as exc:
+            logger.warning("Прокси {}:{}: пароль недоступен: {}", data.get("host"), data.get("port"), exc)
+            data["password"], data["password_unavailable"] = None, True
+        if data.get("last_ok") is not None:
+            data["last_ok"] = bool(data["last_ok"])
+        data["is_search"] = search_id is not None and data.get("id") == search_id
+        return ProxyRecord.model_validate(data)
+
+    @staticmethod
+    async def _store_proxy(
+        conn: aiosqlite.Connection,
+        parts: ProxyParts,
+        country: str | None = None,
+        label: str | None = None,
+    ) -> tuple[int, bool]:
+        """Find-or-create by (host, port, login) inside the caller's transaction; returns (id, created).
+
+        An existing record takes the new password, a known scheme and the given country / label; the accounts using
+        it keep their sign-in status (the proxy itself did not change).
+        """
+        host = parts.host.strip().strip("[]").lower()
+        if not host:
+            raise ValueError("у прокси не указан адрес")
+        if not 0 < int(parts.port) < 65536:
+            raise ValueError("порт прокси должен быть от 1 до 65535")
+        scheme = (parts.scheme or "").lower() or None
+        if scheme == "socks5h":
+            scheme = "socks5"
+        if scheme is not None and scheme not in PROXY_SCHEMES:
+            raise ValueError(f"тип прокси {scheme!r} не поддерживается (http, https, socks5)")
+        login = (parts.login or "").strip()
+        country = country.strip().upper() if country and country.strip() else None
+        label = label.strip() if label and label.strip() else None
+        password = protect_secret(parts.password) if parts.password else None
+        cursor = await conn.execute(
+            "SELECT id, password FROM proxies WHERE host = ? AND port = ? AND login = ?", (host, int(parts.port), login)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            cursor = await conn.execute(
+                """
+                INSERT INTO proxies (scheme, host, port, login, password, country, country_source, label, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (scheme, host, int(parts.port), login, password, country, "user" if country else None, label,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            return int(cursor.lastrowid), True
+        try:
+            same_password = reveal_secret(row["password"]) == parts.password
+        except SecretStoreError:
+            same_password = False
+        await conn.execute(
+            """
+            UPDATE proxies
+            SET scheme = COALESCE(?, scheme),
+                password = CASE WHEN ? THEN password ELSE ? END,
+                country = COALESCE(?, country),
+                country_source = CASE WHEN ? IS NOT NULL THEN 'user' ELSE country_source END,
+                label = COALESCE(?, label)
+            WHERE id = ?
+            """,
+            (scheme, 1 if same_password else 0, password, country, country, label, row["id"]),
+        )
+        return int(row["id"]), False
+
+    @staticmethod
+    async def _account_rows(conn: aiosqlite.Connection, accounts: Iterable[int | str]) -> list[aiosqlite.Row]:
+        """Rows of the given accounts (ids or names) in the given order; RecordNotFoundError for an unknown one."""
+        rows: list[aiosqlite.Row] = []
+        for key in accounts:
+            column = "id" if isinstance(key, int) else "name"
+            cursor = await conn.execute(f"SELECT id, name, proxy_id, proxy_url FROM accounts WHERE {column} = ?", (key,))
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                raise RecordNotFoundError(f"account {key!r} not found")
+            if all(row["id"] != seen["id"] for seen in rows):
+                rows.append(row)
+        return rows
+
+    @staticmethod
+    async def _set_account_proxy(
+        conn: aiosqlite.Connection, row: aiosqlite.Row, proxy_id: int | None, reset_auth: bool = True
+    ) -> bool:
+        """Point one account at `proxy_id` (None = direct). False when nothing changes. A real change resets
+        `auth_status` to `pending` (the next sign-in is checked from the new address) unless `reset_auth` is False."""
+        marker = PROXY_LIBRARY_MARKER if proxy_id is not None else None
+        if row["proxy_id"] == proxy_id and (row["proxy_url"] or None) == marker:
+            return False
+        await conn.execute(
+            """
+            UPDATE accounts
+            SET proxy_id = ?, proxy_url = ?, auth_status = CASE WHEN ? THEN 'pending' ELSE auth_status END
+            WHERE id = ?
+            """,
+            (proxy_id, marker, 1 if reset_auth and row["proxy_id"] != proxy_id else 0, row["id"]),
+        )
+        return True
+
+    # ------------------------------------------------------------ proxy library
+    #
+    # API for the wizard («Прокси» stage). A proxy is stored once and assigned to any number of accounts; the
+    # address is assembled only by `config.compose_proxy_url`. `AccountRecord.proxy_url` stays the ready address.
+
+    async def add_proxy(
+        self,
+        parts: ProxyParts,
+        country: str | None = None,
+        label: str | None = None,
+    ) -> tuple[ProxyRecord, bool]:
+        """Add a proxy or update the one with the same host, port and login (new password / scheme / country /
+        label; nothing is duplicated). Returns (record, created). The accounts using it keep their sign-in status.
+        ValueError on a bad port / type; SecretStoreError when DPAPI cannot encrypt the password."""
+        async with self._transaction() as conn:
+            proxy_id, created = await self._store_proxy(conn, parts, country, label)
+        record = await self.get_proxy(proxy_id)
+        assert record is not None
+        return record, created
+
+    async def add_proxy_url(self, proxy_url: str, country: str | None = None, label: str | None = None) -> tuple[ProxyRecord, bool]:
+        """`add_proxy` from any address form `config.parse_proxy` accepts (ValueError otherwise)."""
+        return await self.add_proxy(split_proxy(proxy_url), country, label)
+
+    async def list_proxies(self) -> list[ProxyRecord]:
+        """All proxies, oldest first, with `accounts_count` and `is_search` filled."""
+        search_id = await self._search_proxy_id()
+        rows = await self._fetch_all(_PROXY_SELECT + " ORDER BY proxies.id ASC")
+        return [self._proxy_from_row(row, search_id) for row in rows]
+
+    async def get_proxy(self, proxy_id: int) -> ProxyRecord | None:
+        search_id = await self._search_proxy_id()
+        row = await self._fetch_one(_PROXY_SELECT + " WHERE proxies.id = ?", (proxy_id,))
+        return self._proxy_from_row(row, search_id) if row else None
+
+    async def update_proxy(
+        self,
+        proxy_id: int,
+        *,
+        scheme: str | None | _Unset = UNSET,
+        password: str | None | _Unset = UNSET,
+        country: str | None | _Unset = UNSET,
+        label: str | None | _Unset = UNSET,
+    ) -> ProxyRecord:
+        """Edit one proxy in place (only the passed fields; None clears). Host, port and login identify a proxy: a
+        different one is `add_proxy`. Accounts keep the proxy and their sign-in status. RecordNotFoundError."""
+        fields: dict[str, Any] = {}
+        if not isinstance(scheme, _Unset):
+            scheme = (scheme or "").lower() or None
+            if scheme is not None and scheme not in PROXY_SCHEMES:
+                raise ValueError(f"тип прокси {scheme!r} не поддерживается (http, https, socks5)")
+            fields["scheme"] = scheme
+        if not isinstance(password, _Unset):
+            fields["password"] = protect_secret(password) if password else None
+        if not isinstance(country, _Unset):
+            fields["country"] = country.strip().upper() if country and country.strip() else None
+            fields["country_source"] = "user" if fields["country"] else None
+        if not isinstance(label, _Unset):
+            fields["label"] = label.strip() if label and label.strip() else None
+        async with self._transaction() as conn:
+            if fields:
+                assignments = ", ".join(f"{column} = ?" for column in fields)
+                cursor = await conn.execute(
+                    f"UPDATE proxies SET {assignments} WHERE id = ?", (*fields.values(), proxy_id)
+                )
+            else:
+                cursor = await conn.execute("SELECT 1 FROM proxies WHERE id = ?", (proxy_id,))
+                if await cursor.fetchone() is None:
+                    raise RecordNotFoundError(f"proxy id={proxy_id} not found")
+            if fields and cursor.rowcount == 0:
+                raise RecordNotFoundError(f"proxy id={proxy_id} not found")
+        record = await self.get_proxy(proxy_id)
+        assert record is not None
+        return record
+
+    async def delete_proxy(self, proxy_id: int) -> ProxyDeleteResult:
+        """Delete a proxy. Its accounts are detached: they go direct from now on, with `auth_status` reset to
+        `pending` (show `detached_accounts` to the user). If it was the search proxy, the search goes direct too.
+        RecordNotFoundError when there is no such proxy."""
+        async with self._transaction() as conn:
+            cursor = await conn.execute("SELECT 1 FROM proxies WHERE id = ?", (proxy_id,))
+            if await cursor.fetchone() is None:
+                raise RecordNotFoundError(f"proxy id={proxy_id} not found")
+            cursor = await conn.execute(
+                "SELECT id, name, proxy_id, proxy_url FROM accounts WHERE proxy_id = ? ORDER BY id", (proxy_id,)
+            )
+            rows = list(await cursor.fetchall())
+            for row in rows:
+                await self._set_account_proxy(conn, row, None)
+            cursor = await conn.execute("SELECT value FROM app_settings WHERE key = ?", (SEARCH_PROXY_KEY,))
+            setting = await cursor.fetchone()
+            was_search = setting is not None and setting["value"] == str(proxy_id)
+            if was_search:
+                await conn.execute("DELETE FROM app_settings WHERE key = ?", (SEARCH_PROXY_KEY,))
+            await conn.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+        return ProxyDeleteResult([row["name"] for row in rows], was_search)
+
+    async def record_proxy_check(
+        self,
+        proxy_id: int,
+        ok: bool,
+        *,
+        scheme: str | None = None,
+        exit_ip: str | None = None,
+        exit_country: str | None = None,
+        latency_ms: int | None = None,
+        error: str | None = None,
+    ) -> ProxyRecord:
+        """Store a check result (`modules.proxy_check.check_and_record` calls it). A detected `scheme` fills an
+        unknown type; a detected `exit_country` fills the country unless the user set one. RecordNotFoundError."""
+        exit_country = exit_country.upper() if exit_country else None
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE proxies
+                SET last_check_at = ?, last_ok = ?, last_exit_ip = ?, last_exit_country = ?, last_latency_ms = ?,
+                    last_error = ?,
+                    scheme = COALESCE(scheme, ?),
+                    country = CASE WHEN ? IS NOT NULL AND COALESCE(country_source, 'check') = 'check' THEN ? ELSE country END,
+                    country_source = CASE WHEN ? IS NOT NULL AND COALESCE(country_source, 'check') = 'check'
+                                          THEN 'check' ELSE country_source END
+                WHERE id = ?
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(), 1 if ok else 0, exit_ip, exit_country, latency_ms,
+                    _truncate(error), (scheme or "").lower() or None, exit_country, exit_country, exit_country, proxy_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"proxy id={proxy_id} not found")
+        record = await self.get_proxy(proxy_id)
+        assert record is not None
+        return record
+
+    async def assign_proxy(
+        self, proxy_id: int | None, accounts: Iterable[int | str], *, reset_auth: bool = True
+    ) -> list[str]:
+        """Give these accounts (ids or names) the proxy `proxy_id`; None takes their proxy away (they go direct).
+
+        Returns the names whose proxy really changed (an account that already had it is not listed). A change
+        resets `auth_status` to `pending` (`reset_auth=False` keeps it: only for moves that keep the same address).
+        RecordNotFoundError for an unknown proxy or account; nothing changes then.
+        """
+        async with self._transaction() as conn:
+            if proxy_id is not None:
+                cursor = await conn.execute("SELECT 1 FROM proxies WHERE id = ?", (proxy_id,))
+                if await cursor.fetchone() is None:
+                    raise RecordNotFoundError(f"proxy id={proxy_id} not found")
+            changed: list[str] = []
+            for row in await self._account_rows(conn, accounts):
+                if await self._set_account_proxy(conn, row, proxy_id, reset_auth):
+                    changed.append(row["name"])
+        return changed
+
+    async def clear_account_proxy(self, accounts: Iterable[int | str]) -> list[str]:
+        """`assign_proxy(None, accounts)`: the accounts go direct; returns the names that really changed."""
+        return await self.assign_proxy(None, accounts)
+
+    async def get_setting(self, key: str) -> str | None:
+        row = await self._fetch_one("SELECT value FROM app_settings WHERE key = ?", (key,))
+        return row["value"] if row else None
+
+    async def set_setting(self, key: str, value: str | None) -> None:
+        """Store a setting; None deletes it."""
+        async with self._transaction() as conn:
+            if value is None:
+                await conn.execute("DELETE FROM app_settings WHERE key = ?", (key,))
+            else:
+                await conn.execute(
+                    "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+
+    async def _search_proxy_id(self) -> int | None:
+        value = await self.get_setting(SEARCH_PROXY_KEY)
+        return int(value) if value and value.isdigit() else None
+
+    async def get_search_proxy(self) -> ProxyRecord | None:
+        """The proxy of the search / comment reading (InnerTube collector); None = it goes direct."""
+        proxy_id = await self._search_proxy_id()
+        return await self.get_proxy(proxy_id) if proxy_id is not None else None
+
+    async def set_search_proxy(self, proxy_id: int | None) -> None:
+        """Make `proxy_id` the search proxy (None: the search goes direct). Accounts are not touched."""
+        if proxy_id is not None and await self.get_proxy(proxy_id) is None:
+            raise RecordNotFoundError(f"proxy id={proxy_id} not found")
+        await self.set_setting(SEARCH_PROXY_KEY, None if proxy_id is None else str(proxy_id))
+
+    async def search_proxy_url(self) -> str | None:
+        """Address for the collector: None = direct. Fail-closed: a search proxy that is set but cannot be read
+        (record gone, password not decryptable) raises ProxyUnavailableError, the search never silently goes direct."""
+        proxy_id = await self._search_proxy_id()
+        if proxy_id is None:
+            return None
+        record = await self.get_proxy(proxy_id)
+        if record is None or record.url is None:
+            raise ProxyUnavailableError(
+                "Прокси поиска не читается (запись удалена или пароль не расшифровывается на этом компьютере). "
+                "Поиск не запущен, чтобы не идти с вашего IP: выберите прокси поиска заново на этапе «Прокси»"
+            )
+        return record.url
 
     async def upsert_account(
         self,
@@ -1273,8 +1781,9 @@ class Database:
 
         `session_path`, `proxy_url` and `is_active` keep the stored values when they are not passed (an explicit
         `proxy_url=None` removes the proxy); a new account needs `session_path`, starts active and without proxy.
-        Credentials passed as None keep what is stored. A changed email, password or proxy resets `auth_status`
-        to `pending`. `password` and `totp_secret` are stored encrypted (Windows DPAPI).
+        A `proxy_url` string (any `config.parse_proxy` form) is found-or-created in the proxy library and the account
+        points at it. Credentials passed as None keep what is stored. A changed email, password or proxy resets
+        `auth_status` to `pending`. `password` and `totp_secret` are stored encrypted (Windows DPAPI).
         `expected_country` (ISO alpha-2, upper-cased here) and `locale` (e.g. `pl-PL`) keep the stored value when not
         passed; an explicit None clears them. Callers validate them (`modules.geo_guard`).
         """
@@ -1294,23 +1803,26 @@ class Database:
             expected_country = expected_country.strip().upper() or None
         if isinstance(locale, str):
             locale = locale.strip() or None
+        parts = split_proxy(proxy_url) if isinstance(proxy_url, str) else None  # ValueError on a malformed proxy
         now = datetime.now(timezone.utc).isoformat()
         async with self._transaction() as conn:
-            row = await (await conn.execute("SELECT * FROM accounts WHERE name = ?", (name,))).fetchone()
+            new_proxy_id = (await self._store_proxy(conn, parts))[0] if parts is not None else None
+            row = await (await conn.execute(_ACCOUNT_SELECT + " WHERE accounts.name = ?", (name,))).fetchone()
             if row is None:
                 if isinstance(session_path, _Unset):
                     raise ValueError("session_path is required for a new account")
                 await conn.execute(
                     """
-                    INSERT INTO accounts (name, session_path, proxy_url, is_active, total_replies, created_at,
+                    INSERT INTO accounts (name, session_path, proxy_url, proxy_id, is_active, total_replies, created_at,
                                           email, password, totp_secret, recovery_email, geo_country,
                                           expected_country, locale)
-                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         name,
                         session_path,
-                        None if isinstance(proxy_url, _Unset) else proxy_url,
+                        PROXY_LIBRARY_MARKER if new_proxy_id is not None else None,
+                        new_proxy_id,
                         0 if not isinstance(is_active, _Unset) and not is_active else 1,
                         now,
                         email,
@@ -1325,20 +1837,22 @@ class Database:
             else:
                 current = self._account_from_row(row)
                 new_session = current.session_path if isinstance(session_path, _Unset) else session_path
-                new_proxy = current.proxy_url if isinstance(proxy_url, _Unset) else proxy_url
                 new_active = current.is_active if isinstance(is_active, _Unset) else bool(is_active)
                 new_country = current.geo_country if isinstance(geo_country, _Unset) else geo_country
                 new_expected = current.expected_country if isinstance(expected_country, _Unset) else expected_country
                 new_locale = current.locale if isinstance(locale, _Unset) else locale
+                proxy_changed = False
+                if not isinstance(proxy_url, _Unset):
+                    proxy_changed = await self._set_account_proxy(conn, row, new_proxy_id, reset_auth=False)
                 credentials_changed = (
                     (email is not None and email != current.email)
                     or (password is not None and password != current.password)
-                    or new_proxy != current.proxy_url
+                    or proxy_changed
                 )
                 await conn.execute(
                     """
                     UPDATE accounts
-                    SET session_path = ?, proxy_url = ?, is_active = ?,
+                    SET session_path = ?, is_active = ?,
                         email = COALESCE(?, email),
                         password = COALESCE(?, password),
                         totp_secret = COALESCE(?, totp_secret),
@@ -1351,7 +1865,6 @@ class Database:
                     """,
                     (
                         new_session,
-                        new_proxy,
                         1 if new_active else 0,
                         email,
                         protect_secret(password),
@@ -1364,7 +1877,7 @@ class Database:
                         row["id"],
                     ),
                 )
-            row = await (await conn.execute("SELECT * FROM accounts WHERE name = ?", (name,))).fetchone()
+            row = await (await conn.execute(_ACCOUNT_SELECT + " WHERE accounts.name = ?", (name,))).fetchone()
         if row is None:
             raise RecordNotFoundError(f"account {name!r} disappeared during upsert")
         account = self._account_from_row(row)
@@ -1377,7 +1890,7 @@ class Database:
         if not new_name:
             raise ValueError("account name must not be empty")
         async with self._transaction() as conn:
-            row = await (await conn.execute("SELECT * FROM accounts WHERE name = ?", (old_name,))).fetchone()
+            row = await (await conn.execute(_ACCOUNT_SELECT + " WHERE accounts.name = ?", (old_name,))).fetchone()
             if row is None:
                 raise RecordNotFoundError(f"account {old_name!r} not found")
             if new_name != old_name:
@@ -1385,30 +1898,30 @@ class Database:
                 if taken:
                     raise ValueError(f"account {new_name!r} already exists")
                 await conn.execute("UPDATE accounts SET name = ? WHERE id = ?", (new_name, row["id"]))
-                row = await (await conn.execute("SELECT * FROM accounts WHERE id = ?", (row["id"],))).fetchone()
+                row = await (await conn.execute(_ACCOUNT_SELECT + " WHERE accounts.id = ?", (row["id"],))).fetchone()
         account = self._account_from_row(row)
         logger.debug("Renamed account {!r} -> {!r} (id={})", old_name, account.name, account.id)
         return account
 
     async def get_account(self, account_id_or_name: int | str) -> AccountRecord | None:
         if isinstance(account_id_or_name, int):
-            row = await self._fetch_one("SELECT * FROM accounts WHERE id = ?", (account_id_or_name,))
+            row = await self._fetch_one(_ACCOUNT_SELECT + " WHERE accounts.id = ?", (account_id_or_name,))
         else:
-            row = await self._fetch_one("SELECT * FROM accounts WHERE name = ?", (str(account_id_or_name),))
+            row = await self._fetch_one(_ACCOUNT_SELECT + " WHERE accounts.name = ?", (str(account_id_or_name),))
             if row is None and isinstance(account_id_or_name, str) and account_id_or_name.isdigit():
-                row = await self._fetch_one("SELECT * FROM accounts WHERE id = ?", (int(account_id_or_name),))
+                row = await self._fetch_one(_ACCOUNT_SELECT + " WHERE accounts.id = ?", (int(account_id_or_name),))
         return self._account_from_row(row) if row else None
 
     async def list_active_accounts(self) -> list[AccountRecord]:
-        rows = await self._fetch_all("SELECT * FROM accounts WHERE is_active = 1 ORDER BY id ASC")
+        rows = await self._fetch_all(_ACCOUNT_SELECT + " WHERE accounts.is_active = 1 ORDER BY accounts.id ASC")
         return [self._account_from_row(row) for row in rows]
 
     async def list_accounts(self, is_active: bool | None = None) -> list[AccountRecord]:
         if is_active is None:
-            rows = await self._fetch_all("SELECT * FROM accounts ORDER BY id ASC")
+            rows = await self._fetch_all(_ACCOUNT_SELECT + " ORDER BY accounts.id ASC")
         else:
             val = 1 if is_active else 0
-            rows = await self._fetch_all("SELECT * FROM accounts WHERE is_active = ? ORDER BY id ASC", (val,))
+            rows = await self._fetch_all(_ACCOUNT_SELECT + " WHERE accounts.is_active = ? ORDER BY accounts.id ASC", (val,))
         return [self._account_from_row(row) for row in rows]
 
     async def set_account_auth_status(self, account_id: int, status: str) -> None:
@@ -1797,10 +2310,14 @@ __all__ = [
     "Database",
     "Payload",
     "PayloadStatus",
+    "PROXY_SCHEMES",
+    "ProxyDeleteResult",
+    "ProxyRecord",
     "QueueItem",
     "QueueKind",
     "QueueStatus",
     "RecordNotFoundError",
+    "SEARCH_PROXY_KEY",
     "TestNode",
     "VideoPoolItem",
     "init_db",

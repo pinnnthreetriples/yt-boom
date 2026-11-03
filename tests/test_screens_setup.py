@@ -84,7 +84,7 @@ class TestProxyScreen(SetupScreenCase):
         self.accounts()
         self.run_keys(lambda: step_proxy(self.config_path), DOWN, DOWN, DOWN, ENTER, UP, UP, UP, ENTER)
         self.assertIsNone(self.accounts()[0].proxy_url)
-        self.assertIsNone(self.raw()["browser"]["accounts"][0]["proxy_url"])
+        self.assertNotIn("proxy_url", self.raw()["browser"]["accounts"][0])  # proxies live only in the library
 
     def test_check_result_stays_under_menu_then_esc_goes_back(self):
         with patch("modules.wizard.check_proxy_connectivity", return_value=(True, "Внешний IP: 9.9.9.9")):
@@ -98,7 +98,7 @@ class TestProxyScreen(SetupScreenCase):
                 inputs=["5.6.7.8:1080", "user", "pw"],
             )
         self.assertEqual(self.accounts()[0].proxy_url, "socks5://user:pw@5.6.7.8:1080")
-        self.assertEqual(self.raw()["browser"]["accounts"][0]["proxy_url"], "socks5://user:pw@5.6.7.8:1080")
+        self.assertNotIn("proxy_url", self.raw()["browser"]["accounts"][0])  # never a password in config.yaml
         self.assertIn("«default»: прокси сохранён", output)
 
     def test_several_accounts_pick_one_and_cursor_starts_on_missing_proxy(self):

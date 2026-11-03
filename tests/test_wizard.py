@@ -80,23 +80,31 @@ class TestWizardHelpers(unittest.TestCase):
         self.assertTrue(masked.endswith("3456"))
 
     def test_check_proxy_connectivity_success(self):
-        with patch("curl_cffi.requests.get") as mock_get:
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = {"ip": "195.201.20.30"}
-            mock_get.return_value = mock_resp
+        """The wizard check runs the shared proxy check: the runtime's libcurl address (socks5 -> socks5h)."""
+        seen = []
 
-            ok, msg = check_proxy_connectivity("http://195.201.20.30:8080")
-            self.assertTrue(ok)
-            self.assertIn("195.201.20.30", msg)
+        async def fake_fetch(url, timeout):
+            seen.append(url)
+            return "195.201.20.30", 40
+
+        with patch("modules.proxy_check._fetch_ip", fake_fetch), patch(
+            "modules.proxy_check.country_for_ip", AsyncMock(return_value="DE")
+        ):
+            ok, msg = check_proxy_connectivity("socks5://u:p@195.201.20.30:1080")
+        self.assertTrue(ok)
+        self.assertIn("195.201.20.30", msg)
+        self.assertEqual(seen, ["socks5://u:p@195.201.20.30:1080"])
 
     def test_check_proxy_connectivity_failure(self):
-        with patch("curl_cffi.requests.get") as mock_get:
-            mock_get.side_effect = RuntimeError("Failed to connect")
+        from modules.proxy_check import _FetchError
 
+        async def fake_fetch(url, timeout):
+            raise _FetchError("unreachable", 7)
+
+        with patch("modules.proxy_check._fetch_ip", fake_fetch):
             ok, msg = check_proxy_connectivity("http://bad.proxy:8080")
-            self.assertFalse(ok)
-            self.assertIn("Не удалось подключиться к прокси", msg)
+        self.assertFalse(ok)
+        self.assertIn("Прокси-сервер недоступен", msg)
 
 
 class TestWizardSessionAndApi(unittest.TestCase):

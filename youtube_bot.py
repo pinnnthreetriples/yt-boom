@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable
 
 from loguru import logger
 
-from config import AppConfig, load_config, mask_proxy_url, resolve_account_proxy
+from config import AppConfig, ProxyUnavailableError, load_config, mask_proxy_url, resolve_account_proxy
 from database import AccountRecord, ActivityLogCreate, Database, RecordNotFoundError
 from modules.collector import CollectorError
 from modules.account_parser import looks_like_credentials, parse_account_line
@@ -23,6 +23,7 @@ from modules.interaction_simulator import InteractionConfig, InteractionSimulato
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.profile_manager import ProfileEditor
+from modules.proxy_library import run_config_proxy_migration
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.session_heartbeat import check_account_heartbeat, check_session_offline, HeartbeatStatus
 from modules.youtube_collector import YouTubeCollector, extract_video_id
@@ -111,16 +112,21 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
                 proxy_url = cfg_acc.proxy_url
             else:
                 session_dir = cfg.browser.session_root / account_name
-                proxy_url = cfg.browser.proxy
         else:
             session_dir = Path(acc.session_path)
-            proxy_url = acc.proxy_url
     else:
         session_dir = cfg.browser.session_root / "youtube"
-        proxy_url = cfg.browser.proxy
+    owner = acc if acc is not None else (None if account_name else await db.get_account("default"))
+    if owner is not None:  # only the account's own proxy, never a global one; unreadable: no login at all
+        try:
+            proxy_url = resolve_account_proxy(owner)
+        except ProxyUnavailableError as exc:
+            logger.error("{}", exc)
+            await db.close()
+            return
 
     if acc is not None and acc.expected_country:
-        allowed, _ = await _login_country_allowed(acc.name, acc.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+        allowed, _ = await _login_country_allowed(acc.name, acc.expected_country, proxy_url)
         if not allowed:
             await db.close()
             return
@@ -135,7 +141,7 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
         cfg.browser,
         _resolve_youtube_target(cfg),
         session_dir=session_dir,
-        proxy=resolve_account_proxy(proxy_url, cfg.browser.proxy),
+        proxy=proxy_url,
         account_name=account_name or "default",
         locale=acc.locale if acc is not None else None,
     )
@@ -305,7 +311,11 @@ async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRe
     simulator = InteractionSimulator(InteractionConfig(key_delay_ms_min=50, key_delay_ms_max=100))
     owner = read_session_owner(account.session_path)
     force_relogin = owner is not None and owner != account.email.lower()  # the saved session is another account's
-    proxy = resolve_account_proxy(account.proxy_url, cfg.browser.proxy)
+    try:
+        proxy = resolve_account_proxy(account)
+    except ProxyUnavailableError as exc:  # fail closed: never sign in from the own IP instead
+        logger.error("{}", exc)
+        return False
     exit_country: str | None = None
     if account.auth_status != "authenticated" or force_relogin:  # a real sign-in follows: the country must match first
         allowed, exit_country = await _login_country_allowed(account.name, account.expected_country, proxy)
@@ -511,7 +521,7 @@ async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml"
         all_alive = True
         for acc in accounts:
             if online:
-                res = await check_account_heartbeat(acc, default_proxy=cfg.browser.proxy, locale=cfg.browser.locale)
+                res = await check_account_heartbeat(acc, locale=cfg.browser.locale)
             else:
                 res = check_session_offline(acc.session_path, acc.name)
             status_str = "ALIVE" if res.is_alive else "EXPIRED"
@@ -718,6 +728,8 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
             for acc in accounts:
                 status = "ACTIVE" if acc.is_active else "DISABLED"
                 proxy_display = mask_proxy_url(acc.proxy_url) if acc.proxy_url else "direct (no proxy)"
+                if acc.proxy_unavailable:
+                    proxy_display = "UNREADABLE: re-assign"
                 geo_display = acc.geo_country or "-"
                 if len(proxy_display) > 30:
                     proxy_display = proxy_display[:27] + "..."  # the masked form: never cut credentials open
@@ -782,7 +794,13 @@ async def list_sub_comments(video_url: str, config_path: str = "config.yaml", li
     """Fetch and list comments under comments for a YouTube video."""
     cfg = load_config(config_path)
     try:
-        async with YouTubeCollector(cfg.collector, cfg.browser.proxy) as collector:
+        async with Database(cfg.app.db_path) as db:
+            search_proxy = await db.search_proxy_url()
+    except ProxyUnavailableError as exc:
+        logger.error("{}", exc)
+        return
+    try:
+        async with YouTubeCollector(cfg.collector, search_proxy) as collector:
             sub_comments = await collector.fetch_video_sub_comments(video_url, max_sub_comments=limit)
     except CollectorError as exc:
         logger.error("Не удалось получить ответы под комментариями: {}", exc)
@@ -869,42 +887,43 @@ async def run_reply_bot(
             cfg_acc = next((a for a in getattr(cfg.browser, "accounts", []) if a.name == account_name), None)
             if cfg_acc:
                 session_dir = cfg_acc.session_path
-                proxy_url = cfg_acc.proxy_url
                 resolved_acc_name = cfg_acc.name
             else:
                 session_dir = str(cfg.browser.session_root / account_name)
-                proxy_url = cfg.browser.proxy
                 resolved_acc_name = account_name
-            acc_record = await db.upsert_account(
-                name=resolved_acc_name,
-                session_path=str(session_dir),
-                proxy_url=proxy_url,
-                is_active=True,
-            )
+            upsert_args: dict[str, Any] = {"name": resolved_acc_name, "session_path": str(session_dir), "is_active": True}
+            if cfg_acc and cfg_acc.proxy_url:
+                upsert_args["proxy_url"] = cfg_acc.proxy_url
+            acc_record = await db.upsert_account(**upsert_args)
         else:
             session_dir = acc_record.session_path
-            proxy_url = acc_record.proxy_url
             resolved_acc_name = acc_record.name
 
-    # comments are fetched through the proxy the account posts from; no proxy anywhere: direct, as before
-    collector = YouTubeCollector(cfg.collector, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+    # the account posts only through its own proxy (or directly); comments are read through the search proxy.
+    # Without --account the main profile is the «default» account's.
+    owner = acc_record if account_name else await db.get_account("default")
+    try:
+        proxy_url = resolve_account_proxy(owner) if owner is not None else None
+        search_proxy = await db.search_proxy_url()
+    except ProxyUnavailableError as exc:
+        logger.error("{}", exc)
+        await db.close()
+        return
+    collector = YouTubeCollector(cfg.collector, search_proxy)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
         "rng": rng,
+        "proxy": proxy_url,  # explicit: YouTubeRunner must not fall back to browser.proxy
     }
     if session_dir is not None:
         runner_kwargs["session_dir"] = session_dir
-    if proxy_url is not None:
-        runner_kwargs["proxy"] = proxy_url
     if account_name is not None:
         runner_kwargs["account_name"] = resolved_acc_name
     if acc_record is not None:
         if acc_record.locale:
             runner_kwargs["locale"] = acc_record.locale
-        await warn_if_exit_mismatch(
-            acc_record.name, acc_record.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy)
-        )
+        await warn_if_exit_mismatch(acc_record.name, acc_record.expected_country, proxy_url)
 
     runner = YouTubeRunner(cfg.browser, yt_target, **runner_kwargs)
 
@@ -1194,42 +1213,43 @@ async def run_multi_video_pipeline(
             cfg_acc = next((a for a in getattr(cfg.browser, "accounts", []) if a.name == account_name), None)
             if cfg_acc:
                 session_dir = cfg_acc.session_path
-                proxy_url = cfg_acc.proxy_url
                 resolved_acc_name = cfg_acc.name
             else:
                 session_dir = str(cfg.browser.session_root / account_name)
-                proxy_url = cfg.browser.proxy
                 resolved_acc_name = account_name
-            acc_record = await db.upsert_account(
-                name=resolved_acc_name,
-                session_path=str(session_dir),
-                proxy_url=proxy_url,
-                is_active=True,
-            )
+            upsert_args: dict[str, Any] = {"name": resolved_acc_name, "session_path": str(session_dir), "is_active": True}
+            if cfg_acc and cfg_acc.proxy_url:
+                upsert_args["proxy_url"] = cfg_acc.proxy_url
+            acc_record = await db.upsert_account(**upsert_args)
         else:
             session_dir = acc_record.session_path
-            proxy_url = acc_record.proxy_url
             resolved_acc_name = acc_record.name
 
-    # comments are fetched through the proxy the account posts from; no proxy anywhere: direct, as before
-    collector = YouTubeCollector(cfg.collector, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+    # the account posts only through its own proxy (or directly); comments are read through the search proxy.
+    # Without --account the main profile is the «default» account's.
+    owner = acc_record if account_name else await db.get_account("default")
+    try:
+        proxy_url = resolve_account_proxy(owner) if owner is not None else None
+        search_proxy = await db.search_proxy_url()
+    except ProxyUnavailableError as exc:
+        logger.error("{}", exc)
+        await db.close()
+        return
+    collector = YouTubeCollector(cfg.collector, search_proxy)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
         "rng": rng,
+        "proxy": proxy_url,  # explicit: YouTubeRunner must not fall back to browser.proxy
     }
     if session_dir is not None:
         runner_kwargs["session_dir"] = session_dir
-    if proxy_url is not None:
-        runner_kwargs["proxy"] = proxy_url
     if account_name is not None:
         runner_kwargs["account_name"] = resolved_acc_name
     if acc_record is not None:
         if acc_record.locale:
             runner_kwargs["locale"] = acc_record.locale
-        await warn_if_exit_mismatch(
-            acc_record.name, acc_record.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy)
-        )
+        await warn_if_exit_mismatch(acc_record.name, acc_record.expected_country, proxy_url)
 
     runner = YouTubeRunner(cfg.browser, yt_target, **runner_kwargs)
 
@@ -1630,6 +1650,7 @@ def main() -> None:
     args = parser.parse_args()
     setup_cli_logging(args.log_level)
     bind_to_kill_on_close_job()  # browser children die with this process, even on a crash
+    run_config_proxy_migration(args.config)  # proxies leave config.yaml for the encrypted library (idempotent)
 
     if args.heartbeat is not None:
         ok = asyncio.run(heartbeat_cli(args.heartbeat, args.config, online=args.heartbeat_online))

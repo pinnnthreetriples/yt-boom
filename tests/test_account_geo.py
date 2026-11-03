@@ -75,7 +75,7 @@ class TestGeoColumns(_DbCase):
             pass
         async with Database(path) as db:  # idempotent
             accounts = await db.list_accounts()
-        self.assertEqual([(a.name, a.proxy_url, a.expected_country, a.locale) for a in accounts], [("legacy", "h:1", None, None)])
+        self.assertEqual([(a.name, a.proxy_url, a.expected_country, a.locale) for a in accounts], [("legacy", "http://h:1", None, None)])  # moved into the proxy library
         check = sqlite3.connect(path)
         try:
             columns = {row[1] for row in check.execute("PRAGMA table_info(accounts)")}
