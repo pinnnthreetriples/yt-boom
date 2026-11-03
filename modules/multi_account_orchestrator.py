@@ -21,7 +21,7 @@ from modules.account_warmer import AccountWarmer
 from modules.comment_visibility import CommentVisibilityChecker
 from modules.geo_guard import warn_if_exit_mismatch
 from modules.interaction_simulator import InteractionSimulator
-from modules.lifecycle_engine import AccountLifecycleEngine
+from modules.lifecycle_engine import AccountLifecycleEngine, explain_block
 from modules.pool_manager import PoolManager
 from modules.proxy_library import sync_config_accounts
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
@@ -236,14 +236,17 @@ class MultiAccountOrchestrator:
             return True
         if (acc.id, verdict.reason) not in self._lifecycle_logged:
             self._lifecycle_logged.add((acc.id, verdict.reason))
-            logger.warning("[LIFECYCLE] Account {} skipped: {}", acc.name, verdict.reason)
+            logger.warning("[LIFECYCLE] {}: пропущен — {}", acc.name, explain_block(acc, verdict))
         if verdict.suggested_action == "warm_up":
             self._schedule_warmup(acc)
         return False
 
     def _schedule_warmup(self, acc: AccountRecord) -> None:
-        """Start a background warm-up unless one runs already, the last one is under 4 h old, or this is a dry run."""
-        if self._dry_run or acc.id in self._warmup_tasks:
+        """Start a background warm-up unless one runs already, the last one is under 4 h old, or this is a dry run.
+
+        An account with «Автопрогрев» off or «В работе» off never gets one (a manual warm-up always works).
+        """
+        if self._dry_run or acc.id in self._warmup_tasks or not acc.auto_warmup or not acc.is_active:
             return
         failed_at = self._warmup_failed_at.get(acc.id)
         if failed_at is not None and datetime.now(timezone.utc) - failed_at <= self.WARMUP_INTERVAL:
@@ -315,6 +318,8 @@ class MultiAccountOrchestrator:
     async def _may_comment_now(self, acc: AccountRecord) -> bool:
         """Re-check an account that was picked earlier (mode "each") against its current counters in the database."""
         fresh = await self._db.get_account(acc.id)
+        if fresh is not None and not fresh.is_active:  # switched off in the wizard while the run was going
+            return False
         return fresh is None or await self._passes_lifecycle_gate(fresh)
 
     async def _usable_accounts(self) -> list[AccountRecord]:

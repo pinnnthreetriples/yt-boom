@@ -245,7 +245,7 @@ class TestImportFlow(MenuCase):
     def paste(self, lines: list[str], *answers: str):
         """«Импорт» → «Вставить строки» (key 2) → the lines, an empty line ends the paste → warm-up answers."""
         return self.run_keys(
-            lambda: _setup_import(self.config_path), "2", paste=[*lines, ""], inputs=list(answers),
+            lambda: _setup_import(self.config_path), "2", ENTER, paste=[*lines, ""], inputs=list(answers),
         )
 
     def test_paste_adds_valid_skips_duplicates_and_reports_bad_lines(self):
@@ -291,7 +291,7 @@ class TestImportFlow(MenuCase):
         path = self.root / "accounts.txt"
         path.write_text("\ufeff# my accounts\n\n" + good_line(1) + "\nbroken\n" + good_line(2) + "\n", encoding="utf-8")
         with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            notice, output = self.run_keys(lambda: _setup_import(self.config_path), "1", inputs=[str(path), "n"])
+            notice, output = self.run_keys(lambda: _setup_import(self.config_path), "1", ENTER, inputs=[str(path), "n"])
         self.assertEqual(notice, ("ok", "Импорт: добавлено 2 из 3"))
         self.assertIn("строка 4: ошибка", output)
         self.assertEqual(len([a for a in self.accounts() if a.startswith("user")]), 2)
@@ -391,7 +391,7 @@ class TestWarmupChoice(MenuCase):
         results = [SimpleNamespace(account_name="user1@example.com", success=True)]
         with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=results)) as warm:
             notice, output = self.run_keys(
-                lambda: _setup_import(self.config_path), "2",
+                lambda: _setup_import(self.config_path), "2", ENTER,
                 paste=[good_line(1), good_line(2), good_line(3), ""], inputs=["1"],
             )
         warm.assert_awaited_once()
@@ -406,7 +406,7 @@ class TestWarmupRun(MenuCase):
         super().setUp()
         with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
             self.run_keys(
-                lambda: _setup_import(self.config_path), "2", paste=[good_line(1), good_line(2), good_line(3), ""], inputs=["n"],
+                lambda: _setup_import(self.config_path), "2", ENTER, paste=[good_line(1), good_line(2), good_line(3), ""], inputs=["n"],
             )
         self.set_stage("user1@example.com", 2)  # quarantine
         self.set_stage("user2@example.com", 30)  # aging
@@ -525,7 +525,7 @@ class TestMenuIntegration(MenuCase):
 
     def test_lifecycle_screen_through_hotkey(self):
         with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
-            self.run_keys(lambda: _setup_import(self.config_path), "2", paste=[good_line(1), good_line(2), ""], inputs=["n"])
+            self.run_keys(lambda: _setup_import(self.config_path), "2", ENTER, paste=[good_line(1), good_line(2), ""], inputs=["n"])
         reset = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
         self.set_stage("user1@example.com", 3, daily_limit_reset_at=reset)
         self.set_stage("user2@example.com", 100, daily_comments_done=2, consecutive_errors=3, daily_limit_reset_at=reset)
@@ -554,7 +554,7 @@ class TestMenuIntegration(MenuCase):
     def test_import_row_registers_through_menu(self):
         with patch("youtube_bot.warm_selected_cli", new=AsyncMock(return_value=[])):
             _, output = self.run_keys(
-                lambda: step_account(self.config_path, self.root / "sessions"), "5", "2", "4",
+                lambda: step_account(self.config_path, self.root / "sessions"), "5", "2", ENTER, "4",
                 paste=[good_line(1), ""], inputs=["n"],
             )
         self.assertIn("user1@example.com", [a.name for a in load_accounts(self.config_path)])

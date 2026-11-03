@@ -340,13 +340,17 @@ def step_proxy(config_path: Path) -> None:
 
 
 def _setup_account_rows(accounts: list[tuple[Any, bool]]) -> list[MenuRow | None]:
-    """One selectable row per account (key A1, A2, …): name, login state and proxy."""
-    proxy_w = MENU_WIDTH - 3 - 24 - 2 - 11 - 2
+    """One selectable row per account (key A1, A2, …): name, login state, proxy, stage/mode."""
+    from modules.account_menu_logic import account_status_label
+
+    name_w, status_w = 16, 15  # the proxy keeps 19 characters: «http://1.2.3.4:8080»
+    proxy_w = MENU_WIDTH - 3 - name_w - 2 - 11 - 2 - status_w - 2  # the status is the last column, after the proxy
     rows: list[MenuRow | None] = []
     for i, (acc, ok) in enumerate(accounts, 1):
         proxy = _fit(_account_proxy_text(acc), proxy_w)
         state = "● вошёл" if ok else "○ нет входа"
-        rows.append((f"A{i}", _fit(acc.name, 24), f"{state:<11}  {proxy}", CLR_GREEN if ok else CLR_YELLOW))
+        status = _fit(account_status_label(acc)[0], status_w)
+        rows.append((f"A{i}", _fit(acc.name, name_w), f"{state:<11}  {proxy:<{proxy_w}}  {status}", CLR_GREEN if ok else CLR_YELLOW))
     return rows
 
 
@@ -360,7 +364,8 @@ def step_account(config_path: Path, session_root: Path) -> bool:
         ("1", "Войти в аккаунт", "новый или уже добавленный", CLR_DIM),
         ("5", "Импорт аккаунтов", "файл или вставка строк", CLR_DIM),
         ("6", "Прогрев", "карантин и aging одним кликом", CLR_DIM),
-        ("8", "Жизненный цикл", "стадии, квоты, heartbeat", CLR_DIM),
+        ("7", "Режим для группы", "галочки: режим, в работе, автопрогрев", CLR_DIM),
+        ("8", "Жизненный цикл", "стадии, квоты, режимы", CLR_DIM),
         ("9", "Профиль канала", "аватарка, описание, никнейм", CLR_DIM),
         None,
         ("4", "Продолжить →", "", ""),
@@ -410,6 +415,11 @@ def step_account(config_path: Path, session_root: Path) -> bool:
             notice, redraw = _setup_warmup_all(config_path), True
             continue
 
+        if choice == "7":
+            notice = _setup_bulk_settings(config_path, accounts) if accounts else ("warn", "Аккаунтов нет")
+            redraw = True
+            continue
+
         if choice == "8":
             _setup_lifecycle(config_path)
             redraw = True
@@ -443,20 +453,22 @@ def step_account(config_path: Path, session_root: Path) -> bool:
 def _setup_account_actions(
     config_path: Path, session_root: Path, accounts: list[tuple[Any, bool]], entry: tuple[Any, bool],
 ) -> tuple[str, str] | None:
-    """Actions of one account: sign in automatically, check login, rename, log out.
+    """Actions of one account: sign in automatically, check login, rename, log out, and its work settings.
 
-    Returns the notice to show (None = nothing happened).
+    A card on top shows the stage, age, today's limit, next comment, last warm-up, mode and auto warm-up. The settings
+    rows (в работе / режим / автопрогрев / прогреть сейчас / снять ограничение) change the account and show the menu
+    again with a fresh card; the other rows act once. Returns the notice to show (None = nothing happened).
     """
+    notice: tuple[str, str] | None = None
     acc = entry[0]
-    rows: list[MenuRow | None] = [
-        ("4", "Войти автоматически", "по почте и паролю аккаунта", CLR_DIM),
-        ("1", "Проверить вход", "", ""),
-        ("2", "Переименовать", "имя для вас: ник или почта", CLR_DIM),
-        ("3", "Выйти из аккаунта", "удалить сохранённую сессию", CLR_DIM),
-        None,
-        ("0", "← Назад", "", ""),
-    ]
-    choice, _ = arrow_menu(lambda: rows, [f" {color(acc.name, CLR_BOLD)}"], esc_key="0")
+    while True:
+        choice = _setup_account_menu(acc, notice)
+        if choice not in _ACCOUNT_SETTING_KEYS:
+            break
+        notice = _setup_account_setting(config_path, acc, choice)
+        fresh = _pools_db(config_path, lambda db: db.get_account(acc.id))
+        acc = fresh or acc
+        clear_terminal()
     if choice == "4":
         return _setup_auto_login(config_path, acc)
     if choice == "1":
@@ -472,6 +484,97 @@ def _setup_account_actions(
             return None
         ok, msg = _setup_clear_session(session_root, acc)
         return ("ok" if ok else "err", msg)
+    return notice
+
+
+_ACCOUNT_SETTING_KEYS = ("5", "6", "7", "8", "9")
+
+
+def _setup_account_menu(acc: Any, notice: tuple[str, str] | None = None) -> str:
+    """Card + menu of one account; returns the chosen key («0»/Esc = back)."""
+    from modules.account_menu_logic import account_card_rows
+    from modules.lifecycle_engine import CIRCUIT_BREAKER_ERRORS, MODE_LABELS, AccountLifecycleEngine
+
+    tui.section_header(acc.name, "аккаунт")
+    tui.kv_table(account_card_rows(acc))
+    if notice:
+        safe_print()
+        tui.status_line(*notice)
+    rows: list[MenuRow | None] = [
+        ("4", "Войти автоматически", "по почте и паролю аккаунта", CLR_DIM),
+        ("1", "Проверить вход", "", ""),
+        ("2", "Переименовать", "имя для вас: ник или почта", CLR_DIM),
+        ("3", "Выйти из аккаунта", "удалить сохранённую сессию", CLR_DIM),
+        None,
+        ("5", f"В работе: {'да' if acc.is_active else 'нет'}", "переключить; выключенный не берётся в рассылку", CLR_DIM),
+        ("6", f"Режим: {MODE_LABELS[AccountLifecycleEngine.mode_of(acc)]}", "по возрасту / уже прогрет / без лимитов", CLR_DIM),
+        ("7", f"Автопрогрев: {'вкл' if acc.auto_warmup else 'выкл'}", "фоновый прогрев во время рассылки", CLR_DIM),
+        ("8", "Прогреть сейчас", "ручной прогрев, откроется браузер", CLR_DIM),
+    ]
+    if acc.consecutive_errors >= CIRCUIT_BREAKER_ERRORS:
+        rows.append(("9", "Снять ограничение", f"{acc.consecutive_errors} ошибок подряд — сбросить", CLR_YELLOW))
+    rows += [None, ("0", "← Назад", "", "")]
+    choice, _ = arrow_menu(lambda: rows, [""], esc_key="0")
+    return choice
+
+
+def _setup_pick_mode(current: str | None = None, question: str = "Режим возраста") -> str | None:
+    """Arrow picker of the age mode; the key of the mode (auto / mature / unlimited), None = cancelled."""
+    from modules.lifecycle_engine import MODE_LABELS
+
+    hints = {
+        "auto": "карантин 24 ч, aging 24-48 ч, дальше лимиты растут",
+        "mature": "купленный или старый аккаунт: сразу 5 в сутки, пауза 45-90 мин",
+        "unlimited": "без стадий, лимита и пауз; остаётся защита от 3 ошибок подряд",
+    }
+    keys = {"1": "auto", "2": "mature", "3": "unlimited"}
+    rows: list[MenuRow | None] = [
+        (key, f"{MODE_LABELS[mode]}{' ✓' if mode == current else ''}", hints[mode], CLR_DIM) for key, mode in keys.items()
+    ]
+    rows += [None, ("0", "← Отмена", "", "")]
+    choice = _pools_choice(rows, [color(f" {question}", CLR_BOLD)])
+    return keys.get(choice)
+
+
+def _setup_apply_settings(config_path: Path, accounts: list[Any], **changes: Any) -> int:
+    """Save mode / auto warm-up / in-work for `accounts`; returns how many were changed."""
+    from youtube_bot import apply_account_settings
+
+    return _pools_db(config_path, lambda db: apply_account_settings(db, accounts, str(config_path), **changes))
+
+
+def _setup_account_setting(config_path: Path, acc: Any, key: str) -> tuple[str, str] | None:
+    """One settings row of the account menu; returns the notice."""
+    from modules.lifecycle_engine import MODE_LABELS
+
+    try:
+        if key == "5":
+            _setup_apply_settings(config_path, [acc], is_active=not acc.is_active)
+            return "ok", f"«{acc.name}»: " + ("выключен — не берётся в рассылку и не прогревается" if acc.is_active else "в работе")
+        if key == "6":
+            from modules.lifecycle_engine import AccountLifecycleEngine
+
+            mode = _setup_pick_mode(AccountLifecycleEngine.mode_of(acc))
+            if mode is None:
+                return None
+            _setup_apply_settings(config_path, [acc], lifecycle_mode=mode)
+            return "ok", f"«{acc.name}»: режим «{MODE_LABELS[mode]}»"
+        if key == "7":
+            _setup_apply_settings(config_path, [acc], auto_warmup=not acc.auto_warmup)
+            return "ok", f"«{acc.name}»: автопрогрев " + ("выключен" if acc.auto_warmup else "включён")
+        if key == "8":
+            return _setup_warm_now(config_path, acc)
+        if key == "9":
+            if not _yes(prompt_user(f"Снять ограничение с «{acc.name}»? Счётчик ошибок обнулится (y/N)", "n")):
+                return None
+            from modules.lifecycle_engine import release_restriction
+
+            _pools_db(config_path, lambda db: release_restriction(db, acc))
+            return "ok", f"«{acc.name}»: ограничение снято"
+    except WizardBack:
+        return None
+    except Exception as exc:
+        return "err", f"«{acc.name}»: не удалось ({exc.__class__.__name__}), подробности в логе"
     return None
 
 
@@ -492,6 +595,84 @@ def _confirm_country_mismatch(message: str) -> bool:
 async def _confirm_country_mismatch_async(message: str) -> bool:
     """The wizard signs in inside `asyncio.run`: the blocking menu runs in a thread so the event loop stays free."""
     return await asyncio.to_thread(_confirm_country_mismatch, message)
+
+
+def _setup_warm_now(config_path: Path, acc: Any) -> tuple[str, str] | None:
+    """«Прогреть сейчас»: a manual warm-up of this one account (works in every mode, also when auto warm-up is off)."""
+    from youtube_bot import warm_up_cli
+
+    if not _yes(prompt_user(f"Прогреть «{acc.name}» (~{WARM_UP_SECONDS:.0f} с, откроется браузер)? (y/N)", "n")):
+        return None
+    try:
+        ok = asyncio.run(warm_up_cli(acc.name, str(config_path), duration=WARM_UP_SECONDS))
+    except KeyboardInterrupt:
+        return "warn", "Прогрев прерван"
+    return ("ok", f"«{acc.name}»: прогрев выполнен") if ok else ("err", f"«{acc.name}»: прогрев не удался, подробности в логе")
+
+
+def _setup_check_accounts(accounts: list[tuple[Any, bool]], question: str) -> list[Any]:
+    """Checkbox list of accounts (Enter/number toggles, A = all/none, D = done); the ticked accounts, [] = cancelled."""
+    from modules.account_menu_logic import account_status_label
+
+    ticked: set[int] = set()
+
+    def toggle(index: int) -> Callable[[], None]:
+        return lambda: ticked.symmetric_difference_update({index})
+
+    def toggle_all() -> None:
+        if len(ticked) == len(accounts):
+            ticked.clear()
+        else:
+            ticked.update(range(1, len(accounts) + 1))
+
+    def rows() -> list[MenuRow | None]:
+        out: list[MenuRow | None] = [
+            (str(i), f"[{'x' if i in ticked else ' '}] {_fit(acc.name, 20)}", account_status_label(acc)[0], CLR_DIM)
+            for i, (acc, _) in enumerate(accounts, 1)
+        ]
+        return [*out, None, ("A", "Все / снять все", "", ""), ("D", f"Готово → выбрано {len(ticked)}", "", ""), ("0", "← Отмена", "", "")]
+
+    actions = {str(i): toggle(i) for i in range(1, len(accounts) + 1)} | {"A": toggle_all}
+    choice, _ = arrow_menu(rows, [color(f" {question}", CLR_BOLD)], esc_key="0", actions=actions)
+    if choice.upper() != "D":
+        return []
+    return [accounts[i - 1][0] for i in sorted(ticked)]
+
+
+def _setup_bulk_settings(config_path: Path, accounts: list[tuple[Any, bool]]) -> tuple[str, str] | None:
+    """«Режим для нескольких»: tick accounts, then set their mode, in-work flag or auto warm-up in one go."""
+    from modules.lifecycle_engine import MODE_LABELS
+
+    picked = _setup_check_accounts(accounts, "Для каких аккаунтов (Enter — галочка)")
+    if not picked:
+        return None
+    rows: list[MenuRow | None] = [
+        ("1", "Режим…", "по возрасту / уже прогрет / без лимитов", CLR_DIM),
+        ("2", "В работе: да", "вернуть в рассылку", CLR_DIM),
+        ("3", "В работе: нет", "не брать в рассылку и не прогревать", CLR_DIM),
+        ("4", "Автопрогрев: вкл", "", CLR_DIM),
+        ("5", "Автопрогрев: выкл", "", CLR_DIM),
+        None,
+        ("0", "← Отмена", "", ""),
+    ]
+    choice = _pools_choice(rows, [color(f" Что поставить: аккаунтов {len(picked)}", CLR_BOLD)])
+    changes: dict[str, Any]
+    if choice == "1":
+        mode = _setup_pick_mode()
+        if mode is None:
+            return None
+        changes, what = {"lifecycle_mode": mode}, f"режим «{MODE_LABELS[mode]}»"
+    elif choice in ("2", "3"):
+        changes, what = {"is_active": choice == "2"}, "в работе: " + ("да" if choice == "2" else "нет")
+    elif choice in ("4", "5"):
+        changes, what = {"auto_warmup": choice == "4"}, "автопрогрев " + ("вкл" if choice == "4" else "выкл")
+    else:
+        return None
+    try:
+        count = _setup_apply_settings(config_path, picked, **changes)
+    except Exception as exc:
+        return "err", f"Не удалось сохранить ({exc.__class__.__name__}), подробности в логе"
+    return "ok", f"{what}: {count} из {len(picked)} акк."
 
 
 def _setup_auto_login(config_path: Path, acc: Any) -> tuple[str, str] | None:
@@ -639,7 +820,7 @@ def _read_secret_line(prompt: str) -> str:
 
 def _read_account_paste() -> list[str]:
     """Pasted `login:password:TOTP_SECRET` lines, one per account, until an empty line."""
-    safe_print(color(" Вставьте по строке на аккаунт: почта, пароль, дальше по желанию TOTP, резервная почта, прокси.", CLR_DIM))
+    safe_print(color(" Вставьте по строке на аккаунт: почта, пароль, дальше по желанию TOTP, резервная почта, прокси, mode=mature|unlimited.", CLR_DIM))
     safe_print(color(" Разделитель — пробел, табуляция или двоеточие. Пустая строка — конец.", CLR_DIM))
     lines: list[str] = []
     while True:
@@ -675,13 +856,19 @@ def _read_accounts_file() -> list[str] | None:
         return None
 
 
-def _setup_register(config_path: Path, lines: list[str]) -> Any:
-    """Register the account lines through the CLI importer (existing accounts are skipped, not overwritten)."""
+def _setup_register(config_path: Path, lines: list[str], default_mode: str | None = None) -> Any:
+    """Register the account lines through the CLI importer (existing accounts are skipped, not overwritten).
+
+    `default_mode` is the age mode of the lines that have no `mode=` of their own.
+    """
     from config import load_config
     from youtube_bot import register_account_lines
 
     cfg = load_config(config_path)
-    return _pools_db(config_path, lambda db: register_account_lines(db, cfg, lines, skip_existing=True))
+    return _pools_db(
+        config_path,
+        lambda db: register_account_lines(db, cfg, lines, skip_existing=True, default_mode=default_mode),
+    )
 
 
 def _setup_profile(config_path: Path, accounts: list[tuple[Any, bool]]) -> tuple[str, str] | None:
@@ -889,8 +1076,11 @@ def _setup_import(config_path: Path) -> tuple[str, str] | None:
         _pause()
         return None
 
+    mode = _setup_pick_mode("auto", "Эти аккаунты уже прогреты? (mode= в строке важнее)")
+    if mode is None:
+        return "info", "Импорт отменён"
     try:
-        result = _setup_register(config_path, lines)
+        result = _setup_register(config_path, lines, mode)
     except KeyboardInterrupt:
         return "warn", "Импорт прерван — часть аккаунтов могла добавиться, проверьте список"
     except Exception as exc:  # a broken DB or config: the lines are not in the message
@@ -986,9 +1176,14 @@ def _setup_lifecycle(config_path: Path) -> None:
             f"   {cell(row.name, name_w, '')}  {cell(row.stage, stage_w, row.stage_style)}  {cell(row.quota, quota_w)}"
             f"  {cell(row.heartbeat, beat_w, row.heartbeat_style)}  {cell(row.pause, pause_w, row.pause_style)}".rstrip()
         )
+        in_work = color(row.in_work, styles.get(row.in_work_style, ""))
+        warm = color(row.auto_warmup, styles.get(row.auto_warmup_style, ""))
+        safe_print(color("     ↳ режим: ", CLR_DIM) + f"{row.mode}" + color(" · в работе: ", CLR_DIM) + in_work
+                   + color(" · автопрогрев: ", CLR_DIM) + warm)
     if len(rows) > len(shown):
         safe_print(color(f"   … ещё {len(rows) - len(shown)}", CLR_DIM))
     safe_print(color("   Квота — комментарии за сутки / лимит стадии. Heartbeat: сессия · последний прогрев.", CLR_DIM))
+    safe_print(color("   Режим, «в работе» и автопрогрев меняются в меню аккаунта (Enter на строке).", CLR_DIM))
     _pause()
 
 

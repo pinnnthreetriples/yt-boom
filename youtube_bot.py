@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
 
+import yaml
 from loguru import logger
 
 from config import AppConfig, ProxyUnavailableError, load_config, mask_proxy_url, resolve_account_proxy
@@ -21,7 +22,13 @@ from modules.account_warmer import AccountWarmer, WarmUpResult
 from modules.geo_guard import check_account_exit, normalize_country, normalize_locale, resolve_exit_country, warn_if_exit_mismatch
 from modules.google_authenticator import GoogleAuthenticator, GoogleAuthError, read_session_owner, write_session_owner
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
-from modules.lifecycle_engine import AccountLifecycleEngine
+from modules.lifecycle_engine import (
+    CIRCUIT_BREAKER_ERRORS,
+    LIFECYCLE_MODES,
+    MODE_LABELS,
+    AccountLifecycleEngine,
+    release_restriction,
+)
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.profile_manager import ProfileEditor
 from modules.proxy_library import log_proxy_routes, run_config_proxy_migration
@@ -297,9 +304,11 @@ async def _register_credentials_account(
     proxy_url: str | None = None,
     country: str | None = None,
     locale: str | None = None,
+    default_mode: str | None = None,
 ) -> AccountRecord:
     """Register `email:password:totp[...]`. A known account keeps its session path, proxy, active flag, expected country
-    and locale unless told otherwise."""
+    and locale unless told otherwise. The age mode comes from the line's `mode=` or else `default_mode`; without
+    either a known account keeps its mode and a new one is "auto"."""
     parsed = parse_account_line(spec, proxy=proxy_url, country=country, locale=locale)
     account_name = (name or parsed.default_name).strip()
     existing = await db.get_account(account_name)
@@ -318,7 +327,12 @@ async def _register_credentials_account(
         upsert_args["expected_country"] = parsed.expected_country
     if parsed.locale is not None:
         upsert_args["locale"] = parsed.locale
-    return await db.upsert_account(**upsert_args)
+    account = await db.upsert_account(**upsert_args)
+    mode = parsed.lifecycle_mode or default_mode
+    if mode is not None and mode != account.lifecycle_mode:
+        await db.set_account_lifecycle_mode(account.id, mode)
+        account = account.model_copy(update={"lifecycle_mode": mode})
+    return account
 
 
 def mask_email(email: str | None) -> str:
@@ -494,9 +508,11 @@ class AccountImportResult:
 
 
 async def register_account_lines(
-    db: Database, cfg: AppConfig, lines: Iterable[str], skip_existing: bool = False
+    db: Database, cfg: AppConfig, lines: Iterable[str], skip_existing: bool = False, default_mode: str | None = None
 ) -> AccountImportResult:
     """Register every account line (blank lines and `#` comments are ignored); one bad line never stops the rest.
+
+    `default_mode` ("auto" / "mature" / "unlimited") is the age mode of every line without its own `mode=`.
 
     With `skip_existing` a line whose account is already in the database (or repeated earlier in the batch) is
     reported as skipped instead of overwriting its credentials.
@@ -514,7 +530,7 @@ async def register_account_lines(
                 if parsed.email.lower() in known_emails or await db.get_account(parsed.default_name) is not None:
                     result.skipped.append((number, "аккаунт уже есть"))
                     continue
-            account = await _register_credentials_account(db, cfg, line)
+            account = await _register_credentials_account(db, cfg, line, default_mode=default_mode)
             result.added.append(account)
             if account.email:
                 known_emails.add(account.email.lower())
@@ -735,37 +751,149 @@ async def warm_selected_cli(
 
 
 async def lifecycle_cli(config_path: str = "config.yaml") -> None:
-    """`--lifecycle`: account ages, stages, quarantine hours left and today's comment quota."""
+    """`--lifecycle`: ages, stages, quarantine hours left, today's quota, mode, on/off and auto warm-up per account."""
     cfg = load_config(config_path)
     async with Database(cfg.app.db_path) as db:
         accounts = await db.list_accounts()
         now = datetime.now(timezone.utc)
-        width = 100
+        width = 128
         print("\n" + "=" * width)
-        print("                                 ACCOUNT LIFECYCLE")
+        print("                                           ACCOUNT LIFECYCLE")
         print("=" * width)
         if not accounts:
             print("  No accounts found in database.")
         else:
             print(
                 f"{'Account':<16} | {'Auth':<13} | {'Age':>7} | {'Stage':<11} | {'Quarantine':>10} | "
-                f"{'Today':>7} | {'Errors':>6} | {'Warm-ups':>8}"
+                f"{'Today':>7} | {'Errors':>6} | {'Warm-ups':>8} | {'Mode':<9} | {'Active':<6} | {'AutoWarm':<8}"
             )
             print("-" * width)
             for acc in accounts:
                 view = AccountLifecycleEngine.summarize(acc, now)
-                stage = view.stage
                 if view.age_hours is None:
                     age, left, quota = "-", "-", "-"
                 else:
                     age = f"{view.age_hours:.1f}h"
                     left = f"{view.quarantine_left:.1f}h"
-                    quota = f"{view.quota_done}/{view.quota_limit}"
+                    quota = f"{view.quota_done}/{'inf' if view.quota_limit is None else view.quota_limit}"
                 print(
-                    f"{acc.name:<16} | {acc.auth_status:<13} | {age:>7} | {stage:<11} | {left:>10} | "
-                    f"{quota:>7} | {acc.consecutive_errors:>6} | {acc.warmup_sessions_done:>8}"
+                    f"{acc.name:<16} | {acc.auth_status:<13} | {age:>7} | {_stage_text(view):<11} | {left:>10} | "
+                    f"{quota:>7} | {acc.consecutive_errors:>6} | {acc.warmup_sessions_done:>8} | "
+                    f"{AccountLifecycleEngine.mode_of(acc):<9} | {'yes' if acc.is_active else 'NO':<6} | "
+                    f"{'on' if acc.auto_warmup else 'off':<8}"
                 )
+            print("-" * width)
+            print("  Mode: auto = by age, mature = already warmed up (stage shown as mature*), unlimited = no stages and limits.")
         print("=" * width + "\n")
+
+
+_ON_OFF = {"on": True, "off": False, "1": True, "0": False, "yes": True, "no": False, "да": True, "нет": False}
+
+
+def _stage_text(view: Any) -> str:
+    """Stage column of `--lifecycle`: «mature*» when the mode, not the age, makes the account mature."""
+    return "mature*" if view.mode == "mature" and view.stage == "mature" else view.stage
+
+
+def mirror_active_to_config(config_path: str, name: str, active: bool) -> None:
+    """Best effort: write the account's `is_active` into config.yaml too, so a later config sync cannot undo the switch."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        accounts = (raw.get("browser") or {}).get("accounts") or []
+        entry = next((a for a in accounts if isinstance(a, dict) and a.get("name") == name), None)
+        if entry is None or entry.get("is_active", True) == active:
+            return
+        entry["is_active"] = active
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
+    except Exception as exc:
+        logger.warning("config.yaml не обновлён для {!r}: {}", name, exc)
+
+
+async def apply_account_settings(
+    db: Database,
+    accounts: Iterable[AccountRecord],
+    config_path: str,
+    *,
+    lifecycle_mode: str | None = None,
+    auto_warmup: bool | None = None,
+    is_active: bool | None = None,
+) -> int:
+    """Set the given work settings (None = leave) on every account; returns how many accounts were changed.
+
+    Shared by the wizard (single and bulk changes); `is_active` is mirrored into config.yaml.
+    """
+    changed = 0
+    for account in accounts:
+        if lifecycle_mode is not None:
+            await db.set_account_lifecycle_mode(account.id, lifecycle_mode)
+        if auto_warmup is not None:
+            await db.set_account_auto_warmup(account.id, auto_warmup)
+        if is_active is not None:
+            await db.set_account_active(account.id, is_active)
+            mirror_active_to_config(config_path, account.name, is_active)
+        changed += 1
+    return changed
+
+
+async def _account_setting_cli(
+    identifier: str, config_path: str, change: Callable[[Database, AccountRecord], Awaitable[str]]
+) -> bool:
+    cfg = load_config(config_path)
+    async with Database(cfg.app.db_path) as db:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
+            return False
+        print(f"[OK] {account.name}: {await change(db, account)}")
+        return True
+
+
+async def set_mode_cli(identifier: str, mode: str, config_path: str = "config.yaml") -> bool:
+    """`--set-mode NAME auto|mature|unlimited`: the account's age mode."""
+    if mode not in LIFECYCLE_MODES:
+        print(f"[ERROR] Unknown mode {mode!r}: use {', '.join(LIFECYCLE_MODES)}.", file=sys.stderr)
+        return False
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        await db.set_account_lifecycle_mode(account.id, mode)
+        return f"mode = {mode} ({MODE_LABELS[mode]})"
+
+    return await _account_setting_cli(identifier, config_path, change)
+
+
+async def set_auto_warmup_cli(identifier: str, enabled: bool, config_path: str = "config.yaml") -> bool:
+    """`--auto-warmup NAME on|off`: whether a run may start a background warm-up of the account."""
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        await db.set_account_auto_warmup(account.id, enabled)
+        return f"auto warm-up {'on' if enabled else 'off'}"
+
+    return await _account_setting_cli(identifier, config_path, change)
+
+
+async def set_active_cli(identifier: str, enabled: bool, config_path: str = "config.yaml") -> bool:
+    """`--set-active NAME on|off`: «В работе»; a switched-off account is not used for a run and not warmed up."""
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        await db.set_account_active(account.id, enabled)
+        mirror_active_to_config(config_path, account.name, enabled)
+        return "in work" if enabled else "switched off"
+
+    return await _account_setting_cli(identifier, config_path, change)
+
+
+async def reset_restricted_cli(identifier: str, config_path: str = "config.yaml") -> bool:
+    """`--reset-restricted NAME`: lift the circuit breaker (the error streak and the stage restart)."""
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        if account.consecutive_errors < CIRCUIT_BREAKER_ERRORS:
+            return "not restricted, nothing to reset"
+        await release_restriction(db, account)
+        return "restriction lifted"
+
+    return await _account_setting_cli(identifier, config_path, change)
 
 
 async def print_accounts_table(config_path: str = "config.yaml") -> None:
@@ -1714,6 +1842,10 @@ def main() -> None:
     parser.add_argument("--apply-profile", type=str, default=None, metavar="NAME_OR_EMAIL", help="Publish the channel profile saved in the wizard (nickname, description, avatar) to the account's YouTube channel")
     parser.add_argument("--lifecycle", action="store_true", help="Show account ages, lifecycle stages, quarantine hours left and daily comment quota")
     parser.add_argument("--warm-quarantined", action="store_true", help="Run organic warm-up, one account after another, for every account in quarantine or aging (uses --warm-up-duration)")
+    parser.add_argument("--set-mode", nargs=2, default=None, metavar=("NAME", "MODE"), help="Account age mode: auto (by age), mature (already warmed up: 5/day, 45-90 min) or unlimited (no stages and limits)")
+    parser.add_argument("--auto-warmup", nargs=2, default=None, metavar=("NAME", "on|off"), help="Allow (on) or forbid (off) the background warm-up of the account during a run")
+    parser.add_argument("--set-active", nargs=2, default=None, metavar=("NAME", "on|off"), help="Put the account in work (on) or switch it off (off): runs skip it and it is not warmed up")
+    parser.add_argument("--reset-restricted", type=str, default=None, metavar="NAME", help="Lift the circuit breaker of a restricted account (3 errors in a row)")
     parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
     parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt)")
     parser.add_argument("--concurrency", "-j", type=int, default=None, help="Accounts working at the same time (default: limits.max_concurrent_sessions)")
@@ -1752,6 +1884,19 @@ def main() -> None:
     if args.lifecycle:
         asyncio.run(lifecycle_cli(args.config))
         return
+
+    if args.set_mode:
+        sys.exit(0 if asyncio.run(set_mode_cli(args.set_mode[0], args.set_mode[1].lower(), args.config)) else 1)
+
+    for switch, handler in ((args.auto_warmup, set_auto_warmup_cli), (args.set_active, set_active_cli)):
+        if switch:
+            if switch[1].lower() not in _ON_OFF:
+                print(f"[ERROR] Expected on or off, got {switch[1]!r}.", file=sys.stderr)
+                sys.exit(1)
+            sys.exit(0 if asyncio.run(handler(switch[0], _ON_OFF[switch[1].lower()], args.config)) else 1)
+
+    if args.reset_restricted:
+        sys.exit(0 if asyncio.run(reset_restricted_cli(args.reset_restricted, args.config)) else 1)
 
     if args.warm_quarantined:
         ok = asyncio.run(
