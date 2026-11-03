@@ -28,7 +28,7 @@ edges:
     condition: when changing an account's YouTube channel nickname, description or avatar
   - target: patterns/debug-browser-interaction.md
     condition: when diagnosing browser automation or selector issues
-last_updated: 2026-11-01
+last_updated: 2026-11-03
 ---
 
 # Session Bootstrap
@@ -48,8 +48,8 @@ Then read this file fully before doing anything else in this session.
 - Automated Google authentication state machine with RFC 6238 TOTP window guard and speedbump dismissal
 - Windows DPAPI credential encryption (`protect_secret` / `reveal_secret`) for SQLite persistence
 - Multi-account parallel orchestration supporting `each` and `share` routing modes
-- Account lifecycle engine (`modules/lifecycle_engine.py`): quarantine 0-24h, aging 24-48h (no comments), probation 48-72h (1/day, 3h cooldown), mature 72h+ (5/day, 45-90 min); 3 consecutive errors restrict an account; `--lifecycle` and `--warm-quarantined` CLI
-- Wizard stage 1 «Аккаунты» menu: each account is its own row (Enter/Space opens «Проверить вход» / «Переименовать» / «Выйти из аккаунта» for that account); `1` add/log in, `5` import accounts (file or pasted `login:password:TOTP` lines, then pick who to warm up), `6` warm up all quarantine/aging accounts, `8` read-only lifecycle table (`modules/account_menu_logic.py`)
+- Account lifecycle engine (`modules/lifecycle_engine.py`): quarantine 0-24h, aging 24-48h (no comments), probation 48-72h (1/day, 3h cooldown), mature 72h+ (5/day, 45-90 min); 3 consecutive errors restrict an account; `--lifecycle` and `--warm-quarantined` CLI. Per account: `lifecycle_mode` (`auto` by age / `mature` already warmed up / `unlimited` no limits except the breaker), `auto_warmup` on/off, `is_active` in work; CLI `--set-mode`, `--auto-warmup`, `--set-active`, `--reset-restricted`
+- Wizard stage 1 «Аккаунты» menu: each account is its own row (Enter/Space opens «Проверить вход» / «Переименовать» / «Выйти из аккаунта» for that account); `1` add/log in, `5` import accounts (file or pasted `login:password:TOTP` lines, then pick who to warm up), `6` warm up all quarantine/aging accounts, `7` bulk mode/in-work/auto-warm-up for ticked accounts, `8` read-only lifecycle table (`modules/account_menu_logic.py`); each account row shows its stage/mode and its menu has a card plus mode, in-work, auto warm-up, warm-up-now and «Снять ограничение»
 - Channel profile (`modules/profile_manager.py`): wizard stage 1 `9` «Профиль канала» → account (Space/Enter) → card with nickname / description / avatar edit rows saved as a DB draft (`accounts.profile_*`), «Применить на YouTube» publishes it through YouTube Studio in the account's own Camoufox profile; `--apply-profile <name>` does the same from the CLI
 - Comprehensive automated test suite (709 passing unit and integration tests)
 

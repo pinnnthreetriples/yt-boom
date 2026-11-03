@@ -156,6 +156,13 @@ _ACCOUNT_LIFECYCLE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("consecutive_errors", "INTEGER NOT NULL DEFAULT 0"),
 )
 
+# Per-account switches: `lifecycle_mode` ("auto" by age / "mature" already warmed up / "unlimited" no limits) and
+# `auto_warmup` (the orchestrator may start a background warm-up). Existing accounts become auto / on.
+_ACCOUNT_MODE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("lifecycle_mode", "TEXT NOT NULL DEFAULT 'auto'"),
+    ("auto_warmup", "INTEGER NOT NULL DEFAULT 1"),
+)
+
 # Channel profile: the draft the operator typed (`profile_name` / `profile_description` / `profile_avatar`), the JSON
 # snapshot of what was last published to YouTube (`profile_applied`) and the JSON list of recent channel-name changes.
 _ACCOUNT_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -310,6 +317,8 @@ class AccountRecord(BaseModel):
     warmup_sessions_done: int = 0
     last_warmup_at: str | None = None
     consecutive_errors: int = 0
+    lifecycle_mode: str = "auto"
+    auto_warmup: bool = True
     profile_name: str | None = None
     profile_description: str | None = None
     profile_avatar: str | None = None
@@ -489,6 +498,7 @@ class Database:
                 await conn.commit()
             await conn.executescript(_MULTI_ACCOUNT_SCHEMA)
             await self._ensure_account_columns(conn)
+            await self._ensure_account_mode_columns(conn)
             await conn.commit()
         logger.debug("Database schema ensured at {}", self._path)
 
@@ -509,6 +519,20 @@ class Database:
         await conn.execute(
             "UPDATE accounts SET authenticated_at = created_at WHERE auth_status = 'authenticated' AND authenticated_at IS NULL"
         )
+
+    @staticmethod
+    async def _ensure_account_mode_columns(conn: aiosqlite.Connection) -> None:
+        """Incremental migration: `lifecycle_mode` / `auto_warmup` for accounts created before the age modes existed."""
+        cursor = await conn.execute("PRAGMA table_info(accounts)")
+        existing = {str(row[1]) for row in await cursor.fetchall()}
+        await cursor.close()
+        for column, ddl in _ACCOUNT_MODE_COLUMNS:
+            if column not in existing:
+                try:
+                    await conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
+                except aiosqlite.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -1490,6 +1514,40 @@ class Database:
         async with self._transaction() as conn:
             cursor = await conn.execute(
                 f"UPDATE accounts SET {assignments} WHERE id = ?", (*fields.values(), account_id)
+            )
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account id={account_id} not found")
+
+    async def set_account_lifecycle_mode(self, account_id: int, mode: str) -> None:
+        """"auto" / "mature" / "unlimited"; the stage is re-derived by the engine on its next check."""
+        if mode not in ("auto", "mature", "unlimited"):
+            raise ValueError(f"unknown lifecycle mode {mode!r}")
+        async with self._transaction() as conn:
+            cursor = await conn.execute("UPDATE accounts SET lifecycle_mode = ? WHERE id = ?", (mode, account_id))
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account id={account_id} not found")
+
+    async def set_account_auto_warmup(self, account_id: int, enabled: bool) -> None:
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE accounts SET auto_warmup = ? WHERE id = ?", (1 if enabled else 0, account_id)
+            )
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account id={account_id} not found")
+
+    async def set_account_active(self, account_id: int, active: bool) -> None:
+        """«В работе»: an inactive account is neither picked for a run nor warmed up automatically."""
+        async with self._transaction() as conn:
+            cursor = await conn.execute("UPDATE accounts SET is_active = ? WHERE id = ?", (1 if active else 0, account_id))
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"account id={account_id} not found")
+
+    async def reset_account_restriction(self, account_id: int, stage: str, daily_limit: int) -> None:
+        """Lift the circuit breaker: the error streak restarts and the stored stage/limit are replaced."""
+        async with self._transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE accounts SET consecutive_errors = 0, lifecycle_stage = ?, daily_comments_limit = ? WHERE id = ?",
+                (stage, daily_limit, account_id),
             )
             if cursor.rowcount == 0:
                 raise RecordNotFoundError(f"account id={account_id} not found")
