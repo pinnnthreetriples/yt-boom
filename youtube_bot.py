@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
 
-import yaml
 from loguru import logger
 
 from config import AppConfig, ProxyUnavailableError, load_config, mask_proxy_url, resolve_account_proxy
@@ -795,26 +794,9 @@ def _stage_text(view: Any) -> str:
     return "mature*" if view.mode == "mature" and view.stage == "mature" else view.stage
 
 
-def mirror_active_to_config(config_path: str, name: str, active: bool) -> None:
-    """Best effort: write the account's `is_active` into config.yaml too, so a later config sync cannot undo the switch."""
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-        accounts = (raw.get("browser") or {}).get("accounts") or []
-        entry = next((a for a in accounts if isinstance(a, dict) and a.get("name") == name), None)
-        if entry is None or entry.get("is_active", True) == active:
-            return
-        entry["is_active"] = active
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
-    except Exception as exc:
-        logger.warning("config.yaml не обновлён для {!r}: {}", name, exc)
-
-
 async def apply_account_settings(
     db: Database,
     accounts: Iterable[AccountRecord],
-    config_path: str,
     *,
     lifecycle_mode: str | None = None,
     auto_warmup: bool | None = None,
@@ -822,7 +804,7 @@ async def apply_account_settings(
 ) -> int:
     """Set the given work settings (None = leave) on every account; returns how many accounts were changed.
 
-    Shared by the wizard (single and bulk changes); `is_active` is mirrored into config.yaml.
+    Shared by the wizard (single and bulk changes). The config.yaml sync never overwrites these in the database.
     """
     changed = 0
     for account in accounts:
@@ -832,7 +814,6 @@ async def apply_account_settings(
             await db.set_account_auto_warmup(account.id, auto_warmup)
         if is_active is not None:
             await db.set_account_active(account.id, is_active)
-            mirror_active_to_config(config_path, account.name, is_active)
         changed += 1
     return changed
 
@@ -878,7 +859,6 @@ async def set_active_cli(identifier: str, enabled: bool, config_path: str = "con
 
     async def change(db: Database, account: AccountRecord) -> str:
         await db.set_account_active(account.id, enabled)
-        mirror_active_to_config(config_path, account.name, enabled)
         return "in work" if enabled else "switched off"
 
     return await _account_setting_cli(identifier, config_path, change)

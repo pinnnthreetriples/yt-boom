@@ -343,11 +343,14 @@ def _setup_account_rows(accounts: list[tuple[Any, bool]]) -> list[MenuRow | None
     """One selectable row per account (key A1, A2, …): name, login state, proxy, stage/mode."""
     from modules.account_menu_logic import account_status_label
 
-    name_w, status_w = 16, 15  # the proxy keeps 19 characters: «http://1.2.3.4:8080»
+    name_w, status_w = 15, 15  # the proxy keeps 20 characters: «[PL] 255.255.255.255»
     proxy_w = MENU_WIDTH - 3 - name_w - 2 - 11 - 2 - status_w - 2  # the status is the last column, after the proxy
     rows: list[MenuRow | None] = []
     for i, (acc, ok) in enumerate(accounts, 1):
-        proxy = _fit(_account_proxy_text(acc), proxy_w)
+        proxy = _account_proxy_text(acc)
+        if len(proxy) > proxy_w and proxy.rpartition(":")[2].isdigit():  # no room: the port goes, stage 2 shows it
+            proxy = proxy.rpartition(":")[0]
+        proxy = _fit(proxy, proxy_w)
         state = "● вошёл" if ok else "○ нет входа"
         status = _fit(account_status_label(acc)[0], status_w)
         rows.append((f"A{i}", _fit(acc.name, name_w), f"{state:<11}  {proxy:<{proxy_w}}  {status}", CLR_GREEN if ok else CLR_YELLOW))
@@ -540,7 +543,7 @@ def _setup_apply_settings(config_path: Path, accounts: list[Any], **changes: Any
     """Save mode / auto warm-up / in-work for `accounts`; returns how many were changed."""
     from youtube_bot import apply_account_settings
 
-    return _pools_db(config_path, lambda db: apply_account_settings(db, accounts, str(config_path), **changes))
+    return _pools_db(config_path, lambda db: apply_account_settings(db, accounts, **changes))
 
 
 def _setup_account_setting(config_path: Path, acc: Any, key: str) -> tuple[str, str] | None:
@@ -611,32 +614,13 @@ def _setup_warm_now(config_path: Path, acc: Any) -> tuple[str, str] | None:
 
 
 def _setup_check_accounts(accounts: list[tuple[Any, bool]], question: str) -> list[Any]:
-    """Checkbox list of accounts (Enter/number toggles, A = all/none, D = done); the ticked accounts, [] = cancelled."""
+    """Checkbox list of accounts (the shared `tui.checklist`); the ticked accounts, [] = cancelled or none ticked."""
     from modules.account_menu_logic import account_status_label
 
-    ticked: set[int] = set()
-
-    def toggle(index: int) -> Callable[[], None]:
-        return lambda: ticked.symmetric_difference_update({index})
-
-    def toggle_all() -> None:
-        if len(ticked) == len(accounts):
-            ticked.clear()
-        else:
-            ticked.update(range(1, len(accounts) + 1))
-
-    def rows() -> list[MenuRow | None]:
-        out: list[MenuRow | None] = [
-            (str(i), f"[{'x' if i in ticked else ' '}] {_fit(acc.name, 20)}", account_status_label(acc)[0], CLR_DIM)
-            for i, (acc, _) in enumerate(accounts, 1)
-        ]
-        return [*out, None, ("A", "Все / снять все", "", ""), ("D", f"Готово → выбрано {len(ticked)}", "", ""), ("0", "← Отмена", "", "")]
-
-    actions = {str(i): toggle(i) for i in range(1, len(accounts) + 1)} | {"A": toggle_all}
-    choice, _ = arrow_menu(rows, [color(f" {question}", CLR_BOLD)], esc_key="0", actions=actions)
-    if choice.upper() != "D":
-        return []
-    return [accounts[i - 1][0] for i in sorted(ticked)]
+    items = [(_fit(acc.name, 22), account_status_label(acc)[0], "dim") for acc, _ in accounts]
+    header = [color(f" {question}", CLR_BOLD), color(" Enter/Пробел — отметить · Esc — отмена", CLR_DIM), ""]
+    picked = tui.checklist(items, (), header, save_label="Готово", interactive=_use_arrow_keys(), ask_fn=prompt_user)
+    return [accounts[i][0] for i in sorted(picked or ())]
 
 
 def _setup_bulk_settings(config_path: Path, accounts: list[tuple[Any, bool]]) -> tuple[str, str] | None:

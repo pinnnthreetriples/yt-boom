@@ -18,6 +18,7 @@ import yaml
 from loguru import logger
 
 import youtube_bot
+from config import load_config
 from database import AccountRecord, Database
 from modules.account_menu_logic import (
     account_card_rows,
@@ -32,6 +33,7 @@ from modules.lifecycle_engine import (
     release_restriction,
 )
 from modules.multi_account_orchestrator import MultiAccountOrchestrator
+from modules.proxy_library import sync_config_accounts
 from modules.wizard import (
     MENU_WIDTH,
     _setup_account_actions,
@@ -42,7 +44,7 @@ from modules.wizard import (
     load_accounts,
 )
 from tests.test_account_menu import MenuCase, good_line
-from tests.tui_keys import ENTER, ESC, scripted_keys
+from tests.tui_keys import DOWN, ENTER, ESC, SPACE, scripted_keys
 
 T0 = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -409,11 +411,12 @@ class TestCliFunctions(CliCase):
         self.run_cli(youtube_bot.set_auto_warmup_cli("bob", True, str(self.config_path)))
         self.assertTrue(self.bob().auto_warmup)
 
-    def test_set_active_updates_the_database_and_the_config(self):
+    def test_set_active_survives_a_config_sync(self):
         self.run_cli(youtube_bot.set_active_cli("bob", False, str(self.config_path)))
         self.assertFalse(self.bob().is_active)
-        cfg = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
-        self.assertFalse(cfg["browser"]["accounts"][0]["is_active"])  # a config sync cannot switch it back on
+        cfg = load_config(self.config_path)  # config.yaml still says is_active: true
+        self.db(lambda db: sync_config_accounts(db, cfg.browser.accounts))
+        self.assertFalse(self.bob().is_active)
         self.run_cli(youtube_bot.set_active_cli("bob", True, str(self.config_path)))
         self.assertTrue(self.bob().is_active)
 
@@ -627,8 +630,10 @@ class TestWizardScreens(MenuCase):
     def test_bulk_mode_for_ticked_accounts(self):
         self.seed(3)
         accounts = [(a, True) for a in load_accounts(self.config_path)]
-        # tick 1 and 3, «Готово» (D), «Режим…» (1), «Без лимитов» (3)
-        notice, _ = self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), "1", "3", "D", "1", "3")
+        # tick 1 and 3, «Готово», «Режим…» (1), «Без лимитов» (3)
+        notice, _ = self.run_keys(
+            lambda: _setup_bulk_settings(self.config_path, accounts), SPACE, DOWN, DOWN, SPACE, DOWN, ENTER, "1", "3"
+        )
         modes = {n: a.lifecycle_mode for n, a in self.accounts().items()}
         self.assertEqual((modes["user1@example.com"], modes["user2@example.com"], modes["user3@example.com"]),
                          ("unlimited", "auto", "unlimited"))
@@ -637,17 +642,17 @@ class TestWizardScreens(MenuCase):
     def test_bulk_in_work_and_auto_warmup_for_all(self):
         self.seed(2)
         accounts = [(a, True) for a in load_accounts(self.config_path)]
-        self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), "A", "D", "3")
+        self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), SPACE, DOWN, SPACE, DOWN, ENTER, "3")
         self.assertEqual([a.is_active for a in self.accounts().values()], [False, False])
-        self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), "A", "D", "5")
+        self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), SPACE, DOWN, SPACE, DOWN, ENTER, "5")
         self.assertEqual([a.auto_warmup for a in self.accounts().values()], [False, False])
 
     def test_bulk_cancel_changes_nothing(self):
         self.seed(1)
         accounts = [(a, True) for a in load_accounts(self.config_path)]
-        notice, _ = self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), "1", "0")
+        notice, _ = self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), SPACE, ESC)
         self.assertIsNone(notice)
-        notice, _ = self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), "D")
+        notice, _ = self.run_keys(lambda: _setup_bulk_settings(self.config_path, accounts), DOWN, ENTER)
         self.assertIsNone(notice)
 
     def test_lifecycle_table_has_mode_work_and_warmup_line(self):

@@ -475,7 +475,7 @@ class TestYourIpOutsideStage(ProxyScreenCase):
         self.assertEqual(_account_proxy_text(accounts["alice"]), "[PL] 45.130.253.31:8000")
         self.assertEqual(_account_proxy_text(accounts["bob"]), "с вашего IP")
         rows = _setup_account_rows([(accounts["alice"], True)])
-        self.assertTrue(rows[0][2].endswith("[PL] 45.130.253.31:8000"))
+        self.assertIn("[PL] 45.130.253.31 ", rows[0][2])  # the stage column follows; no room for the port
 
 
 if __name__ == "__main__":
