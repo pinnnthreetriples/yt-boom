@@ -16,7 +16,7 @@
 
 ## Quick Commands
 - Run all tests: `python run_tests.py`
-- Launch interactive wizard: `python youtube_bot.py --wizard`
+- Launch the console interface (tabs «Запуск», «Аккаунты», «Прокси», «Цель», «Ответы»): `python youtube_bot.py --wizard`
 - Authenticate single account: `python youtube_bot.py --auth-account <name>`
 - Batch import accounts: `python youtube_bot.py --import-accounts-file <path>`
 - List accounts: `python youtube_bot.py --list-accounts`

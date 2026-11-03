@@ -15,7 +15,7 @@ edges:
   - target: context/modules.md
     condition: when inspecting module implementations and code-grounded behaviors
 grounds_to: []
-last_updated: 2026-10-31
+last_updated: 2026-11-03
 mex:
   id: mx_01M69TVZXPPER40BE4QGRY2Q4M
   type: architecture
@@ -38,7 +38,7 @@ mex:
 
 ## System Overview
 The pipeline operates as an automated, multi-account YouTube comment-reply system with strict anti-fraud safeguards:
-1. **Target Ingestion & Discovery**: Video URLs or search terms are supplied via CLI, text files, or the interactive wizard (`modules/wizard.py`). YouTube InnerTube API queries (`modules/youtube_collector.py`) find candidate videos and harvest popular parent comments and nested sub-comments without requiring official Google Data API credentials.
+1. **Target Ingestion & Discovery**: Video URLs or search terms are supplied via CLI, text files, or the interactive console interface (`modules/ui/app.py`, «Цель» tab; shared helpers in `modules/wizard.py`). YouTube InnerTube API queries (`modules/youtube_collector.py`) find candidate videos and harvest popular parent comments and nested sub-comments without requiring official Google Data API credentials.
 2. **Text Filtering & Payload Generation**: Fetched sub-comments pass through `modules/collector.py` for language validation (`lingua-language-detector`) and text metrics. Qualifying comments are dispatched to DeepSeek API via `modules/processor.py` for context-aware reply generation, followed by typography normalization (`normalize_text`).
 3. **Queueing & Multi-Account Orchestration**: Targets and generated payloads are queued in SQLite (`test_metrics.db`) via `database.py`. `modules/multi_account_orchestrator.py` assigns targets across active Google accounts according to concurrency limits and routing modes (`each` or `share`).
 4. **Browser Automation & Natural Interaction**: For each target, `modules/youtube_runner.py` drives a persistent `AsyncCamoufox` session with dedicated hardware fingerprints (`modules/fingerprint_manager.py`), pinned proxies, and remote SOCKS5 DNS. Mouse movement follows Bezier curves with speed jitter, human pauses, and natural keystroke timings (`modules/interaction_simulator.py`).

@@ -48,7 +48,7 @@ Automated sign-in to Google accounts requires navigating `accounts.google.com` w
 ## Country check before the sign-in
 Before a real sign-in (`_authenticate_account`, `interactive_login`) `_login_country_allowed` compares the proxy's exit country with the account's `expected_country` (`geo_guard.check_account_exit`: `ok` / `mismatch` / `unknown` / `skipped`). `mismatch` and `unknown` **no longer cancel silently**; the person decides, once per sign-in:
 - `--allow-country-mismatch` (on `--auth-account`, `--import-accounts-file`, `--login --account`) → a warning in the log, the sign-in goes on without a question;
-- otherwise a `confirm_country` callback (the wizard's «Войти автоматически» passes an arrow menu «Отменить вход» / «Продолжить вход», cursor on «Отменить», run in a thread because the sign-in is inside `asyncio.run`) or, with a console stdin, the question «Отменить вход или продолжить?»; Enter / anything but yes / Ctrl+C = cancel;
+- otherwise a `confirm_country` callback (the «Аккаунты» tab's sign-in passes `wizard._confirm_country_mismatch_async` (arrow menu «Отменить вход» / «Продолжить вход», cursor on «Отменить», run in a thread because the sign-in is inside `asyncio.run`) or, with a console stdin, the question «Отменить вход или продолжить?»; Enter / anything but yes / Ctrl+C = cancel;
 - no callback, no console, no flag (night runs) → cancelled, and the error log names `--allow-country-mismatch`.
 The message names the account, the expected and the real exit country (or «не удалось определить… возможно, не скачана гео-база Camoufox») and the risk; the decision is logged. `ok` / `skipped` ask nothing. The mailing (`warn_if_exit_mismatch`) only warns, unchanged. Tests: `tests/test_country_confirm.py`.
 

@@ -14,7 +14,7 @@ edges:
   - target: context/architecture.md
     condition: when understanding how components connect during setup
 grounds_to: []
-last_updated: 2026-10-31
+last_updated: 2026-11-03
 mex:
   id: mx_01M69TVZYDJAF96PJC4A94TX3T
   type: guide
@@ -50,7 +50,7 @@ mex:
    ```
 3. **Configure environment & keys**:
    Copy or edit `config.yaml` with your DeepSeek API key and proxy settings if applicable.
-4. **Run interactive onboarding wizard**:
+4. **Run the console interface** (five tabs: «Запуск», «Аккаунты», «Прокси», «Цель», «Ответы»):
    ```powershell
    python youtube_bot.py --wizard
    ```
@@ -65,7 +65,7 @@ mex:
 
 ## Common Commands
 - **Run all automated tests**: `python run_tests.py`
-- **Launch interactive wizard**: `python youtube_bot.py` (or `python youtube_bot.py --wizard`)
+- **Launch the console interface**: `python youtube_bot.py` (or `python youtube_bot.py --wizard`)
 - **Authenticate Google account**: `python youtube_bot.py --auth-account <name>`
 - **Batch import accounts**: `python youtube_bot.py --import-accounts-file <path>`
 - **List stored accounts**: `python youtube_bot.py --list-accounts`
