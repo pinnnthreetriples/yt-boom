@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -167,6 +168,7 @@ class TestProxyLibraryDb(DbCase):
         self.assertNotEqual(other.id, first.id)
         self.assertEqual(len(await self.db.list_proxies()), 2)
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI")
     async def test_password_is_encrypted_at_rest_and_never_in_accounts(self):
         await self.accounts("a")
         record, _ = await self.db.add_proxy(ProxyParts("http", "h.example", 3128, "u", "x@y:z/%41"))
@@ -328,6 +330,7 @@ class TestDatabaseMigration(FakeDpapi, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(await db.list_proxies()), 2)
             self.assertEqual(len(list(Path(tmp).glob("old.db.bak-proxies-*"))), 1)
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI")
     async def test_no_dpapi_keeps_the_old_values_working(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "old.db"
