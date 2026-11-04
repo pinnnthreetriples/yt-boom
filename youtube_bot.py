@@ -29,6 +29,7 @@ from modules.lifecycle_engine import (
     release_restriction,
 )
 from modules.process_guard import bind_to_kill_on_close_job
+from modules.projects import project_seed
 from modules.profile_manager import ProfileEditor
 from modules.proxy_library import log_proxy_routes, run_config_proxy_migration
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
@@ -38,6 +39,12 @@ from modules.youtube_runner import YouTubeRunner
 
 
 from modules.logger_config import configure_windows_encoding, setup_bot_logging
+
+
+def _open_db(cfg: AppConfig) -> Database:
+    """The configured database; its first start with projects seeds «Основной» from this config (a stand-in config
+    without the target sections seeds nothing)."""
+    return Database(cfg.app.db_path, project_seed=project_seed(cfg) if isinstance(cfg, AppConfig) else None)
 
 
 def format_author(author: str | None) -> str:
@@ -152,7 +159,7 @@ async def interactive_login(
 
     cfg = load_config(config_path)
     cfg.browser.headless = False
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
 
@@ -259,7 +266,7 @@ async def add_account_cli(
             sys.exit(1)
         geo["locale"] = tag
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
@@ -353,7 +360,7 @@ async def add_credentials_account_cli(
 ) -> bool:
     """`--add-account email:password:totp_secret[:recovery_email]`: register the account with status `pending`."""
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         try:
             account = await _register_credentials_account(db, cfg, spec, name, session_path, proxy_url, country, locale)
         except ValueError as exc:
@@ -482,7 +489,7 @@ async def auth_account_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found. Add it with --add-account email:password:totp", file=sys.stderr)
@@ -558,7 +565,7 @@ async def import_accounts_file_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         imported = await register_account_lines(db, cfg, lines)
         registered = {account.id: account for account in imported.added}
         failed_lines = len(imported.errors)
@@ -583,7 +590,7 @@ async def import_accounts_file_cli(
 async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml", online: bool = False) -> bool:
     """Session status from the profile's LOGIN_INFO cookie; with `online` also asks YouTube over HTTP (no browser)."""
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         if identifier and identifier != "ALL":
             account = await _find_account(db, identifier)
             if account is None:
@@ -632,7 +639,7 @@ async def warm_up_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
@@ -648,7 +655,7 @@ async def apply_profile_cli(identifier: str, config_path: str = "config.yaml", h
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
@@ -673,7 +680,7 @@ async def warm_quarantined_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         targets = warm_candidates(await db.list_active_accounts())
         if not targets:
             print("[INFO] No authenticated accounts in quarantine or aging.")
@@ -728,7 +735,7 @@ async def warm_selected_cli(
         cfg.browser.headless = headless
     results: list[WarmUpResult] = []
     worked = False  # something already ran: the next account waits first (a skipped one costs no pause)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         for name in names:
             account = await db.get_account(name)
             needs_sign_in = account is not None and account.auth_status != "authenticated"
@@ -752,7 +759,7 @@ async def warm_selected_cli(
 async def lifecycle_cli(config_path: str = "config.yaml") -> None:
     """`--lifecycle`: ages, stages, quarantine hours left, today's quota, mode, on/off and auto warm-up per account."""
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         accounts = await db.list_accounts()
         now = datetime.now(timezone.utc)
         width = 128
@@ -822,7 +829,7 @@ async def _account_setting_cli(
     identifier: str, config_path: str, change: Callable[[Database, AccountRecord], Awaitable[str]]
 ) -> bool:
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
@@ -879,7 +886,7 @@ async def reset_restricted_cli(identifier: str, config_path: str = "config.yaml"
 async def print_accounts_table(config_path: str = "config.yaml") -> None:
     """Pretty-print a table of all accounts with stats from DB."""
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
@@ -953,7 +960,7 @@ async def run_video_pool_cli(
     if headless is not None:
         cfg.browser.headless = headless
 
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     await log_proxy_routes(db)
@@ -1010,7 +1017,7 @@ async def run_search_cli(
         logger.error("Включен режим 'Свой текст' (custom), но список 'custom_replies' пуст и --custom-reply не передан")
         return SearchRunResult(0, 0, 0)
 
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     await log_proxy_routes(db)
@@ -1093,7 +1100,7 @@ async def list_sub_comments(video_url: str, config_path: str = "config.yaml", li
     """Fetch and list comments under comments for a YouTube video."""
     cfg = load_config(config_path)
     try:
-        async with Database(cfg.app.db_path) as db:
+        async with _open_db(cfg) as db:
             search_proxy = await db.search_proxy_url()
     except ProxyUnavailableError as exc:
         logger.error("{}", exc)
@@ -1136,7 +1143,7 @@ async def run_reply_bot(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
 
@@ -1466,7 +1473,7 @@ async def run_multi_video_pipeline(
     max_age_hours = cfg.collector.max_age_hours if max_age_hours is None else (max_age_hours or None)
     if headless is not None:
         cfg.browser.headless = headless
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
 
@@ -1832,7 +1839,7 @@ async def print_activity_history(
 ) -> None:
     """Print the database audit log of replies in a table."""
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
@@ -1861,7 +1868,7 @@ async def print_activity_history(
 
 async def print_status(config_path: str = "config.yaml") -> None:
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:

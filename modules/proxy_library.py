@@ -19,6 +19,7 @@ from loguru import logger
 
 from config import AccountSettings, ProxyUnavailableError, load_config, mask_proxy_url
 from database import SEARCH_PROXY_KEY, AccountRecord, Database, ProxyRecord
+from modules.projects import open_database
 
 CONFIG_MIGRATION_KEY = "config_proxies_migrated_at"
 
@@ -217,7 +218,7 @@ async def migrate_config_proxies(config_path: str | Path) -> ConfigMigrationRepo
     if not isinstance(raw, dict):
         return report
     cfg = load_config(path)
-    async with Database(cfg.app.db_path) as db:
+    async with open_database(cfg) as db:
         first = await db.get_setting(CONFIG_MIGRATION_KEY) is None
         yaml_names = _yaml_account_names(raw)
         report.imported_accounts = await sync_config_accounts(

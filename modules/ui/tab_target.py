@@ -64,13 +64,13 @@ def _pool_counts(ctx: AppContext) -> tuple[int, int]:
 
 
 def _fetch_preview(ctx: AppContext, url: str, limit: int) -> list[Any]:
-    from database import Database
+    from modules.projects import open_database
     from modules.youtube_collector import YouTubeCollector
 
     cfg = ctx.cfg()
 
     async def fetch() -> list[Any]:
-        async with Database(cfg.app.db_path) as db:
+        async with open_database(cfg) as db:
             proxy = await db.search_proxy_url()
         async with YouTubeCollector(cfg.collector, proxy) as collector:
             return await collector.fetch_video_sub_comments(url, max_sub_comments=limit)

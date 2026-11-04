@@ -23,6 +23,7 @@ from modules.geo_guard import warn_if_exit_mismatch
 from modules.interaction_simulator import InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine, explain_block
 from modules.pool_manager import PoolManager
+from modules.projects import project_seed
 from modules.proxy_library import sync_config_accounts
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.ui_test_runner import SubmissionResult
@@ -69,7 +70,7 @@ class MultiAccountOrchestrator:
         if headless is not None:
             self._cfg.browser.headless = headless
 
-        self._db = db or Database(self._cfg.app.db_path)
+        self._db = db or Database(self._cfg.app.db_path, project_seed=project_seed(self._cfg))
         self._concurrency = max(1, concurrency)
         self._semaphore = asyncio.Semaphore(self._concurrency)
         self._dry_run = dry_run

@@ -418,10 +418,10 @@ def _target_plan(cfg: Any) -> tuple[str, int, str]:
 def load_accounts(config_path: Path) -> list[Any]:
     """Load accounts from the DB, seeding it from config.yaml when the DB has none."""
     from config import load_config
-    from database import Database
+    from modules.projects import open_database
 
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = open_database(cfg)
 
     async def _fetch():
         await db.connect()
@@ -450,12 +450,12 @@ def load_accounts(config_path: Path) -> list[Any]:
 def _pools_db(config_path: Path, fn: Callable[[Any], Any]) -> Any:
     """Run `await fn(db)` against the configured database."""
     from config import load_config
-    from database import Database
+    from modules.projects import open_database
 
-    db_path = load_config(config_path).app.db_path
+    cfg = load_config(config_path)
 
     async def _run() -> Any:
-        db = Database(db_path)
+        db = open_database(cfg)
         await db.connect()
         await db.init_schema()
         try:
