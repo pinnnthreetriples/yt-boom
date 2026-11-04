@@ -190,7 +190,7 @@ def build_tab(ctx: AppContext) -> Tab:
         problems = ctx.problems(project)
         return Row(
             f"p{project.id}",
-            [Cell(icon("project"), "", 3), Cell(project.name, "warn" if problems and project.enabled else "", 14, grow=True),
+            [Cell(icon("project"), "", 3), Cell(project.name, "warn" if problems and project.enabled else "", 18),
              Cell("▶ в запуске" if project.enabled else "‖ пропуск", "" if project.enabled else "dim", 13),
              Cell(f"{icon('tab_accounts')} {project.accounts_count}", "", 6), Cell(f"{icon('topic')} {len(project.search_topics)}", "", 6),
              Cell(f"{icon('links')} {project.links_waiting}", "", 6), Cell(f"{icon('sent')} {sent}", "dim")],
