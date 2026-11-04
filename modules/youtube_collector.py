@@ -88,7 +88,7 @@ def build_search_params(sort_by: str = "views", video_only: bool = True, upload_
     if upload_date is not None:
         sort_code = {"views": 3, "view_count": 3, "popularity": 3, "popular": 3,
                      "date": 2, "upload_date": 2, "newest": 2, "rating": 1, "likes": 1}.get(s, 0)
-        filters = bytes([0x08, upload_date]) + (b"" if video_only else b"")
+        filters = bytes([0x08, upload_date]) + (b"\x10\x01" if video_only else b"")
         raw = (bytes([0x08, sort_code]) if sort_code else b"") + bytes([0x12, len(filters)]) + filters
         return base64.b64encode(raw).decode("ascii")
     if video_only:
@@ -106,6 +106,45 @@ def build_search_params(sort_by: str = "views", video_only: bool = True, upload_
         elif s in {"date", "upload_date"}:
             return "CAISAg=="
         return ""
+
+
+def next_page_token(data: Any) -> str | None:
+    """Token of the next search results page: the `continuationItemRenderer` at the end of the results.
+
+    Not any `continuationCommand`: from page 2 on the filter chips of the header come first in the response,
+    and their tokens reload the results instead of continuing them.
+    """
+    for node in _find_keys(data, "continuationItemRenderer"):
+        if not isinstance(node, dict):
+            continue
+        command = (node.get("continuationEndpoint") or {}).get("continuationCommand") or {}
+        token = command.get("token")
+        if token:
+            return str(token)
+    return None
+
+
+def _views_text(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " млн"
+    if n >= 1000:
+        return f"{n / 1000:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " тыс"
+    return str(n)
+
+
+def empty_search_hint(min_views: int = 0, max_views: int | None = None, max_age_hours: int | None = None) -> str:
+    """What to loosen when a topic search found no video within the filters, e.g.
+    'шире свежесть (до 24 ч), шире просмотры (10 тыс – 500 тыс) или другая тема'."""
+    tips = []
+    if max_age_hours:
+        tips.append(f"шире свежесть (до {max_age_hours} ч)")
+    if min_views and max_views:
+        tips.append(f"шире просмотры ({_views_text(min_views)} – {_views_text(max_views)})")
+    elif min_views:
+        tips.append(f"меньше просмотров (от {_views_text(min_views)})")
+    elif max_views:
+        tips.append(f"больше просмотров (до {_views_text(max_views)})")
+    return (", ".join(tips) + " или другая тема") if tips else "другая тема"
 
 
 # "5 hours ago", "Streamed 2 days ago", "3 дня назад" -> hours per unit (matched by prefix).
@@ -669,21 +708,25 @@ class YouTubeCollector:
         *,
         min_views: int = 0,
         max_views: int | None = None,
-        sort_by: str = "views",
+        sort_by: str | None = None,
         limit: int = 10,
-        max_pages: int = 3,
+        max_pages: int = 10,
         max_age_hours: int | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Search YouTube videos via InnerTube, sorted by views (or other sort_by)
-        and filtered by min_views / max_views thresholds.
+        Search YouTube videos via InnerTube and keep those within min_views / max_views.
 
+        sort_by None picks the order: by views without an upper view limit, else by relevance
+        (sorted by views, the first pages hold only the most viewed videos, all above a low max_views).
         max_age_hours keeps only videos published at most that many hours ago: YouTube's
         upload date filter narrows the search, the publish time text gives the exact cut.
+        Up to max_pages result pages are read until `limit` videos match.
         """
         await self.open()
         assert self._session is not None
 
+        if sort_by is None:
+            sort_by = "views" if max_views is None else "relevance"
         api_key, client_version = await self._ensure_innertube_credentials()
         search_url = f"https://www.youtube.com/youtubei/v1/search?key={api_key}"
         params_token = build_search_params(
@@ -748,7 +791,7 @@ class YouTubeCollector:
                 if not isinstance(vr, dict):
                     continue
                 vid = vr.get("videoId")
-                if not vid:
+                if not vid or any(v["video_id"] == vid for v in matched_videos):
                     continue
 
                 title_node = vr.get("title")
@@ -824,15 +867,7 @@ class YouTubeCollector:
                     if len(matched_videos) >= limit:
                         break
 
-            commands = _find_keys(data, "continuationCommand")
-            continuation_token = None
-            for cmd in commands:
-                if isinstance(cmd, dict) and "token" in cmd:
-                    continuation_token = str(cmd["token"])
-                    break
-            if not continuation_token:
-                tokens = _find_keys(data, "token")
-                continuation_token = str(tokens[0]) if tokens else None
+            continuation_token = next_page_token(data)
             if not continuation_token:
                 break
 

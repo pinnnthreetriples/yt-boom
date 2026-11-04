@@ -11,7 +11,8 @@ from modules.ui.shell import Cell, Confirm, Field, Menu, Notice, Row, Run, Scree
 
 _SOURCES = ["поиск по теме", "свои ссылки"]
 _LIMITS = [str(n) for n in range(1, 51)]
-_PENDING_SQL = "status IN ('pending', 'in_progress') AND comments_done < comments_target"
+_VIDEOS = [str(n) for n in range(1, 51)]  # auto-search: videos per run
+_PENDING_SQL = "source = 'links' AND status IN ('pending', 'in_progress') AND comments_done < comments_target"
 
 
 def _db(ctx: AppContext, fn: Callable[[Any], Any]) -> Any:
@@ -57,7 +58,7 @@ def parse_views(text: str) -> tuple[int, int | None]:
 def _pool_counts(ctx: AppContext) -> tuple[int, int]:
     """(videos waiting, videos done) in the video list."""
     waiting = ctx.query(f"SELECT COUNT(*) FROM video_pool WHERE {_PENDING_SQL}")
-    total = ctx.query("SELECT COUNT(*) FROM video_pool")
+    total = ctx.query("SELECT COUNT(*) FROM video_pool WHERE source = 'links'")
     w = int(waiting[0][0]) if waiting else 0
     return w, (int(total[0][0]) if total else 0) - w
 
@@ -128,6 +129,18 @@ def build_tab(ctx: AppContext) -> Tab:
 
     def set_age(index: int) -> None:
         ctx.update({"collector.max_age_hours": _TARGET_AGES[index][0]})
+
+    def set_videos(index: int) -> Notice:
+        ctx.update({"collector.max_videos": index + 1})
+        return Notice("ok", f"Видео за запуск: {index + 1}")
+
+    def edit_videos() -> Field:
+        def submit(text: str) -> Notice:
+            if not text.strip().isdigit() or not 1 <= int(text) <= 50:
+                return Notice("warn", "Нужно число от 1 до 50")
+            return set_videos(int(text) - 1)
+
+        return Field("видео за запуск, 1–50", submit, initial=str(ctx.cfg().collector.max_videos))
 
     # ---- links
 
@@ -239,6 +252,12 @@ def build_tab(ctx: AppContext) -> Tab:
                 "views", [Cell(icon("views"), "", 3), Cell(views_label(collector.min_views or 0, collector.max_views))],
                 hint="Просмотры видео · Enter — изменить", enter=edit_views,
             ))
+            videos = max(1, min(50, collector.max_videos))
+            rows.append(Row(
+                "videos", [Cell(icon("videos"), "", 3), Cell(f"{videos} видео за запуск")],
+                hint="Сколько найденных видео брать за запуск · Enter — ввести число", values=_VIDEOS,
+                value_index=videos - 1, on_value=set_videos, enter=edit_videos,
+            ))
         else:
             waiting, done = _pool_counts(ctx)
             rows.append(Row(
@@ -273,7 +292,7 @@ def links_view(ctx: AppContext) -> View:
     """The video list: one row per video with its reply progress."""
     from modules.wizard import _target_short_url
 
-    videos = ctx.query("SELECT id, video_url, comments_done, comments_target, status FROM video_pool ORDER BY id LIMIT 200")
+    videos = ctx.query("SELECT id, video_url, comments_done, comments_target, status FROM video_pool WHERE source = 'links' ORDER BY id LIMIT 200")
     rows = []
     for vid, url, done, target, status in videos:
         finished = status == "completed" or done >= target

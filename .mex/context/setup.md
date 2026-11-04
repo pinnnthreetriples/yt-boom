@@ -69,7 +69,7 @@ mex:
 - **Authenticate Google account**: `python youtube_bot.py --auth-account <name>`
 - **Batch import accounts**: `python youtube_bot.py --import-accounts-file <path>`
 - **List stored accounts**: `python youtube_bot.py --list-accounts`
-- **Search videos & reply**: `python youtube_bot.py --search "<topic>" --min-views 10000 --max-views 500000 --dry-run`
+- **Search videos & reply**: `python youtube_bot.py --search "<topic>" --min-views 10000 --max-views 500000 --dry-run` (all active accounts, like own links; filters / `--max-videos` / `--comments-per-video` default to `collector.*`, `--max-views 0` / `--max-age-hours 0` turn a limit off, `--account NAME` = only that account)
 - **Inspect activity audit history**: `python youtube_bot.py --history`
 - **Inspect database metrics**: `python youtube_bot.py --status`
 - **MEX memory health check**: `mex doctor` and `mex check`

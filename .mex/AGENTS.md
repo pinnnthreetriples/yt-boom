@@ -23,7 +23,7 @@ An automated Python 3.11+ web testing and telemetry pipeline driving persistent 
 - Authenticate single account: `python youtube_bot.py --auth-account <name>`
 - Batch import accounts: `python youtube_bot.py --import-accounts-file <path>`
 - List accounts: `python youtube_bot.py --list-accounts`
-- Multi-video search & reply: `python youtube_bot.py --search "<topic>" --min-views 10000 --max-views 500000 --dry-run`
+- Multi-video search & reply: `python youtube_bot.py --search "<topic>" --min-views 10000 --max-views 500000 --dry-run` (all active accounts, like own links; filters / `--max-videos` / `--comments-per-video` default to `collector.*`, `--max-views 0` / `--max-age-hours 0` turn a limit off, `--account NAME` = only that account)
 - Check database status: `python youtube_bot.py --status`
 - MEX memory check: `mex doctor` and `mex check`
 

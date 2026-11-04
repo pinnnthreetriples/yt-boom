@@ -330,19 +330,21 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
             "--config", str(self.config_path),
             "--dry-run",
         ]
+        run_defaults = dict(headless=None, concurrency=None, account_mode=None, reply_mode=None, custom_reply=None)
         with patch.object(sys, "argv", test_args), \
-             patch("youtube_bot.run_multi_video_pipeline", new_callable=AsyncMock) as mock_multi:
+             patch("youtube_bot.run_search_cli", new_callable=AsyncMock) as mock_multi:
             bot_main()
             mock_multi.assert_called_once_with(
                 "python automated testing",
-                config_path=str(self.config_path),
+                str(self.config_path),
                 min_views=5000,
                 max_views=100000,
+                max_age_hours=48,
                 max_videos=3,
                 comments_per_video=4,
                 target_mode="mixed",
                 dry_run=True,
-                max_age_hours=48,
+                **run_defaults,
             )
 
         # Test --history / --log flag
@@ -359,21 +361,25 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
         cfg_mod["collector"]["comments_per_video"] = 7
         cfg_mod["collector"]["min_views"] = 0
         cfg_mod["collector"]["max_views"] = None
+        cfg_mod["collector"]["max_age_hours"] = None
+        cfg_mod["collector"]["max_videos"] = 5
         with open(self.config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(cfg_mod, f)
 
         with patch.object(sys, "argv", ["youtube_bot.py", "--config", str(self.config_path), "--dry-run"]), \
-             patch("youtube_bot.run_multi_video_pipeline", new_callable=AsyncMock) as mock_cfg_multi:
+             patch("youtube_bot.run_search_cli", new_callable=AsyncMock) as mock_cfg_multi:
             bot_main()
             mock_cfg_multi.assert_called_once_with(
                 "topic from config",
-                config_path=str(self.config_path),
+                str(self.config_path),
                 min_views=0,
                 max_views=None,
+                max_age_hours=None,
                 max_videos=5,
                 comments_per_video=7,
                 target_mode="sub_comment",
                 dry_run=True,
+                **run_defaults,
             )
 
         # Test --headless flag passes headless=True
@@ -381,6 +387,64 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
              patch("youtube_bot.run_reply_bot", new_callable=AsyncMock) as mock_reply:
             bot_main()
             self.assertTrue(mock_reply.call_args[1].get("headless") is True)
+
+    def search_call(self, *flags: str, **collector):
+        import sys
+        from youtube_bot import main as bot_main
+
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        data["collector"].update(collector)
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f)
+        argv = ["youtube_bot.py", "--search", "iphone 17", "--config", str(self.config_path), "--dry-run", *flags]
+        with patch.object(sys, "argv", argv), patch("youtube_bot.run_search_cli", new_callable=AsyncMock) as run:
+            bot_main()
+        run.assert_called_once()
+        return run.call_args.kwargs
+
+    def test_search_takes_the_filters_from_config_without_flags(self):
+        kwargs = self.search_call(min_views=10000, max_views=500000, max_age_hours=24, max_videos=8,
+                                  comments_per_video=3, target_mode="first_reply")
+        self.assertEqual(
+            {k: kwargs[k] for k in ("min_views", "max_views", "max_age_hours", "max_videos", "comments_per_video", "target_mode")},
+            {"min_views": 10000, "max_views": 500000, "max_age_hours": 24, "max_videos": 8,
+             "comments_per_video": 3, "target_mode": "first_reply"},
+        )
+
+    def test_search_zero_turns_the_view_cap_and_freshness_off(self):
+        kwargs = self.search_call("--max-views", "0", "--max-age-hours", "0", "--target-mode", "first_reply",
+                                  "--concurrency", "3", "--account-mode", "share",
+                                  max_views=500000, max_age_hours=24)
+        self.assertIsNone(kwargs["max_views"])
+        self.assertIsNone(kwargs["max_age_hours"])
+        self.assertEqual((kwargs["target_mode"], kwargs["concurrency"], kwargs["account_mode"]), ("first_reply", 3, "share"))
+
+    def test_search_with_account_keeps_the_single_account_pipeline(self):
+        import sys
+        from youtube_bot import main as bot_main
+
+        argv = ["youtube_bot.py", "--search", "iphone 17", "--account", "solo", "--max-age-hours", "0",
+                "--config", str(self.config_path), "--dry-run"]
+        with patch.object(sys, "argv", argv), \
+             patch("youtube_bot.run_multi_video_pipeline", new_callable=AsyncMock) as single, \
+             patch("youtube_bot.run_search_cli", new_callable=AsyncMock) as through_accounts:
+            bot_main()
+        through_accounts.assert_not_called()
+        self.assertEqual(single.call_args.kwargs["account_name"], "solo")
+        self.assertEqual(single.call_args.kwargs["max_age_hours"], 0)  # 0 = any age in the pipeline
+
+    async def test_run_search_cli_hands_the_run_to_the_orchestrator(self):
+        from modules.multi_account_orchestrator import SearchRunResult
+        from youtube_bot import run_search_cli
+
+        with patch("modules.multi_account_orchestrator.MultiAccountOrchestrator.run_search",
+                   new_callable=AsyncMock, return_value=SearchRunResult(1, 2, 3)) as run_search:
+            result = await run_search_cli("topic", str(self.config_path), min_views=5, max_views=None,
+                                          max_age_hours=12, max_videos=4, comments_per_video=2, dry_run=True)
+        self.assertEqual(tuple(result), (1, 2, 3))
+        run_search.assert_awaited_once_with("topic", min_views=5, max_views=None, max_age_hours=12,
+                                            max_videos=4, comments_per_video=2)
 
     async def test_print_activity_history(self):
         from database import ActivityLogCreate

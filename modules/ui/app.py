@@ -109,6 +109,7 @@ def run_app(config_path: Path) -> None:
     from modules.wizard import clear_terminal
 
     ctx = AppContext(config_path)
+    _ensure_schema(ctx)
     _load_icon_choice(ctx)
     controller = Controller(build_tabs(ctx), status=lambda: status_cells(ctx))
     controller.on_icons = lambda: _switch_icons(ctx, controller)
@@ -116,6 +117,14 @@ def run_app(config_path: Path) -> None:
 
 
 ICONS_SETTING = "ui_icons"
+
+
+def _ensure_schema(ctx: AppContext) -> None:
+    """Bring an older database up to date before the tabs read it with plain sqlite3 (e.g. `video_pool.source`)."""
+    try:
+        ctx.db(lambda db: db.count_pool_videos())
+    except Exception:
+        pass  # no readable config or database yet: the tabs show what is missing
 
 
 def _load_icon_choice(ctx: AppContext) -> None:

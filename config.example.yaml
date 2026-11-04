@@ -46,6 +46,7 @@ collector:
   search_query: null
   min_views: 500000
   max_views: 5000000
+  max_videos: 5
   target_mode: first_reply
 processor:
   system_prompt: 'You are an active YouTube user participating in comment discussions.

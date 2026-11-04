@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import yaml
 
@@ -120,7 +120,7 @@ class LaunchCase(unittest.TestCase):
         self.assertIn("БОЕВОЙ", self.screen(c))
         c.press("enter")
         self.assertIsInstance(c.confirm, Confirm)
-        self.assertIn("Публикуем ответы с 1 акк.?", self.screen(c))
+        self.assertIn("Публикуем ответы · до 1 акк. (лимиты этапов учитываются)?", self.screen(c))
         c.press("enter")  # «Нет» is selected
         self.assertIsNone(c.pending_run)
         c.press("enter")
@@ -186,10 +186,61 @@ class LaunchCase(unittest.TestCase):
         self.assertIn("«Цель»", notice.text)
 
     def test_run_target_search_reports_errors_as_a_notice(self):
-        with patch("youtube_bot.run_multi_video_pipeline", side_effect=RuntimeError("сеть")):
+        with patch("youtube_bot.run_search_cli", side_effect=RuntimeError("сеть")):
             notice = run_target(self.ctx, dry_run=True)
         self.assertEqual(notice.kind, "err")
         self.assertIn("сеть", notice.text)
+
+    def set_search(self, **collector) -> None:
+        data = self.raw()
+        data["collector"].update(collector)
+        data["limits"]["max_iterations_per_session"] = 3
+        self.config_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+
+    def test_run_target_search_goes_through_the_accounts_with_the_tab_settings(self):
+        from modules.multi_account_orchestrator import SearchRunResult
+
+        self.set_search(min_views=10000, max_views=500000, max_age_hours=24, max_videos=7)
+        search = AsyncMock(return_value=SearchRunResult(2, 7, 5))
+        with patch("youtube_bot.run_search_cli", search):
+            notice = run_target(self.ctx, dry_run=True)
+        args, kwargs = search.call_args
+        self.assertEqual(args, ("iphone 17 обзор", str(self.config_path)))
+        self.assertEqual(kwargs, {"min_views": 10000, "max_views": 500000, "max_age_hours": 24, "max_videos": 7,
+                                  "comments_per_video": 3, "dry_run": True})
+        self.assertEqual(notice.kind, "ok")
+        self.assertIn("видео: 7 · ответов: 5", notice.text)
+
+    def test_run_target_search_nothing_found_says_what_to_loosen(self):
+        from modules.multi_account_orchestrator import SearchRunResult
+
+        self.set_search(min_views=10000, max_views=500000, max_age_hours=24)
+        with patch("youtube_bot.run_search_cli", AsyncMock(return_value=SearchRunResult(1, 0, 0))):
+            notice = run_target(self.ctx, dry_run=True)
+        self.assertEqual(notice.kind, "warn")
+        self.assertIn("Видео по теме не найдено", notice.text)
+        self.assertIn("шире свежесть (до 24 ч), шире просмотры (10 тыс – 500 тыс)", notice.text)
+
+    def test_run_target_search_without_accounts_able_to_post(self):
+        from modules.multi_account_orchestrator import SearchRunResult
+
+        with patch("youtube_bot.run_search_cli", AsyncMock(return_value=SearchRunResult(0, 0, 0))):
+            notice = run_target(self.ctx, dry_run=False)
+        self.assertEqual(notice.kind, "warn")
+        self.assertIn("«Аккаунты»", notice.text)
+
+    def test_live_start_without_accounts_able_to_post_says_so(self):
+        self.add_accounts("one")
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE accounts SET auth_status = 'failed'")
+        conn.commit()
+        conn.close()
+        c = self.controller()
+        c.press("right")
+        c.press("enter")
+        self.assertIsNone(c.confirm)
+        self.assertIsNone(c.pending_run)
+        self.assertIn("Нет аккаунтов в работе", c.notice.text)
 
     def test_icon_choice_is_remembered(self):
         from modules.ui.app import _load_icon_choice, _switch_icons, build_tabs

@@ -33,7 +33,7 @@ from modules.profile_manager import ProfileEditor
 from modules.proxy_library import log_proxy_routes, run_config_proxy_migration
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.session_heartbeat import check_account_heartbeat, check_session_offline, HeartbeatStatus
-from modules.youtube_collector import YouTubeCollector, extract_video_id
+from modules.youtube_collector import YouTubeCollector, empty_search_hint, extract_video_id
 from modules.youtube_runner import YouTubeRunner
 
 
@@ -972,6 +972,123 @@ async def run_video_pool_cli(
         await orchestrator.close()
 
 
+async def run_search_cli(
+    query: str,
+    config_path: str = "config.yaml",
+    *,
+    min_views: int = 0,
+    max_views: int | None = None,
+    max_age_hours: int | None = None,
+    max_videos: int = 5,
+    comments_per_video: int = 2,
+    dry_run: bool = False,
+    headless: bool | None = None,
+    concurrency: int | None = None,
+    account_mode: str | None = None,
+    target_mode: str | None = None,
+    reply_mode: str | None = None,
+    custom_reply: str | None = None,
+) -> Any:
+    """Topic search through the accounts, the same way as the own links: every active account,
+    concurrency / account_mode (default limits.max_concurrent_sessions / limits.account_mode) and the
+    lifecycle limits. max_age_hours None = any age (the caller resolves the config value).
+    Returns SearchRunResult(accounts, found, replies).
+    """
+    from modules.multi_account_orchestrator import MultiAccountOrchestrator, SearchRunResult
+
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    if target_mode:
+        cfg.collector.target_mode = target_mode
+    if custom_reply and custom_reply.strip():
+        cfg.processor.reply_mode = "custom"
+        cfg.processor.custom_replies = [custom_reply.strip()]
+    elif reply_mode:
+        cfg.processor.reply_mode = reply_mode
+    if cfg.processor.reply_mode == "custom" and not [r for r in cfg.processor.custom_replies if r and r.strip()]:
+        logger.error("Включен режим 'Свой текст' (custom), но список 'custom_replies' пуст и --custom-reply не передан")
+        return SearchRunResult(0, 0, 0)
+
+    db = Database(cfg.app.db_path)
+    await db.connect()
+    await db.init_schema()
+    await log_proxy_routes(db)
+
+    orchestrator = MultiAccountOrchestrator(
+        config_or_path=cfg,
+        db=db,
+        concurrency=concurrency or cfg.limits.max_concurrent_sessions,
+        dry_run=dry_run,
+        headless=headless,
+        account_mode=account_mode,
+    )
+    try:
+        return await orchestrator.run_search(
+            query,
+            min_views=min_views,
+            max_views=max_views,
+            max_age_hours=max_age_hours,
+            max_videos=max_videos,
+            comments_per_video=comments_per_video,
+        )
+    finally:
+        await orchestrator.close()
+
+
+def search_options(args: argparse.Namespace, cfg: AppConfig) -> dict[str, Any]:
+    """Filters of a CLI topic search: a flag wins, else collector.* of config.yaml.
+
+    0 turns a limit off: --max-views 0 (no upper view limit), --max-age-hours 0 (any age).
+    """
+    col = cfg.collector
+    return {
+        "min_views": col.min_views if args.min_views is None else args.min_views,
+        "max_views": col.max_views if args.max_views is None else (args.max_views or None),
+        "max_age_hours": col.max_age_hours if args.max_age_hours is None else (args.max_age_hours or None),
+        "max_videos": col.max_videos if args.max_videos is None else args.max_videos,
+        "comments_per_video": col.comments_per_video if args.comments_per_video is None else args.comments_per_video,
+    }
+
+
+def run_search_from_args(args: argparse.Namespace, cfg: AppConfig, query: str) -> None:
+    """`--search` (or collector.search_query): through the accounts; with --account only that account."""
+    opts = search_options(args, cfg)
+    target_mode = args.target_mode or cfg.collector.target_mode
+    if args.account is not None:
+        kwargs: dict[str, Any] = {
+            "config_path": args.config,
+            "min_views": opts["min_views"],
+            "max_views": opts["max_views"],
+            "max_age_hours": opts["max_age_hours"] or 0,  # 0 = any age (None would mean the config value)
+            "max_videos": opts["max_videos"],
+            "comments_per_video": opts["comments_per_video"],
+            "target_mode": target_mode,
+            "dry_run": args.dry_run,
+            "account_name": args.account,
+        }
+        if args.headless:
+            kwargs["headless"] = True
+        if args.reply_mode is not None:
+            kwargs["reply_mode"] = args.reply_mode
+        if args.custom_reply is not None:
+            kwargs["custom_reply"] = args.custom_reply
+        asyncio.run(run_multi_video_pipeline(query, **kwargs))
+        return
+    asyncio.run(run_search_cli(
+        query,
+        args.config,
+        **opts,
+        dry_run=args.dry_run,
+        headless=True if args.headless else None,
+        concurrency=args.concurrency,
+        account_mode=args.account_mode,
+        target_mode=target_mode,
+        reply_mode=args.reply_mode,
+        custom_reply=args.custom_reply,
+    ))
+
+
 async def list_sub_comments(video_url: str, config_path: str = "config.yaml", limit: int = 10) -> None:
     """Fetch and list comments under comments for a YouTube video."""
     cfg = load_config(config_path)
@@ -1341,10 +1458,12 @@ async def run_multi_video_pipeline(
     Search videos by query, iterate through matched videos,
     and reply to popular comments under each video.
 
-    max_age_hours (default: collector.max_age_hours) keeps only videos published within that many hours.
+    Used for `--search --account NAME` (one named account); without --account a topic search goes
+    through the accounts (run_search_cli).
+    max_age_hours keeps only videos published within that many hours: None = collector.max_age_hours, 0 = any age.
     """
     cfg = load_config(config_path)
-    max_age_hours = max_age_hours or cfg.collector.max_age_hours
+    max_age_hours = cfg.collector.max_age_hours if max_age_hours is None else (max_age_hours or None)
     if headless is not None:
         cfg.browser.headless = headless
     db = Database(cfg.app.db_path)
@@ -1462,7 +1581,11 @@ async def run_multi_video_pipeline(
             max_age_hours=max_age_hours,
         )
         if not videos:
-            logger.warning("Не найдено видео по запросу {!r} с заданными критериями", query)
+            logger.warning(
+                "Не найдено видео по запросу {!r} с заданными фильтрами: {}",
+                query,
+                empty_search_hint(min_views, max_views, max_age_hours),
+            )
             return
 
         logger.info("Найдено подходящих видео: {}. Запуск процесса ответов...", len(videos))
@@ -1765,17 +1888,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="YouTube Comments-Under-Comments AI Reply Bot")
     parser.add_argument("--video", type=str, default=None, help="YouTube video URL or ID")
     parser.add_argument("--search", type=str, default=None, help="Search query to find YouTube videos by topic")
-    parser.add_argument("--min-views", type=int, default=0, help="Minimum views required for videos in search")
-    parser.add_argument("--max-views", type=int, default=None, help="Maximum views allowed for videos in search")
-    parser.add_argument("--max-age-hours", type=int, default=None, help="Search only videos published within N hours (e.g. 12, 24, 48, 168)")
-    parser.add_argument("--max-videos", type=int, default=5, help="Maximum number of videos to process in search")
-    parser.add_argument("--comments-per-video", type=int, default=2, help="Number of comments to answer per video")
+    parser.add_argument("--min-views", type=int, default=None, help="Minimum views of searched videos (default: collector.min_views)")
+    parser.add_argument("--max-views", type=int, default=None, help="Maximum views of searched videos, 0 = no limit (default: collector.max_views)")
+    parser.add_argument("--max-age-hours", type=int, default=None, help="Search only videos published within N hours (e.g. 12, 24, 48, 168), 0 = any age (default: collector.max_age_hours)")
+    parser.add_argument("--max-videos", type=int, default=None, help="Videos taken per search run (default: collector.max_videos)")
+    parser.add_argument("--comments-per-video", type=int, default=None, help="Replies per video (default: collector.comments_per_video)")
     parser.add_argument(
         "--target-mode",
         type=str,
-        choices=["popular_parent", "sub_comment", "mixed"],
+        choices=["first_reply", "popular_parent", "sub_comment", "mixed"],
         default=None,
-        help="Target comments mode: popular top-level comments, sub-comments, or mixed",
+        help="Target comments: first_reply (a reply under a top comment), popular_parent (top comments), sub_comment (replies), mixed (default: collector.target_mode)",
     )
     parser.add_argument(
         "--reply-mode",
@@ -1971,29 +2094,9 @@ def main() -> None:
         return
 
     search_query = args.search or getattr(cfg.collector, "search_query", None)
-    target_mode = args.target_mode or getattr(cfg.collector, "target_mode", "first_reply")
 
     if args.search:
-        search_kwargs: dict[str, Any] = {
-            "config_path": args.config,
-            "min_views": args.min_views,
-            "max_views": args.max_views,
-            "max_videos": args.max_videos,
-            "comments_per_video": args.comments_per_video,
-            "target_mode": target_mode,
-            "dry_run": args.dry_run,
-        }
-        if args.account is not None:
-            search_kwargs["account_name"] = args.account
-        if args.headless:
-            search_kwargs["headless"] = True
-        if args.reply_mode is not None:
-            search_kwargs["reply_mode"] = args.reply_mode
-        if args.custom_reply is not None:
-            search_kwargs["custom_reply"] = args.custom_reply
-        if args.max_age_hours is not None:
-            search_kwargs["max_age_hours"] = args.max_age_hours
-        asyncio.run(run_multi_video_pipeline(args.search, **search_kwargs))
+        run_search_from_args(args, cfg, args.search)
         return
 
     # Check if user explicitly provided a CLI action or if interactive wizard should open
@@ -2017,29 +2120,7 @@ def main() -> None:
         return
 
     if not args.video and search_query:
-        min_v = args.min_views if args.min_views != 0 else getattr(cfg.collector, "min_views", 0)
-        max_v = args.max_views if args.max_views is not None else getattr(cfg.collector, "max_views", None)
-        c_per_v = args.comments_per_video if args.comments_per_video != 2 else getattr(cfg.collector, "comments_per_video", 2)
-        fallback_kwargs: dict[str, Any] = {
-            "config_path": args.config,
-            "min_views": min_v,
-            "max_views": max_v,
-            "max_videos": args.max_videos,
-            "comments_per_video": c_per_v,
-            "target_mode": target_mode,
-            "dry_run": args.dry_run,
-        }
-        if args.account is not None:
-            fallback_kwargs["account_name"] = args.account
-        if args.headless:
-            fallback_kwargs["headless"] = True
-        if args.reply_mode is not None:
-            fallback_kwargs["reply_mode"] = args.reply_mode
-        if args.custom_reply is not None:
-            fallback_kwargs["custom_reply"] = args.custom_reply
-        if args.max_age_hours is not None:
-            fallback_kwargs["max_age_hours"] = args.max_age_hours
-        asyncio.run(run_multi_video_pipeline(search_query, **fallback_kwargs))
+        run_search_from_args(args, cfg, search_query)
         return
 
     video_url = args.video or default_video
