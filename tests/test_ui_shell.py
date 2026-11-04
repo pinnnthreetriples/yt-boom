@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from modules.ui import icons
 from modules.ui.shell import (
@@ -241,6 +242,28 @@ class LiveShell(unittest.TestCase):
         self.assertTrue(c.quit)
         self.assertGreaterEqual(len(builds), 2)  # built at start and again after ← →
 
+    def test_details_may_use_asyncio_run_while_the_menu_draws(self):
+        import asyncio
+
+        from modules.ui.shell import run_shell
+        from tests.tui_keys import scripted_keys
+
+        async def read() -> str:
+            return "из базы"
+
+        shown: list[str] = []
+
+        def detail():
+            shown.append(asyncio.run(read()))  # like «Прокси»: Space reads the proxy from the database
+            return [[Cell(shown[-1])]]
+
+        c = Controller([Tab("Т", "т", lambda: View(rows=[Row("a", [Cell("альфа")], detail=detail)]))])
+        c.press("space")  # open the details; the menu draws them inside its event loop
+        with scripted_keys("q"):
+            run_shell(c, lambda run: run.work(), lambda: None)
+        self.assertTrue(c.quit)
+        self.assertIn("из базы", shown)
+
     def test_a_run_step_leaves_the_menu_and_comes_back_with_its_result(self):
         from modules.ui.shell import run_shell
         from tests.tui_keys import ENTER, scripted_keys
@@ -265,6 +288,15 @@ class LiveShell(unittest.TestCase):
 
 
 class TextHelpers(unittest.TestCase):
+    def test_a_wide_window_widens_only_growing_cells(self):
+        from modules.ui import shell
+
+        cells = [Cell("абвгдежзиклмн", "", 6, grow=True), Cell("x", "", 3), Cell("конец")]
+        self.assertTrue(frags_text(shell.cells_frags(cells)).startswith("абвг… x  "))
+        with patch.object(shell, "WIDTH", shell.BASE_WIDTH + 20):
+            out = frags_text(shell.cells_frags(cells))
+        self.assertTrue(out.startswith("абвгдежзиклмн" + " " * 13 + "x  "))
+
     def test_emoji_take_two_columns_and_fit_keeps_the_width(self):
         self.assertEqual(width("🌳"), 2)
         cut = fit("🌳🌳🌳🌳", 5)

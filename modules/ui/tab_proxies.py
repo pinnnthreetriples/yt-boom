@@ -74,7 +74,7 @@ def _proxy_cells(record: Any, users: int | None = None) -> list[Cell]:
     return [
         Cell(icon(name), style, 3),
         Cell(country_of(record) or "??", "accent" if country_of(record) else "dim", 3),
-        Cell(record.address, "", 24),
+        Cell(record.address, "", 24, grow=True),
         Cell(icon("search") if record.is_search else "", "", 3),
         Cell(f"{icon('people')}{users}", "" if users else "dim"),
     ]

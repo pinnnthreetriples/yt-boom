@@ -278,7 +278,7 @@ def links_view(ctx: AppContext) -> View:
     for vid, url, done, target, status in videos:
         finished = status == "completed" or done >= target
         rows.append(Row(f"v{vid}", [Cell(icon("sent" if finished else "videos"), "", 3),
-                                    Cell(_target_short_url(url), "dim" if finished else "", 30), Cell(f"{done}/{target}", "dim")],
+                                    Cell(_target_short_url(url), "dim" if finished else "", 30, grow=True), Cell(f"{done}/{target}", "dim")],
                         hint="Готово" if finished else "Ждёт ответов"))
     if not rows:
         rows.append(Row("empty", [Cell("список пуст", "dim")], selectable=False))
