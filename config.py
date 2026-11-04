@@ -553,6 +553,23 @@ def _resolve_path(base: Path, value: Path) -> Path:
     return value if value.is_absolute() else (base / value).resolve()
 
 
+def repair_text(value: Any) -> Any:
+    """Join UTF-16 surrogate halves into real characters (strings, lists and mappings, recursively).
+
+    The Windows console delivers an emoji as two surrogate halves, and YAML keeps them as "\\uD83D\\uDE33":
+    such a string cannot be stored in SQLite or typed into a browser. A half without its pair is dropped.
+    """
+    if isinstance(value, str):
+        if not any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            return value
+        return value.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "ignore")
+    if isinstance(value, list):
+        return [repair_text(item) for item in value]
+    if isinstance(value, dict):
+        return {key: repair_text(item) for key, item in value.items()}
+    return value
+
+
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
     config_path = Path(path)
     if not config_path.is_file():
@@ -564,6 +581,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         raise ConfigError(f"failed to read {config_path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError(f"{config_path} must contain a YAML mapping at the top level")
+    raw = repair_text(raw)
 
     missing: list[str] = []
     expanded = _expand_env(raw, "$", missing)

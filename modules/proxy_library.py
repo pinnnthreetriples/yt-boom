@@ -19,6 +19,7 @@ from loguru import logger
 
 from config import AccountSettings, ProxyUnavailableError, load_config, mask_proxy_url
 from database import SEARCH_PROXY_KEY, AccountRecord, Database, ProxyRecord
+from modules.projects import open_database
 
 CONFIG_MIGRATION_KEY = "config_proxies_migrated_at"
 
@@ -155,8 +156,11 @@ def account_route(account: AccountRecord, record: ProxyRecord | None = None) -> 
 async def sync_config_accounts(db: Database, accounts: list[AccountSettings]) -> list[str]:
     """config.yaml -> DB without ever overwriting what the DB knows: missing accounts are created (with their yaml
     proxy and active flag); an existing account keeps its proxy and active flag, except that a proxy written in the
-    yaml (explicitly, non-empty) is imported when the account has none. Returns the names that got a proxy."""
+    yaml (explicitly, non-empty) is imported when the account has none. Accounts created in the run that created
+    «Основной» join it while it is the only project (`Database.adopt_config_accounts`). Returns the names that got a
+    proxy."""
     imported: list[str] = []
+    created: list[int] = []
     for acc in accounts:
         existing = await db.get_account(acc.name)
         explicit_proxy = acc.proxy_url.strip() if "proxy_url" in acc.model_fields_set and acc.proxy_url else None
@@ -164,7 +168,7 @@ async def sync_config_accounts(db: Database, accounts: list[AccountSettings]) ->
             args: dict[str, Any] = {"name": acc.name, "session_path": acc.session_path, "is_active": acc.is_active}
             if explicit_proxy:
                 args["proxy_url"] = explicit_proxy
-            await db.upsert_account(**args)
+            created.append((await db.upsert_account(**args)).id)
             if explicit_proxy:
                 imported.append(acc.name)
         elif explicit_proxy and existing.proxy_url is None and not existing.proxy_unavailable:
@@ -174,6 +178,7 @@ async def sync_config_accounts(db: Database, accounts: list[AccountSettings]) ->
                 logger.warning("Аккаунт {!r}: прокси из config.yaml не разобран и не импортирован", acc.name)
                 continue
             imported.append(acc.name)
+    await db.adopt_config_accounts(created)
     return imported
 
 
@@ -217,7 +222,7 @@ async def migrate_config_proxies(config_path: str | Path) -> ConfigMigrationRepo
     if not isinstance(raw, dict):
         return report
     cfg = load_config(path)
-    async with Database(cfg.app.db_path) as db:
+    async with open_database(cfg) as db:
         first = await db.get_setting(CONFIG_MIGRATION_KEY) is None
         yaml_names = _yaml_account_names(raw)
         report.imported_accounts = await sync_config_accounts(

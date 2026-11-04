@@ -15,6 +15,7 @@ from database import Database, Payload, QueueItem, TestNode
 from modules.collector import CollectedItem, Collector, CollectorError
 from modules.interaction_simulator import InteractionSimulator
 from modules.process_guard import bind_to_kill_on_close_job
+from modules.projects import project_seed
 from modules.processor import DeepSeekProcessor, ProcessorError, resolve_reply_text
 from modules.ui_test_runner import UITestRunner
 from modules.validator import DeliveryValidator
@@ -34,7 +35,7 @@ class Orchestrator:
     def __init__(self, config: AppConfig) -> None:
         self._cfg = config
         self._rng = random.Random()
-        self._db = Database(config.app.db_path)
+        self._db = Database(config.app.db_path, project_seed=project_seed(config))
         self._collector = Collector(config.collector, config.browser.proxy)
         self._processor = DeepSeekProcessor(config.deepseek, config.processor, rng=self._rng)
         self._validator = DeliveryValidator(config.validator)

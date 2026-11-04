@@ -1,4 +1,5 @@
-"""Tab «Ответы» of the tabbed interface: who writes, the DeepSeek key, rewording, templates."""
+"""Tab «Ответы» of the tabbed interface: who writes, rewording, templates (of the current project), the DeepSeek key
+(common to every project)."""
 from __future__ import annotations
 
 import tempfile
@@ -10,7 +11,7 @@ import yaml
 
 from config import load_config
 from modules.ui import icons
-from modules.ui.app import AppContext
+from modules.ui.app import AppContext, _ensure_schema
 from modules.ui.shell import Controller, Run, frags_text, render
 from modules.ui.tab_replies import build_tab
 
@@ -32,6 +33,7 @@ class RepliesTabCase(unittest.TestCase):
         data["deepseek"]["api_key"] = "sk-test-key-123456"
         self.config_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
         self.ctx = AppContext(self.config_path)
+        _ensure_schema(self.ctx)  # as run_app does: «Основной» is seeded from this config
         self.tab = build_tab(self.ctx)
         self.c = Controller([self.tab])
 
@@ -40,6 +42,9 @@ class RepliesTabCase(unittest.TestCase):
 
     def cfg(self):
         return load_config(self.config_path)
+
+    def project(self):
+        return self.ctx.project()
 
     def screen(self) -> str:
         return frags_text(render(self.c))
@@ -67,14 +72,14 @@ class WriterTest(RepliesTabCase):
 
     def test_templates_without_templates_warn(self):
         self.keys("right")
-        cfg = self.cfg()
-        self.assertEqual(cfg.processor.reply_mode, "custom")
+        self.assertEqual(self.project().reply_mode, "custom")
+        self.assertEqual(self.cfg().processor.reply_mode, "ai")  # config.yaml is not the project's
         text = self.screen()
         self.assertIn("Шаблонов нет", text)
         self.assertIn("менять слова", text)
         self.assertTrue(self.tab.warn())
         self.keys("left")
-        self.assertEqual(self.cfg().processor.reply_mode, "ai")
+        self.assertEqual(self.project().reply_mode, "ai")
 
     def test_ai_without_a_key_warns(self):
         self.ctx.update({"deepseek.api_key": "sk-your-deepseek-key"})
@@ -86,7 +91,7 @@ class WriterTest(RepliesTabCase):
         self.keys("right")
         self.c.select("shuffle")
         self.keys("right")
-        self.assertFalse(self.cfg().processor.paraphrase_custom)
+        self.assertFalse(self.project().paraphrase_custom)
         self.assertIn("как есть", self.screen())
 
 
@@ -147,7 +152,7 @@ class TemplatesTest(RepliesTabCase):
         self.keys("+")
         self.type("Отличный обзор")
         self.keys("enter")
-        self.assertEqual(self.cfg().processor.custom_replies, ["Отличный обзор"])
+        self.assertEqual(self.project().custom_replies, ["Отличный обзор"])
         self.keys("+")
         self.type("Согласен")
         self.keys("enter")
@@ -156,21 +161,62 @@ class TemplatesTest(RepliesTabCase):
         self.keys("enter")
         self.type(", спасибо")
         self.keys("enter")
-        self.assertEqual(self.cfg().processor.custom_replies[0], "Отличный обзор, спасибо")
+        self.assertEqual(self.project().custom_replies[0], "Отличный обзор, спасибо")
 
         self.keys("D")
         self.assertIn("Удалить шаблон?", self.screen())
         self.keys("right", "enter")
-        self.assertEqual(self.cfg().processor.custom_replies, ["Согласен"])
+        self.assertEqual(self.project().custom_replies, ["Согласен"])
 
         self.keys("escape")
         self.assertIn("шаблоны 1", self.screen())
 
     def test_delete_defaults_to_no(self):
-        self.ctx.update({"processor.custom_replies": ["a", "b"], "custom_replies": ["a", "b"]})
+        self.ctx.update_project(self.project().id, custom_replies=["a", "b"])
         self.open()
         self.keys("delete", "enter")
-        self.assertEqual(self.cfg().processor.custom_replies, ["a", "b"])
+        self.assertEqual(self.project().custom_replies, ["a", "b"])
+
+
+
+class SeveralProjectsTest(RepliesTabCase):
+    def setUp(self):
+        super().setUp()
+        self.other = self.ctx.db(lambda db: db.create_project("Фитнес", reply_mode="custom", custom_replies=["Класс"]))
+        self.c.refresh()
+
+    def test_the_switch_row_and_each_project_keeps_its_replies(self):
+        text = self.screen()
+        self.assertIn("Основной", text)
+        self.assertIn("1/2", text)
+        self.assertIn("── общее для всех проектов", text)
+        self.keys("right")  # the switch row is the first one
+        self.assertEqual(self.project().name, "Фитнес")
+        self.assertIn("мои шаблоны", self.screen())
+        self.c.select("writer")
+        self.keys("left")
+        self.assertEqual(self.project().reply_mode, "ai")
+        main = next(p for p in self.ctx.projects() if p.name == "Основной")
+        self.assertEqual(main.reply_mode, "ai")
+        self.assertEqual(self.ctx.projects()[1].custom_replies, ["Класс"])
+
+    def test_templates_are_the_projects(self):
+        self.ctx.set_project(self.other.id)
+        self.c.select("templates")
+        self.keys("enter")
+        self.assertIn("Фитнес › шаблоны · 1", self.screen())
+        self.keys("+")
+        self.type("Огонь")
+        self.keys("enter")
+        self.assertEqual(self.project().custom_replies, ["Класс", "Огонь"])
+        self.assertEqual(next(p for p in self.ctx.projects() if p.name == "Основной").custom_replies, [])
+
+    def test_warn_follows_the_projects_in_the_launch(self):
+        self.assertFalse(self.tab.warn())
+        self.ctx.update_project(self.other.id, custom_replies=[])
+        self.assertTrue(self.tab.warn())
+        self.ctx.update_project(self.other.id, enabled=False)
+        self.assertFalse(self.tab.warn())
 
 
 if __name__ == "__main__":

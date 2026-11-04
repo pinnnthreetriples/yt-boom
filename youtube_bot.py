@@ -8,12 +8,12 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, NamedTuple
 
 from loguru import logger
 
 from config import AppConfig, ProxyUnavailableError, load_config, mask_proxy_url, resolve_account_proxy
-from database import AccountRecord, ActivityLogCreate, Database, RecordNotFoundError
+from database import DEFAULT_PROJECT_NAME, AccountRecord, ActivityLogCreate, Database, ProjectRecord, RecordNotFoundError
 from modules.collector import CollectorError
 from modules.account_parser import looks_like_credentials, parse_account_line
 from modules.account_menu_logic import format_profile_summary, profile_pending_fields
@@ -29,6 +29,7 @@ from modules.lifecycle_engine import (
     release_restriction,
 )
 from modules.process_guard import bind_to_kill_on_close_job
+from modules.projects import project_config, project_plan, project_seed
 from modules.profile_manager import ProfileEditor
 from modules.proxy_library import log_proxy_routes, run_config_proxy_migration
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
@@ -38,6 +39,40 @@ from modules.youtube_runner import YouTubeRunner
 
 
 from modules.logger_config import configure_windows_encoding, setup_bot_logging
+
+
+async def _settings_without_project(db: Database, cfg: AppConfig, log: bool = True) -> AppConfig | None:
+    """Target and replies for a run without --project (`--search`, `--account`, `--video`): config.yaml no longer
+    holds them (the interface writes into the projects), so they come from the only project, else from «Основной».
+    None (logged, with the hint to name --project) when there are several projects and no «Основной»."""
+    projects = await db.list_projects()
+    project = projects[0] if len(projects) == 1 else await db.get_project_by_name(DEFAULT_PROJECT_NAME)
+    if project is None:
+        names = ", ".join(f"«{p.name}»" for p in projects) or "нет"
+        logger.error("Проектов несколько и «{}» нет: укажите, чьи цель и ответы взять — --project ИМЯ (проекты: {})",
+                     DEFAULT_PROJECT_NAME, names)
+        return None
+    if log:
+        logger.info("Цель и ответы — из проекта «{}» (без --project; аккаунты — как раньше)", project.name)
+    return project_config(cfg, project, project.search_topics[0] if project.search_topics else None)
+
+
+def _cli_settings(args: argparse.Namespace, cfg: AppConfig) -> AppConfig:
+    """`_settings_without_project` for main(): the filters and limits of the command line default to it; exit 1."""
+    async def resolve() -> AppConfig | None:
+        async with _open_db(cfg) as db:
+            return await _settings_without_project(db, cfg, log=False)
+
+    settings = asyncio.run(resolve())
+    if settings is None:
+        sys.exit(1)
+    return settings
+
+
+def _open_db(cfg: AppConfig) -> Database:
+    """The configured database; its first start with projects seeds «Основной» from this config (a stand-in config
+    without the target sections seeds nothing)."""
+    return Database(cfg.app.db_path, project_seed=project_seed(cfg) if isinstance(cfg, AppConfig) else None)
 
 
 def format_author(author: str | None) -> str:
@@ -152,7 +187,7 @@ async def interactive_login(
 
     cfg = load_config(config_path)
     cfg.browser.headless = False
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
 
@@ -259,7 +294,7 @@ async def add_account_cli(
             sys.exit(1)
         geo["locale"] = tag
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
@@ -275,6 +310,7 @@ async def add_account_cli(
             f"[OK] Account {account.name!r} registered successfully "
             f"(id={account.id}, session={account.session_path}, proxy={mask_proxy_url(account.proxy_url) or 'direct'})"
         )
+        await _warn_without_project(db, [account])
     finally:
         await db.close()
 
@@ -353,7 +389,7 @@ async def add_credentials_account_cli(
 ) -> bool:
     """`--add-account email:password:totp_secret[:recovery_email]`: register the account with status `pending`."""
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         try:
             account = await _register_credentials_account(db, cfg, spec, name, session_path, proxy_url, country, locale)
         except ValueError as exc:
@@ -365,6 +401,7 @@ async def add_credentials_account_cli(
             f"country={account.expected_country or '-'}, locale={account.locale or '-'}). "
             f"Next: --auth-account {account.name}"
         )
+        await _warn_without_project(db, [account])
         return True
 
 
@@ -482,7 +519,7 @@ async def auth_account_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found. Add it with --add-account email:password:totp", file=sys.stderr)
@@ -558,13 +595,14 @@ async def import_accounts_file_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         imported = await register_account_lines(db, cfg, lines)
         registered = {account.id: account for account in imported.added}
         failed_lines = len(imported.errors)
         for number, reason in imported.errors:
             print(f"[ERROR] line {number}: {reason}", file=sys.stderr)
         print(f"[OK] Registered {len(registered)} account(s), skipped {failed_lines} invalid line(s)")
+        await _warn_without_project(db, list(registered.values()))
 
         queue = [a for a in registered.values() if force or a.auth_status != "authenticated"]
         if len(queue) < len(registered):
@@ -583,7 +621,7 @@ async def import_accounts_file_cli(
 async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml", online: bool = False) -> bool:
     """Session status from the profile's LOGIN_INFO cookie; with `online` also asks YouTube over HTTP (no browser)."""
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         if identifier and identifier != "ALL":
             account = await _find_account(db, identifier)
             if account is None:
@@ -632,7 +670,7 @@ async def warm_up_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
@@ -648,7 +686,7 @@ async def apply_profile_cli(identifier: str, config_path: str = "config.yaml", h
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
@@ -673,7 +711,7 @@ async def warm_quarantined_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         targets = warm_candidates(await db.list_active_accounts())
         if not targets:
             print("[INFO] No authenticated accounts in quarantine or aging.")
@@ -728,7 +766,7 @@ async def warm_selected_cli(
         cfg.browser.headless = headless
     results: list[WarmUpResult] = []
     worked = False  # something already ran: the next account waits first (a skipped one costs no pause)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         for name in names:
             account = await db.get_account(name)
             needs_sign_in = account is not None and account.auth_status != "authenticated"
@@ -752,7 +790,7 @@ async def warm_selected_cli(
 async def lifecycle_cli(config_path: str = "config.yaml") -> None:
     """`--lifecycle`: ages, stages, quarantine hours left, today's quota, mode, on/off and auto warm-up per account."""
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         accounts = await db.list_accounts()
         now = datetime.now(timezone.utc)
         width = 128
@@ -822,7 +860,7 @@ async def _account_setting_cli(
     identifier: str, config_path: str, change: Callable[[Database, AccountRecord], Awaitable[str]]
 ) -> bool:
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
@@ -879,7 +917,7 @@ async def reset_restricted_cli(identifier: str, config_path: str = "config.yaml"
 async def print_accounts_table(config_path: str = "config.yaml") -> None:
     """Pretty-print a table of all accounts with stats from DB."""
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
@@ -900,9 +938,10 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
         if not accounts:
             print("  No accounts found in database or configuration.")
         else:
+            in_projects = await _projects_by_account(db)
             header = (
                 f"{'ID':<4} | {'Name':<16} | {'Status':<8} | {'Auth':<13} | {'Geo':<12} | {'Exp':<3} | {'Locale':<7} | {'Replies':<8} | "
-                f"{'Email':<24} | {'Proxy':<30} | {'Session Path'}"
+                f"{'Email':<24} | {'Proxy':<30} | {'Projects':<20} | {'Session Path'}"
             )
             print(header)
             print("-" * 123)
@@ -925,6 +964,7 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
                     f"{acc.total_replies:<8} | "
                     f"{mask_email(acc.email):<24} | "
                     f"{proxy_display:<30} | "
+                    f"{(', '.join(in_projects.get(acc.id, [])) or '— без проекта')[:20]:<20} | "
                     f"{acc.session_path}"
                 )
                 print(row)
@@ -935,6 +975,108 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
         await db.close()
 
 
+async def _project_by_name(db: Database, name: str | None) -> ProjectRecord | None:
+    """The project named `name` (without regard to case); without a name «Основной». Logs what is missing."""
+    wanted = name or DEFAULT_PROJECT_NAME
+    project = await db.get_project_by_name(wanted)
+    if project is None:
+        names = ", ".join(f"«{p.name}»" for p in await db.list_projects()) or "нет"
+        hint = "" if name else " — укажите проект: --project ИМЯ"
+        logger.error("Проект «{}» не найден{} (проекты: {})", wanted, hint, names)
+    return project
+
+
+# --------------------------------------------------------------------------- projects (CLI)
+
+
+async def _warn_without_project(db: Database, accounts: Iterable[AccountRecord]) -> None:
+    """Decision of the projects: a new account joins no project and does not work until it does — say so."""
+    loose = [account.name for account in accounts if not await db.projects_of_account(account.id)]
+    if loose:
+        print(
+            f"[!] Без проекта (не работают, пока не добавлены в проект): {', '.join(loose)} — "
+            f"--project-accounts ПРОЕКТ {','.join(loose)} или вкладка «Проекты»"
+        )
+
+
+async def _projects_by_account(db: Database) -> dict[int, list[str]]:
+    names: dict[int, list[str]] = {}
+    for project in await db.list_projects():
+        for account in await db.list_project_accounts(project.id):
+            names.setdefault(account.id, []).append(project.name)
+    return names
+
+
+async def print_projects_table(config_path: str = "config.yaml") -> None:
+    """`--list-projects`: every project in queue order with its launch flag, members, topics, links and replies."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        projects = await db.list_projects()
+        print("\n" + "=" * 90)
+        print("                        ПРОЕКТЫ (по порядку запуска)")
+        print("=" * 90)
+        print(f"{'ID':<4} | {'Название':<24} | {'Запуск':<6} | {'Акк.':<4} | {'Тем':<3} | {'Ссылки':<9} | {'Ответы':<14} | Лимит")
+        print("-" * 90)
+        for p in projects:
+            replies = "ИИ" if p.reply_mode == "ai" else f"шаблоны {len(p.custom_replies)}"
+            print(
+                f"{p.id:<4} | {p.name[:24]:<24} | {'да' if p.enabled else 'нет':<6} | {p.accounts_count:<4} | "
+                f"{len(p.search_topics):<3} | {f'{p.links_waiting}/{p.links_total}':<9} | {replies:<14} | "
+                f"{p.daily_per_account or '-'}"
+            )
+        print("=" * 90 + "\n")
+
+
+async def project_add_cli(name: str, config_path: str = "config.yaml") -> bool:
+    """`--project-add NAME`: a new project (AI replies, no topics, no accounts) at the end of the queue."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        try:
+            project = await db.create_project(name)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return False
+    print(f"[OK] Проект «{project.name}» создан (id={project.id}). Аккаунты: --project-accounts \"{project.name}\" acc1,acc2")
+    return True
+
+
+async def _project_and_accounts(db: Database, name: str, accounts: str) -> tuple[ProjectRecord, list[AccountRecord]] | None:
+    project = await db.get_project_by_name(name)
+    if project is None:
+        print(f"[ERROR] Проект «{name}» не найден (--list-projects)", file=sys.stderr)
+        return None
+    found: list[AccountRecord] = []
+    for identifier in [part.strip() for part in accounts.split(",") if part.strip()]:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Аккаунт {identifier!r} не найден (--list-accounts)", file=sys.stderr)
+            return None
+        found.append(account)
+    if not found:
+        print("[ERROR] Аккаунты не указаны: имена через запятую", file=sys.stderr)
+        return None
+    return project, found
+
+
+async def project_accounts_cli(name: str, accounts: str, config_path: str = "config.yaml", add: bool = True) -> bool:
+    """`--project-accounts NAME acc1,acc2` adds the accounts to the project; `--project-remove-account` takes them out.
+    Nothing changes when the project or one of the accounts is unknown."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        resolved = await _project_and_accounts(db, name, accounts)
+        if resolved is None:
+            return False
+        project, found = resolved
+        ids = [account.id for account in found]
+        if add:
+            changed = await db.add_project_accounts(project.id, ids)
+            print(f"[OK] «{project.name}»: добавлено {changed} из {len(ids)} (уже были: {len(ids) - changed})")
+        else:
+            changed = await db.remove_project_accounts(project.id, ids)
+            print(f"[OK] «{project.name}»: убрано {changed} из {len(ids)}")
+    return True
+
+
 async def run_video_pool_cli(
     config_path: str = "config.yaml",
     videos_file: str | Path | None = None,
@@ -942,8 +1084,10 @@ async def run_video_pool_cli(
     account_mode: str | None = None,
     dry_run: bool = False,
     headless: bool | None = None,
+    project: str | None = None,
 ) -> int:
-    """Reply under the video pool with all active accounts; returns the number of replies posted.
+    """Load `videos_file` into a project's own links (`project`, else «Основной») and reply under that project's
+    waiting links with its members and its settings; returns the number of replies posted (0: no such project).
 
     concurrency / account_mode default to limits.max_concurrent_sessions / limits.account_mode.
     """
@@ -953,10 +1097,14 @@ async def run_video_pool_cli(
     if headless is not None:
         cfg.browser.headless = headless
 
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
-    await log_proxy_routes(db)
+    record = await _project_by_name(db, project)
+    if record is None:
+        await db.close()
+        return 0
+    await log_proxy_routes(db, [acc.name for acc in await db.list_project_accounts(record.id, active_only=True)])
 
     orchestrator = MultiAccountOrchestrator(
         config_or_path=cfg,
@@ -965,11 +1113,108 @@ async def run_video_pool_cli(
         dry_run=dry_run,
         headless=headless,
         account_mode=account_mode,
+        project=record,
     )
     try:
         return await orchestrator.run_video_pool(videos_file=videos_file)
     finally:
         await orchestrator.close()
+
+
+class ProjectsRunSummary(NamedTuple):
+    """A launch over projects: one result per project reached, and where it stopped early (Ctrl+C or an error)."""
+
+    results: list[Any]  # ProjectRunResult
+    stopped_at: str | None = None  # the project the launch stopped on; None: every project had its turn
+    error: str | None = None
+
+
+def _project_skip_reason(project: ProjectRecord, topics: list[str] | None) -> str:
+    """Why a project is not started at all ("" = start it): no members, nothing to look at, no templates."""
+    if not project.accounts_count:
+        return "нет аккаунтов"
+    plan = project_plan(project if topics is None else project.model_copy(update={"search_topics": topics}))
+    if not plan.steps:
+        return plan.reason
+    if project.reply_mode == "custom" and not project.custom_replies:
+        return "нет шаблонов"
+    return ""
+
+
+def _log_projects_summary(summary: ProjectsRunSummary) -> None:
+    for res in summary.results:
+        if res.skipped:
+            logger.warning("Проект «{}»: пропущен — {}", res.project, res.skipped)
+        else:
+            logger.info("Проект «{}»: видео {} · ответов {}", res.project, res.found, res.replies)
+    if summary.stopped_at:
+        logger.error("Запуск остановлен на проекте «{}»{}", summary.stopped_at, f": {summary.error}" if summary.error else "")
+
+
+async def run_projects(
+    config_path: str = "config.yaml",
+    dry_run: bool = False,
+    project_ids: list[int] | None = None,
+    *,
+    headless: bool | None = None,
+    concurrency: int | None = None,
+    account_mode: str | None = None,
+    topics: list[str] | None = None,
+    progress: dict[str, Any] | None = None,
+) -> ProjectsRunSummary:
+    """Run the projects one after another: those «в запуске» in queue order, or exactly `project_ids` (in queue
+    order too). Each one gets its own orchestrator (its members, pool, target and replies), closed before the next;
+    the comments taken are shared, so one comment gets one reply from the whole launch. A project without members,
+    videos or templates is skipped with the reason. An error stops the launch on that project (the next ones do not
+    start); Ctrl+C closes the current one and propagates. `topics` replaces the projects' topics for this launch only
+    (nothing is saved); `progress["project"]` names the project running now (the interface reports a Ctrl+C with it).
+    """
+    from modules.multi_account_orchestrator import MultiAccountOrchestrator, ProjectRunResult, WarmupLedger
+
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    async with _open_db(cfg) as db:
+        projects = await db.list_projects()
+        await log_proxy_routes(db)
+    wanted = None if project_ids is None else set(project_ids)
+    queue = [p for p in projects if (p.id in wanted if wanted is not None else p.enabled)]
+    if not queue:
+        logger.warning("Нет проектов в запуске: отметьте проект «в запуске» во вкладке «Проекты»")
+    claimed: set[str] = set()
+    warmups = WarmupLedger()
+    summary = ProjectsRunSummary([])
+    for project in queue:
+        reason = _project_skip_reason(project, topics)
+        if reason:
+            summary.results.append(ProjectRunResult(project.name, 0, 0, 0, reason))
+            continue
+        if progress is not None:
+            progress["project"] = project.name
+        orchestrator = MultiAccountOrchestrator(
+            config_or_path=cfg,
+            db=_open_db(cfg),
+            concurrency=concurrency or cfg.limits.max_concurrent_sessions,
+            dry_run=dry_run,
+            headless=headless,
+            account_mode=account_mode,
+            project=project,
+            claimed=claimed,
+            warmups=warmups,
+        )
+        try:
+            summary.results.append(await orchestrator.run_project(topics))
+        except Exception as exc:
+            logger.exception("Проект «{}» завершился ошибкой: {}", project.name, exc)
+            summary = summary._replace(stopped_at=project.name, error=f"{type(exc).__name__}: {exc}")
+            break
+        except BaseException:  # Ctrl+C: the project is closed below, the next ones do not start
+            logger.warning("Запуск прерван на проекте «{}»", project.name)
+            raise
+        finally:
+            await orchestrator.close()
+    _log_projects_summary(summary)
+    return summary
 
 
 async def run_search_cli(
@@ -999,6 +1244,14 @@ async def run_search_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
+    db = _open_db(cfg)
+    await db.connect()
+    await db.init_schema()
+    settings = await _settings_without_project(db, cfg)
+    if settings is None:
+        await db.close()
+        return SearchRunResult(0, 0, 0)
+    cfg = settings
     if target_mode:
         cfg.collector.target_mode = target_mode
     if custom_reply and custom_reply.strip():
@@ -1007,12 +1260,9 @@ async def run_search_cli(
     elif reply_mode:
         cfg.processor.reply_mode = reply_mode
     if cfg.processor.reply_mode == "custom" and not [r for r in cfg.processor.custom_replies if r and r.strip()]:
-        logger.error("Включен режим 'Свой текст' (custom), но список 'custom_replies' пуст и --custom-reply не передан")
+        logger.error("Включен режим 'Свой текст' (custom), но список шаблонов пуст и --custom-reply не передан")
+        await db.close()
         return SearchRunResult(0, 0, 0)
-
-    db = Database(cfg.app.db_path)
-    await db.connect()
-    await db.init_schema()
     await log_proxy_routes(db)
 
     orchestrator = MultiAccountOrchestrator(
@@ -1034,6 +1284,56 @@ async def run_search_cli(
         )
     finally:
         await orchestrator.close()
+
+
+async def run_projects_cli(
+    config_path: str = "config.yaml",
+    project: str | None = None,
+    *,
+    dry_run: bool = False,
+    headless: bool | None = None,
+    concurrency: int | None = None,
+    account_mode: str | None = None,
+    topics: list[str] | None = None,
+) -> ProjectsRunSummary | None:
+    """`run_projects` for the command line: `project` (a name) runs only that one, else every project «в запуске».
+    None when the named project does not exist."""
+    project_ids = None
+    if project is not None:
+        cfg = load_config(config_path)
+        async with _open_db(cfg) as db:
+            record = await _project_by_name(db, project)
+        if record is None:
+            return None
+        project_ids = [record.id]
+    return await run_projects(
+        config_path, dry_run, project_ids, headless=headless, concurrency=concurrency, account_mode=account_mode,
+        topics=topics,
+    )
+
+
+_PROJECT_OVERRIDE_FLAGS = (
+    "min_views", "max_views", "max_age_hours", "max_videos", "comments_per_video", "target_mode", "reply_mode",
+    "custom_reply",
+)
+
+
+def run_projects_from_args(args: argparse.Namespace, topics: list[str] | None = None) -> None:
+    """A launch over projects from the command line; exits 1 for an unknown project or a launch stopped by an error."""
+    ignored = [f"--{flag.replace('_', '-')}" for flag in _PROJECT_OVERRIDE_FLAGS if getattr(args, flag, None) is not None]
+    if ignored:
+        logger.warning("Фильтры и ответы берутся из проекта: {} не действуют", ", ".join(ignored))
+    summary = asyncio.run(run_projects_cli(
+        args.config,
+        args.project,
+        dry_run=args.dry_run,
+        headless=True if args.headless else None,
+        concurrency=args.concurrency,
+        account_mode=args.account_mode,
+        topics=topics,
+    ))
+    if summary is None or summary.stopped_at:
+        sys.exit(1)
 
 
 def search_options(args: argparse.Namespace, cfg: AppConfig) -> dict[str, Any]:
@@ -1093,7 +1393,7 @@ async def list_sub_comments(video_url: str, config_path: str = "config.yaml", li
     """Fetch and list comments under comments for a YouTube video."""
     cfg = load_config(config_path)
     try:
-        async with Database(cfg.app.db_path) as db:
+        async with _open_db(cfg) as db:
             search_proxy = await db.search_proxy_url()
     except ProxyUnavailableError as exc:
         logger.error("{}", exc)
@@ -1136,9 +1436,14 @@ async def run_reply_bot(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
+    settings = await _settings_without_project(db, cfg)
+    if settings is None:
+        await db.close()
+        return
+    cfg = settings
 
     rng = random.Random()
     effective_mode = "custom" if custom_reply else (reply_mode or getattr(cfg.processor, "reply_mode", "ai"))
@@ -1317,6 +1622,7 @@ async def run_reply_bot(
                         error=f"{db_err_label} failed: {exc}",
                         duration_sec=None,
                         payload_id=payload.id if payload else None,
+                        account_id=owner.id if owner is not None else None,
                     )
                 )
                 logger.error("{} завершилась ошибкой для {}: {}", ru_err_label, item.external_id, exc)
@@ -1345,6 +1651,7 @@ async def run_reply_bot(
                         error=sub_res.error if not sub_res.success else None,
                         duration_sec=sub_res.duration_seconds,
                         payload_id=None,
+                        account_id=owner.id if owner is not None else None,
                     )
                 )
                 if sub_res.success:
@@ -1377,6 +1684,7 @@ async def run_reply_bot(
                             error=str(exc),
                             duration_sec=None,
                             payload_id=payload.id,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
                     logger.exception("Ошибка при отправке ответа для {}: {}", item.external_id, exc)
@@ -1400,6 +1708,7 @@ async def run_reply_bot(
                             error=None,
                             duration_sec=sub_res.duration_seconds,
                             payload_id=payload.id,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
                     logger.success("Ответ успешно опубликован и сохранен в базе (ID={})", sub_res.remote_id)
@@ -1420,6 +1729,7 @@ async def run_reply_bot(
                             error=sub_res.error or "submission failed",
                             duration_sec=sub_res.duration_seconds,
                             payload_id=payload.id,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
                     logger.error("Не удалось отправить ответ: {}", sub_res.error)
@@ -1463,12 +1773,17 @@ async def run_multi_video_pipeline(
     max_age_hours keeps only videos published within that many hours: None = collector.max_age_hours, 0 = any age.
     """
     cfg = load_config(config_path)
-    max_age_hours = cfg.collector.max_age_hours if max_age_hours is None else (max_age_hours or None)
     if headless is not None:
         cfg.browser.headless = headless
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
+    settings = await _settings_without_project(db, cfg)
+    if settings is None:
+        await db.close()
+        return
+    cfg = settings
+    max_age_hours = cfg.collector.max_age_hours if max_age_hours is None else (max_age_hours or None)
 
     rng = random.Random()
     effective_mode = "custom" if custom_reply else (reply_mode or getattr(cfg.processor, "reply_mode", "ai"))
@@ -1691,6 +2006,7 @@ async def run_multi_video_pipeline(
                             error=f"{db_err_label} failed: {exc}",
                             duration_sec=None,
                             payload_id=payload.id if payload else None,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
                     logger.error("{} завершилась ошибкой для {}: {}", ru_err_label, item.external_id, exc)
@@ -1718,6 +2034,7 @@ async def run_multi_video_pipeline(
                             error=sub_res.error if not sub_res.success else None,
                             duration_sec=sub_res.duration_seconds,
                             payload_id=None,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
                     if sub_res.success:
@@ -1751,6 +2068,7 @@ async def run_multi_video_pipeline(
                                 error=str(exc),
                                 duration_sec=None,
                                 payload_id=payload.id,
+                                account_id=owner.id if owner is not None else None,
                             )
                         )
                         logger.exception("Ошибка при отправке ответа для {}: {}", item.external_id, exc)
@@ -1774,6 +2092,7 @@ async def run_multi_video_pipeline(
                                 error=None,
                                 duration_sec=sub_res.duration_seconds,
                                 payload_id=payload.id,
+                                account_id=owner.id if owner is not None else None,
                             )
                         )
                         logger.success("Ответ успешно опубликован и сохранен в базе (ID={})", sub_res.remote_id)
@@ -1795,6 +2114,7 @@ async def run_multi_video_pipeline(
                                 error=sub_res.error or "submission failed",
                                 duration_sec=sub_res.duration_seconds,
                                 payload_id=payload.id,
+                                account_id=owner.id if owner is not None else None,
                             )
                         )
                         logger.error("Не удалось отправить ответ: {}", sub_res.error)
@@ -1832,11 +2152,12 @@ async def print_activity_history(
 ) -> None:
     """Print the database audit log of replies in a table."""
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
         entries = await db.list_activity_logs(page=1, page_size=limit, status_filter=status_filter)
+        project_names = {p.id: p.name for p in await db.list_projects()}
         print("\n" + "=" * 90)
         print("                        ЖУРНАЛ ОТРАБОТОК (ACTIVITY AUDIT LOG)")
         print("=" * 90)
@@ -1845,15 +2166,16 @@ async def print_activity_history(
             print("=" * 90 + "\n")
             return
 
-        header = f"{'ID':<5} | {'Время (UTC)':<19} | {'Статус':<9} | {'Режим':<7} | {'Автор':<15} | {'Видео':<12} | {'Ответ (фрагмент)'}"
+        header = f"{'ID':<5} | {'Время (UTC)':<19} | {'Статус':<9} | {'Режим':<7} | {'Проект':<12} | {'Автор':<15} | {'Видео':<12} | {'Ответ (фрагмент)'}"
         print(header)
         print("-" * 90)
         for e in entries:
             t = e.created_at[:19].replace("T", " ") if e.created_at else "---"
+            project = "—" if e.project_id is None else project_names.get(e.project_id, "удалён")
             author = (e.target_author or "@unknown")[:14]
             vid = (e.video_title or e.video_id)[:11]
             reply = (e.reply_text or e.error or "")[:25].replace("\n", " ")
-            print(f"{e.id:<5} | {t:<19} | {e.status:<9} | {e.mode:<7} | {author:<15} | {vid:<12} | {reply}...")
+            print(f"{e.id:<5} | {t:<19} | {e.status:<9} | {e.mode:<7} | {project[:12]:<12} | {author:<15} | {vid:<12} | {reply}...")
         print("=" * 90 + "\n")
     finally:
         await db.close()
@@ -1861,7 +2183,7 @@ async def print_activity_history(
 
 async def print_status(config_path: str = "config.yaml") -> None:
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
@@ -1949,8 +2271,13 @@ def main() -> None:
     parser.add_argument("--auto-warmup", nargs=2, default=None, metavar=("NAME", "on|off"), help="Allow (on) or forbid (off) the background warm-up of the account during a run")
     parser.add_argument("--set-active", nargs=2, default=None, metavar=("NAME", "on|off"), help="Put the account in work (on) or switch it off (off): runs skip it and it is not warmed up")
     parser.add_argument("--reset-restricted", type=str, default=None, metavar="NAME", help="Lift the circuit breaker of a restricted account (3 errors in a row)")
-    parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
-    parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt)")
+    parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats and projects from DB")
+    parser.add_argument("--list-projects", action="store_true", help="List the projects in launch order: in the launch, accounts, topics, links, replies, daily limit")
+    parser.add_argument("--project-add", type=str, default=None, metavar="NAME", help="Create a project (AI replies, no topics, no accounts)")
+    parser.add_argument("--project-accounts", nargs=2, default=None, metavar=("NAME", "ACC1,ACC2"), help="Add accounts (names or emails, comma-separated) to a project")
+    parser.add_argument("--project-remove-account", nargs=2, default=None, metavar=("NAME", "ACC"), help="Take accounts (comma-separated) out of a project")
+    parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt): the links go into --project (default «Основной») and that project runs its waiting links")
+    parser.add_argument("--project", type=str, default=None, metavar="NAME", help="Run only this project (its topics, reference links and own links, its accounts and replies); without it a run with no --search/--video/--account goes through every project «в запуске» one after another. With --search: the topic replaces the project's topics for this run only (nothing is saved)")
     parser.add_argument("--concurrency", "-j", type=int, default=None, help="Accounts working at the same time (default: limits.max_concurrent_sessions)")
     parser.add_argument("--account-mode", choices=("each", "share"), default=None, help="each: every account passes the whole video list; share: the list is split (default: limits.account_mode)")
     parser.add_argument("--list-replies", action="store_true", help="List comments under comments and exit")
@@ -2010,6 +2337,17 @@ def main() -> None:
     if args.list_accounts:
         asyncio.run(print_accounts_table(args.config))
         return
+
+    if args.list_projects:
+        asyncio.run(print_projects_table(args.config))
+        return
+
+    if args.project_add:
+        sys.exit(0 if asyncio.run(project_add_cli(args.project_add, args.config)) else 1)
+
+    for pair, add in ((args.project_accounts, True), (args.project_remove_account, False)):
+        if pair:
+            sys.exit(0 if asyncio.run(project_accounts_cli(pair[0], pair[1], args.config, add=add)) else 1)
 
     if args.add_account:
         account_spec: str = args.add_account
@@ -2079,6 +2417,7 @@ def main() -> None:
                 account_mode=args.account_mode,
                 dry_run=args.dry_run,
                 headless=args.headless if args.headless else None,
+                **({"project": args.project} if args.project else {}),
             )
         )
         return
@@ -2095,8 +2434,12 @@ def main() -> None:
 
     search_query = args.search or getattr(cfg.collector, "search_query", None)
 
+    if args.search and args.project:
+        run_projects_from_args(args, topics=[" ".join(args.search.split())])
+        return
+
     if args.search:
-        run_search_from_args(args, cfg, args.search)
+        run_search_from_args(args, _cli_settings(args, cfg), args.search)
         return
 
     # Check if user explicitly provided a CLI action or if interactive wizard should open
@@ -2112,6 +2455,7 @@ def main() -> None:
         or args.auth_account is not None
         or args.import_accounts_file is not None
         or args.list_accounts
+        or args.project is not None
     )
 
     if args.wizard or (not has_cli_action and sys.stdin.isatty()):
@@ -2119,6 +2463,16 @@ def main() -> None:
         run_wizard_app(args.config)
         return
 
+    if not args.video and args.account is None:
+        run_projects_from_args(args)
+        return
+
+    if args.project:
+        logger.warning("--project не действует вместе с --video / --account: запуск без проектов")
+
+    cfg = _cli_settings(args, cfg)
+    search_query = cfg.collector.search_query
+    default_limit = cfg.limits.max_iterations_per_session or 2
     if not args.video and search_query:
         run_search_from_args(args, cfg, search_query)
         return

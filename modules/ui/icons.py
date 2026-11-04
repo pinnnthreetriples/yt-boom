@@ -16,6 +16,7 @@ _ICONS: dict[str, tuple[str, str]] = {
     "tab_launch": ("🚀", "▶"),
     "tab_accounts": ("👥", "◎"),
     "tab_proxies": ("🌐", "◇"),
+    "tab_projects": ("📁", "▣"),
     "tab_target": ("🎯", "◉"),
     "tab_replies": ("💬", "✎"),
     # account state
@@ -78,6 +79,11 @@ _ICONS: dict[str, tuple[str, str]] = {
     "mark": ("📌", "x"),
     "trash": ("🧹", "×"),
     "warn": ("🟡", "!"),
+    # projects
+    "project": ("📁", "▣"),
+    "similar": ("🧭", "≈"),
+    "copy": ("🧬", "c"),
+    "order": ("⇅", "⇅"),
 }
 
 

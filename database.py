@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 import aiosqlite
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from config import PROXY_LIBRARY_MARKER, ProxyParts, ProxyUnavailableError, compose_proxy_url, split_proxy
 from secret_store import SecretStoreError, protect_secret, reveal_secret
@@ -115,18 +115,43 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_used_at        TEXT
 );
 
-CREATE TABLE IF NOT EXISTS video_pool (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_url         TEXT    NOT NULL UNIQUE,
-    video_id          TEXT    NOT NULL,
-    status            TEXT    NOT NULL DEFAULT 'pending'
-                              CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
-    comments_target   INTEGER NOT NULL DEFAULT 2 CHECK (comments_target > 0),
-    comments_done     INTEGER NOT NULL DEFAULT 0 CHECK (comments_done >= 0),
-    created_at        TEXT    NOT NULL,
-    last_processed_at TEXT,
-    source            TEXT    NOT NULL DEFAULT 'links'  -- 'links' pasted by the user, 'search' found by a topic search
+-- Projects: a set of accounts with its own target (topics, own links, filters) and its own replies.
+-- `search_topics` / `custom_replies` are JSON lists of strings; NULL `max_views` / `max_age_hours` = no limit;
+-- NULL `daily_per_account` = no ceiling of the project (the account's own lifecycle limits always apply).
+CREATE TABLE IF NOT EXISTS projects (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    name               TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    enabled            INTEGER NOT NULL DEFAULT 1,
+    sort               INTEGER NOT NULL DEFAULT 0,
+    search_topics      TEXT    NOT NULL DEFAULT '[]',
+    use_similar        INTEGER NOT NULL DEFAULT 0,
+    use_title_words    INTEGER NOT NULL DEFAULT 0,
+    min_views          INTEGER NOT NULL DEFAULT 0,
+    max_views          INTEGER,
+    max_age_hours      INTEGER,
+    max_videos         INTEGER NOT NULL DEFAULT 5 CHECK (max_videos BETWEEN 1 AND 50),
+    comments_per_video INTEGER NOT NULL DEFAULT 2 CHECK (comments_per_video BETWEEN 1 AND 100),
+    target_mode        TEXT    NOT NULL DEFAULT 'first_reply',
+    daily_per_account  INTEGER CHECK (daily_per_account IS NULL OR daily_per_account > 0),
+    reply_mode         TEXT    NOT NULL DEFAULT 'ai' CHECK (reply_mode IN ('ai', 'custom')),
+    custom_replies     TEXT    NOT NULL DEFAULT '[]',
+    paraphrase_custom  INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT    NOT NULL,
+    updated_at         TEXT    NOT NULL
 );
+
+-- Members of a project (an account may be in several); `daily_done` counts this project's replies of the account
+-- today, restarted at the same daily boundary as the account's own counter (`Database.next_daily_reset`).
+CREATE TABLE IF NOT EXISTS project_accounts (
+    project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    account_id     INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    daily_done     INTEGER NOT NULL DEFAULT 0,
+    daily_reset_at TEXT,
+    added_at       TEXT    NOT NULL,
+    PRIMARY KEY (project_id, account_id)
+);
+
+{video_pool}
 
 -- The proxy library: one row per proxy (host, port, login), assigned to any number of accounts via accounts.proxy_id.
 -- `password` is DPAPI-encrypted; `scheme` NULL = not known yet (a check finds it); `country` is the one the user
@@ -160,7 +185,39 @@ CREATE TABLE IF NOT EXISTS app_settings (
 CREATE INDEX IF NOT EXISTS idx_accounts_name ON accounts(name);
 CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active);
 CREATE INDEX IF NOT EXISTS idx_video_pool_status ON video_pool(status, id);
+CREATE INDEX IF NOT EXISTS idx_project_accounts_account ON project_accounts(account_id);
 """
+
+# One row per video of one project: the same link may sit in several projects. `project_id` is never NULL once
+# the projects are seeded (the pool methods resolve a missing one); `source` 'links' = pasted by the operator,
+# 'search' = found by a topic search or a reference link for one run.
+_VIDEO_POOL_DDL = """
+CREATE TABLE IF NOT EXISTS {name} (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_url         TEXT    NOT NULL,
+    video_id          TEXT    NOT NULL,
+    status            TEXT    NOT NULL DEFAULT 'pending'
+                              CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
+    comments_target   INTEGER NOT NULL DEFAULT 2 CHECK (comments_target > 0),
+    comments_done     INTEGER NOT NULL DEFAULT 0 CHECK (comments_done >= 0),
+    created_at        TEXT    NOT NULL,
+    last_processed_at TEXT,
+    source            TEXT    NOT NULL DEFAULT 'links',
+    project_id        INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    UNIQUE (project_id, video_url)
+);
+"""
+_MULTI_ACCOUNT_SCHEMA = _MULTI_ACCOUNT_SCHEMA.replace("{video_pool}", _VIDEO_POOL_DDL.format(name="video_pool").strip())
+_VIDEO_POOL_COPY_COLUMNS = (
+    "id, video_url, video_id, status, comments_target, comments_done, created_at, last_processed_at, source"
+)
+
+# `activity_log.project_id` has no foreign key on purpose: a deleted project keeps its id in the journal, so its
+# records show as «удалён» (NULL = a run without a project). The account is a real reference.
+_ACTIVITY_PROJECT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("project_id", "INTEGER"),
+    ("account_id", "INTEGER REFERENCES accounts(id) ON DELETE SET NULL"),
+)
 
 _ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
     ("email", "TEXT"),
@@ -230,6 +287,26 @@ NAME_CHANGE_WINDOW_DAYS = 14
 
 _ERROR_LIMIT = 2000
 _SCHEMA_ATTEMPTS = 6
+
+PROJECTS_SEEDED_KEY = "projects_seeded"  # app_settings flag: the first project was created (never seeded again)
+UI_PROJECT_KEY = "ui_project"  # app_settings: the project open in «Цель» / «Ответы»
+DEFAULT_PROJECT_NAME = "Основной"
+PROJECT_NAME_MAX = 40
+PROJECT_TOPICS_MAX = 20
+TARGET_MODES = ("first_reply", "popular_parent", "sub_comment", "mixed")
+_PENDING_POOL_SQL = "status IN ('pending', 'in_progress') AND comments_done < comments_target"
+
+# Every project read carries its counters: members, own links in total and own links still waiting for replies.
+_PROJECT_SELECT = f"""
+    SELECT projects.*,
+           (SELECT COUNT(*) FROM project_accounts pa WHERE pa.project_id = projects.id) AS accounts_count,
+           (SELECT COUNT(*) FROM video_pool v WHERE v.project_id = projects.id AND v.source = 'links') AS links_total,
+           (SELECT COUNT(*) FROM video_pool v
+             WHERE v.project_id = projects.id AND v.source = 'links' AND {_PENDING_POOL_SQL}) AS links_waiting
+    FROM projects
+"""
+_PROJECT_ORDER = " ORDER BY projects.sort ASC, projects.id ASC"
+PROJECT_SELECT, PROJECT_ORDER = _PROJECT_SELECT, _PROJECT_ORDER  # the interface reads projects with plain sqlite3
 
 
 class _Unset:
@@ -318,6 +395,8 @@ class ActivityLogEntry(BaseModel):
     error: str | None = None
     duration_sec: float | None = None
     payload_id: int | None = None
+    project_id: int | None = None
+    account_id: int | None = None
 
 
 class ActivityLogCreate(BaseModel):
@@ -333,6 +412,8 @@ class ActivityLogCreate(BaseModel):
     error: str | None = None
     duration_sec: float | None = None
     payload_id: int | None = None
+    project_id: int | None = None  # the project the run belonged to (None: a run without projects)
+    account_id: int | None = None  # the account that answered
     created_at: str | None = None
 
 
@@ -465,6 +546,201 @@ class VideoPoolItem(BaseModel):
     created_at: str
     last_processed_at: str | None = None
     source: str = "links"  # 'links' pasted by the user, 'search' found by a topic search
+    project_id: int | None = None
+
+
+class ProjectRecord(BaseModel):
+    """One project: its members (`project_accounts`), target and replies. `search_topics` / `custom_replies` are
+    lists; `accounts_count`, `links_total`, `links_waiting` are counted on every read (own links only)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    enabled: bool = True
+    sort: int = 0
+    search_topics: list[str] = Field(default_factory=list)
+    use_similar: bool = False
+    use_title_words: bool = False
+    min_views: int = 0
+    max_views: int | None = None
+    max_age_hours: int | None = None
+    max_videos: int = 5
+    comments_per_video: int = 2
+    target_mode: str = "first_reply"
+    daily_per_account: int | None = None
+    reply_mode: str = "ai"
+    custom_replies: list[str] = Field(default_factory=list)
+    paraphrase_custom: bool = False
+    created_at: str = ""
+    updated_at: str = ""
+    accounts_count: int = 0
+    links_total: int = 0
+    links_waiting: int = 0
+
+    @field_validator("search_topics", "custom_replies", mode="before")
+    @classmethod
+    def _json_list(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return []
+        return [str(item) for item in value if isinstance(item, str) and item.strip()] if isinstance(value, list) else []
+
+
+# Fields a project stores besides its name; create / update / the seed accept exactly these.
+PROJECT_FIELDS: tuple[str, ...] = (
+    "enabled", "search_topics", "use_similar", "use_title_words", "min_views", "max_views", "max_age_hours",
+    "max_videos", "comments_per_video", "target_mode", "daily_per_account", "reply_mode", "custom_replies",
+    "paraphrase_custom",
+)
+
+
+class ProjectQuota(NamedTuple):
+    """Today's replies of one account in one project against the project's ceiling (None = no ceiling)."""
+
+    done: int
+    limit: int | None
+    allowed: bool
+
+
+class ProjectDeleteResult(NamedTuple):
+    """What `Database.delete_project` removed: members that left it and its videos (the journal stays)."""
+
+    accounts: int
+    links: int
+
+
+class LastProjectError(ValueError):
+    """The last project cannot be deleted: a run always needs one."""
+
+
+class MigrationError(RuntimeError):
+    """A schema migration did not run (or was rolled back); `backup` is the copy of the file made before it."""
+
+    def __init__(self, message: str, backup: Path | None = None) -> None:
+        super().__init__(message)
+        self.backup = backup
+
+
+def clean_project_name(name: Any) -> str:
+    """A project name: trimmed, one line, 1..40 characters. ValueError (Russian text) otherwise."""
+    text = str(name or "").strip()
+    if any(ch in text for ch in "\r\n\t"):
+        raise ValueError("Название — одна строка, без переводов строк")
+    text = " ".join(text.split())
+    if not text:
+        raise ValueError("Название не может быть пустым")
+    if len(text) > PROJECT_NAME_MAX:
+        raise ValueError(f"Название длиннее {PROJECT_NAME_MAX} символов")
+    return text
+
+
+def clean_topics(values: Iterable[Any]) -> list[str]:
+    """Search topics: trimmed, without empty ones and case-insensitive duplicates, at most 20 (ValueError)."""
+    topics: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = " ".join(str(value or "").split())
+        if text and text.casefold() not in seen:
+            seen.add(text.casefold())
+            topics.append(text)
+    if len(topics) > PROJECT_TOPICS_MAX:
+        raise ValueError(f"Тем не больше {PROJECT_TOPICS_MAX}")
+    return topics
+
+
+def clean_templates(values: Iterable[Any]) -> list[str]:
+    """Reply templates: one line each, empty ones dropped, order kept."""
+    return [text for text in (" ".join(str(value or "").split()) for value in values) if text]
+
+
+def _optional_positive(value: Any, field: str) -> int | None:
+    """None / 0 / '' = no limit; a positive integer otherwise (ValueError)."""
+    if value in (None, "", 0, False):
+        return None
+    number = int(value)
+    if number < 1:
+        raise ValueError(f"{field}: нужно положительное число или пусто")
+    return number
+
+
+def _bounded(value: Any, low: int, high: int, field: str) -> int:
+    number = int(value)
+    if not low <= number <= high:
+        raise ValueError(f"{field}: нужно число от {low} до {high}")
+    return number
+
+
+def _clean_project_field(field: str, value: Any) -> Any:
+    """One project field as the table stores it; ValueError for a bad value or an unknown field."""
+    if field == "search_topics":
+        return json.dumps(clean_topics(value or []), ensure_ascii=False)
+    if field == "custom_replies":
+        return json.dumps(clean_templates(value or []), ensure_ascii=False)
+    if field in ("enabled", "use_similar", "use_title_words", "paraphrase_custom"):
+        return 1 if value else 0
+    if field == "min_views":
+        number = int(value or 0)
+        if number < 0:
+            raise ValueError("Просмотры не могут быть меньше нуля")
+        return number
+    if field in ("max_views", "max_age_hours", "daily_per_account"):
+        return _optional_positive(value, field)
+    if field == "max_videos":
+        return _bounded(value, 1, 50, "Видео за запуск")
+    if field == "comments_per_video":
+        return _bounded(value, 1, 100, "Ответов на видео")
+    if field == "target_mode":
+        mode = "first_reply" if value == "first_sub_comment" else str(value or "")
+        if mode not in TARGET_MODES:
+            raise ValueError(f"Неизвестный режим «{value}»")
+        return mode
+    if field == "reply_mode":
+        if value not in ("ai", "custom"):
+            raise ValueError(f"Неизвестный режим ответов «{value}»")
+        return value
+    raise ValueError(f"unknown project field {field!r}")
+
+
+def clean_project_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Validate project fields (white list of PROJECT_FIELDS) into table values; max views never below min views."""
+    cleaned = {field: _clean_project_field(field, value) for field, value in fields.items()}
+    low, high = cleaned.get("min_views"), cleaned.get("max_views")
+    if low is not None and high is not None and high < low:
+        raise ValueError("Верхний предел просмотров меньше нижнего")
+    return cleaned
+
+
+def _clean_seed(seed: dict[str, Any] | None) -> dict[str, Any]:
+    """The first project's fields from config.yaml: a value the project cannot take keeps its default (logged)."""
+    cleaned: dict[str, Any] = {}
+    for field, value in (seed or {}).items():
+        try:
+            cleaned.update(clean_project_fields({field: value}))
+        except (TypeError, ValueError) as exc:
+            logger.warning("Проект «{}»: значение {} из config.yaml не перенесено: {}", DEFAULT_PROJECT_NAME, field, exc)
+    if cleaned.get("max_views") is not None and cleaned["max_views"] < cleaned.get("min_views", 0):
+        cleaned["max_views"] = None
+    return cleaned
+
+
+def project_quota_today(done: int, reset_at: str | None, now: datetime | None = None) -> int:
+    """Replies counted for today in `project_accounts`: the stored counter restarts once its reset moment passed."""
+    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    reset = _parse_utc_text(reset_at)
+    return 0 if reset is None or moment >= reset else int(done or 0)
+
+
+def _parse_utc_text(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _extract_video_id(url_or_id: str) -> str:
@@ -512,9 +788,20 @@ def recent_name_changes(stored: str | None, now: datetime) -> list[datetime]:
 class Database:
     """Async SQLite repository for nodes, payloads and the execution queue."""
 
-    def __init__(self, db_path: str | Path = "test_metrics.db", busy_timeout_ms: int = 5000) -> None:
+    def __init__(
+        self,
+        db_path: str | Path = "test_metrics.db",
+        busy_timeout_ms: int = 5000,
+        *,
+        project_seed: dict[str, Any] | None = None,
+    ) -> None:
+        """`project_seed`: the first project's fields taken from config.yaml (`modules.projects.project_seed`); the
+        database never reads the config itself. Without it the first project starts with the defaults."""
         self._path = Path(db_path).expanduser()
         self._busy_timeout_ms = busy_timeout_ms
+        self._project_seed = project_seed
+        self.seeded_now = False  # this connection created «Основной» (the first start with projects)
+        self.last_backup: Path | None = None  # the copy of the file made before a migration of this start
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
 
@@ -576,19 +863,28 @@ class Database:
     async def __aexit__(self, *_: Any) -> None:
         await self.close()
 
-    async def init_schema(self) -> None:
-        """Create / migrate the schema; a few retries when another process holds the write lock at the same time."""
-        for attempt in range(1, _SCHEMA_ATTEMPTS + 1):
-            try:
-                await self._init_schema_once()
-                return
-            except aiosqlite.OperationalError as exc:
-                if "locked" not in str(exc).lower() or attempt == _SCHEMA_ATTEMPTS:
-                    raise
-                logger.debug("База занята другим процессом, повтор инициализации схемы ({}/{})", attempt, _SCHEMA_ATTEMPTS)
-                await asyncio.sleep(0.2 * attempt)
+    async def init_schema(self, project_seed: dict[str, Any] | None = None) -> None:
+        """Create / migrate the schema; a few retries when another process holds the write lock at the same time.
 
-    async def _init_schema_once(self) -> None:
+        `project_seed` (else the one given to the constructor) fills the first project «Основной» once.
+        """
+        seed = project_seed if project_seed is not None else self._project_seed
+        try:
+            for attempt in range(1, _SCHEMA_ATTEMPTS + 1):
+                try:
+                    await self._init_schema_once(seed)
+                    return
+                except aiosqlite.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == _SCHEMA_ATTEMPTS:
+                        raise
+                    logger.debug("База занята другим процессом, повтор инициализации схемы ({}/{})", attempt, _SCHEMA_ATTEMPTS)
+                    await asyncio.sleep(0.2 * attempt)
+        except BaseException:
+            # a connection left open keeps aiosqlite's worker thread alive: the program would never exit
+            await self.close()
+            raise
+
+    async def _init_schema_once(self, seed: dict[str, Any] | None = None) -> None:
         conn = self.connection
         async with self._lock:
             cursor = await conn.execute("PRAGMA user_version")
@@ -611,6 +907,9 @@ class Database:
             await self._ensure_pool_columns(conn)
             await conn.commit()
             await self._migrate_account_proxies(conn, backed_up)
+            await self._rebuild_video_pool(conn, backed_up)
+            await self._ensure_activity_columns(conn)
+            await self._ensure_projects(conn, seed)
         logger.debug("Database schema ensured at {}", self._path)
 
     async def _migrate_account_proxies(self, conn: aiosqlite.Connection, backed_up: bool = False) -> None:
@@ -678,8 +977,142 @@ class Database:
         except aiosqlite.Error as exc:
             logger.warning("Резервная копия базы перед миграцией не создана: {}", exc)
             return None
-        logger.info("Резервная копия базы перед миграцией прокси: {}", target)
+        logger.info("Резервная копия базы перед миграцией ({}): {}", tag, target)
+        self.last_backup = target
         return target
+
+    @staticmethod
+    async def _columns(conn: aiosqlite.Connection, table: str) -> set[str]:
+        cursor = await conn.execute(f"PRAGMA table_info({table})")
+        try:
+            return {str(row[1]) for row in await cursor.fetchall()}
+        finally:
+            await cursor.close()
+
+    @staticmethod
+    async def _scalar(conn: aiosqlite.Connection, query: str, params: tuple[Any, ...] = ()) -> Any:
+        cursor = await conn.execute(query, params)
+        try:
+            row = await cursor.fetchone()
+        finally:
+            await cursor.close()
+        return row[0] if row is not None else None
+
+    async def _rebuild_video_pool(self, conn: aiosqlite.Connection, backed_up: bool) -> None:
+        """Once: `video_pool` of an older version gets `project_id` and UNIQUE(project_id, video_url) instead of
+        UNIQUE(video_url). SQLite cannot change a constraint, so the table is rebuilt in one transaction after a copy
+        of the database file; the row count is compared before and after (a mismatch rolls everything back)."""
+        if "project_id" in await self._columns(conn, "video_pool"):
+            return
+        if not backed_up and await self._backup_before_migration(conn, "projects") is None:
+            raise MigrationError(
+                "список видео не перестроен под проекты: не удалось сделать резервную копию базы "
+                f"(нужно место на диске и права записи рядом с {self._path.name}); база не изменена"
+            )
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            if "project_id" not in await self._columns(conn, "video_pool"):  # another process may have done it
+                before = int(await self._scalar(conn, "SELECT COUNT(*) FROM video_pool"))
+                await conn.execute("DROP TABLE IF EXISTS video_pool_new")
+                await conn.execute(_VIDEO_POOL_DDL.format(name="video_pool_new"))
+                await conn.execute(
+                    f"INSERT INTO video_pool_new ({_VIDEO_POOL_COPY_COLUMNS}) "
+                    f"SELECT {_VIDEO_POOL_COPY_COLUMNS} FROM video_pool"
+                )
+                after = int(await self._scalar(conn, "SELECT COUNT(*) FROM video_pool_new"))
+                if after != before:
+                    raise MigrationError(f"перестройка списка видео скопировала {after} строк из {before}; изменения отменены",
+                                         self.last_backup)
+                await conn.execute("DROP TABLE video_pool")
+                await conn.execute("ALTER TABLE video_pool_new RENAME TO video_pool")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_video_pool_status ON video_pool(status, id)")
+                logger.info("Список видео перестроен под проекты: строк {}", after)
+        except BaseException:
+            await conn.rollback()
+            raise
+        await conn.commit()
+
+    async def _ensure_activity_columns(self, conn: aiosqlite.Connection) -> None:
+        """Incremental migration: the journal records the project and the account of each reply."""
+        existing = await self._columns(conn, "activity_log")
+        for column, ddl in _ACTIVITY_PROJECT_COLUMNS:
+            if column not in existing:
+                try:
+                    await conn.execute(f"ALTER TABLE activity_log ADD COLUMN {column} {ddl}")
+                except aiosqlite.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_project ON activity_log(project_id, created_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_video_pool_project ON video_pool(project_id, status, id)")
+        await conn.commit()
+
+    async def _ensure_projects(self, conn: aiosqlite.Connection, seed: dict[str, Any] | None) -> None:
+        """Idempotent: the first start with projects creates «Основной» from `seed` (config.yaml values), makes every
+        existing account its member and gives it the whole video pool; the `projects_seeded` flag is set in the same
+        transaction, so a «Основной» the operator deleted later never comes back. Afterwards: a pool row without a
+        project (written by an older version) joins the fallback project, and a database left without any project
+        (deleted outside the program) gets an empty «Основной» again."""
+        seeded = await self._scalar(conn, "SELECT value FROM app_settings WHERE key = ?", (PROJECTS_SEEDED_KEY,))
+        orphans = await self._scalar(conn, "SELECT 1 FROM video_pool WHERE project_id IS NULL LIMIT 1")
+        empty = await self._scalar(conn, "SELECT 1 FROM projects LIMIT 1") is None
+        if seeded and not orphans and not empty:
+            return
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            await self._seed_projects(conn, seed)
+        except BaseException:
+            await conn.rollback()
+            raise
+        await conn.commit()
+
+    async def _seed_projects(self, conn: aiosqlite.Connection, seed: dict[str, Any] | None) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        seeded = await self._scalar(conn, "SELECT value FROM app_settings WHERE key = ?", (PROJECTS_SEEDED_KEY,))
+        empty = await self._scalar(conn, "SELECT 1 FROM projects LIMIT 1") is None
+        if not seeded:
+            if empty:
+                await self._insert_project(conn, DEFAULT_PROJECT_NAME, _clean_seed(seed))
+                self.seeded_now = True
+            project_id = await self._fallback_project_id(conn)
+            members = await conn.execute(
+                "INSERT OR IGNORE INTO project_accounts (project_id, account_id, added_at) SELECT ?, id, ? FROM accounts",
+                (project_id, now),
+            )
+            await conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (PROJECTS_SEEDED_KEY, now),
+            )
+            logger.info("Проект «{}» создан: аккаунтов {}", DEFAULT_PROJECT_NAME, members.rowcount)
+        elif empty:
+            await self._insert_project(conn, DEFAULT_PROJECT_NAME, {})
+            logger.warning("Проектов не осталось: создан пустой «{}»", DEFAULT_PROJECT_NAME)
+        moved = await conn.execute(
+            "UPDATE video_pool SET project_id = ? WHERE project_id IS NULL", (await self._fallback_project_id(conn),)
+        )
+        if moved.rowcount:
+            logger.info("Видео без проекта переданы в «{}»: {}", DEFAULT_PROJECT_NAME, moved.rowcount)
+
+    @staticmethod
+    async def _insert_project(conn: aiosqlite.Connection, name: str, fields: dict[str, Any]) -> int:
+        """Insert a project with already cleaned `fields` at the end of the order; returns its id."""
+        now = datetime.now(timezone.utc).isoformat()
+        sort = await Database._scalar(conn, "SELECT COALESCE(MAX(sort), -1) + 1 FROM projects")
+        columns = ["name", "sort", "created_at", "updated_at", *fields]
+        cursor = await conn.execute(
+            f"INSERT INTO projects ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            (name, int(sort or 0), now, now, *fields.values()),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    async def _fallback_project_id(conn: aiosqlite.Connection) -> int:
+        """The project that takes work without an explicit one: «Основной» if it exists, else the first in order."""
+        value = await Database._scalar(
+            conn, "SELECT id FROM projects ORDER BY (name = ?) DESC, sort ASC, id ASC LIMIT 1", (DEFAULT_PROJECT_NAME,)
+        )
+        if value is None:
+            raise RecordNotFoundError("no project exists")
+        return int(value)
 
     @staticmethod
     async def _ensure_account_columns(conn: aiosqlite.Connection) -> None:
@@ -1381,14 +1814,16 @@ class Database:
         error = _truncate(data.get("error"))
         duration_sec = data.get("duration_sec")
         payload_id = data.get("payload_id")
+        project_id = data.get("project_id")
+        account_id = data.get("account_id")
 
         async with self._transaction() as conn:
             cursor = await conn.execute(
                 """
                 INSERT INTO activity_log (
                     created_at, video_id, video_title, video_url, target_id, target_author,
-                    target_text, reply_text, mode, status, error, duration_sec, payload_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    target_text, reply_text, mode, status, error, duration_sec, payload_id, project_id, account_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at,
@@ -1404,6 +1839,8 @@ class Database:
                     error,
                     duration_sec,
                     payload_id,
+                    project_id,
+                    account_id,
                 ),
             )
             log_id = cursor.lastrowid
@@ -1429,23 +1866,26 @@ class Database:
         page: int = 1,
         page_size: int = 50,
         status_filter: str | None = None,
+        project_id: int | None = None,
     ) -> list[ActivityLogEntry]:
-        """Fetch a paginated list of activity logs, newest first."""
+        """Fetch a paginated list of activity logs, newest first (optionally of one status / one project)."""
         if page < 1:
             page = 1
         if page_size < 1:
             page_size = 50
         offset = (page - 1) * page_size
+        where: list[str] = []
+        params: list[Any] = []
         if status_filter:
-            rows = await self._fetch_all(
-                "SELECT * FROM activity_log WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?",
-                (status_filter, page_size, offset),
-            )
-        else:
-            rows = await self._fetch_all(
-                "SELECT * FROM activity_log ORDER BY id DESC LIMIT ? OFFSET ?",
-                (page_size, offset),
-            )
+            where.append("status = ?")
+            params.append(status_filter)
+        if project_id is not None:
+            where.append("project_id = ?")
+            params.append(project_id)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        rows = await self._fetch_all(
+            f"SELECT * FROM activity_log{clause} ORDER BY id DESC LIMIT ? OFFSET ?", (*params, page_size, offset)
+        )
         return [ActivityLogEntry.model_validate(dict(row)) for row in rows]
 
     async def count_activity_logs(self, status_filter: str | None = None) -> int:
@@ -2232,9 +2672,276 @@ class Database:
             replies,
         )
 
+    # ---------------------------------------------------------------- projects
+    #
+    # A project = its members (`project_accounts`), its target and its replies. Names are unique without regard to
+    # case (checked here with casefold: SQLite's NOCASE folds only ASCII, «Крипта» and «крипта» must clash too).
+
+    async def list_projects(self) -> list[ProjectRecord]:
+        """All projects in the order of the list and of the launch queue."""
+        rows = await self._fetch_all(_PROJECT_SELECT + _PROJECT_ORDER)
+        return [ProjectRecord.model_validate(dict(row)) for row in rows]
+
+    async def get_project(self, project_id: int) -> ProjectRecord | None:
+        row = await self._fetch_one(_PROJECT_SELECT + " WHERE projects.id = ?", (project_id,))
+        return ProjectRecord.model_validate(dict(row)) if row else None
+
+    async def get_project_by_name(self, name: str) -> ProjectRecord | None:
+        """The project whose name matches without regard to case or surrounding spaces."""
+        wanted = " ".join(str(name or "").split()).casefold()
+        return next((p for p in await self.list_projects() if p.name.casefold() == wanted), None)
+
+    async def default_project_id(self) -> int:
+        """The project that takes links without an explicit one: «Основной» if it exists, else the first in order."""
+        async with self._lock:
+            return await self._fallback_project_id(self.connection)
+
+    @staticmethod
+    async def _check_name_free(conn: aiosqlite.Connection, name: str, own_id: int | None = None) -> None:
+        cursor = await conn.execute("SELECT id, name FROM projects")
+        rows = list(await cursor.fetchall())
+        await cursor.close()
+        if any(row["name"].casefold() == name.casefold() and row["id"] != own_id for row in rows):
+            raise ValueError(f"Проект «{name}» уже есть")
+
+    async def create_project(self, name: str, **fields: Any) -> ProjectRecord:
+        """A new project at the end of the queue: the defaults of ProjectRecord (AI replies, no topics) plus `fields`
+        (PROJECT_FIELDS only). ValueError for a bad / taken name or a bad field."""
+        name = clean_project_name(name)
+        cleaned = clean_project_fields(fields)
+        async with self._transaction() as conn:
+            await self._check_name_free(conn, name)
+            project_id = await self._insert_project(conn, name, cleaned)
+        record = await self.get_project(project_id)
+        assert record is not None
+        return record
+
+    async def copy_project(self, project_id: int, name: str) -> ProjectRecord:
+        """A new project with the settings of `project_id` (target and replies), without its accounts and links."""
+        source = await self.get_project(project_id)
+        if source is None:
+            raise RecordNotFoundError(f"project id={project_id} not found")
+        return await self.create_project(name, **{field: getattr(source, field) for field in PROJECT_FIELDS})
+
+    async def update_project(self, project_id: int, **fields: Any) -> ProjectRecord:
+        """Change the given fields (PROJECT_FIELDS only, validated). RecordNotFoundError / ValueError."""
+        cleaned = clean_project_fields(fields)
+        async with self._transaction() as conn:
+            row = await (await conn.execute("SELECT min_views, max_views FROM projects WHERE id = ?", (project_id,))).fetchone()
+            if row is None:
+                raise RecordNotFoundError(f"project id={project_id} not found")
+            low = cleaned.get("min_views", row["min_views"])
+            high = cleaned["max_views"] if "max_views" in cleaned else row["max_views"]
+            if high is not None and high < low:
+                raise ValueError("Верхний предел просмотров меньше нижнего")
+            if cleaned:
+                assignments = ", ".join(f"{column} = ?" for column in cleaned)
+                await conn.execute(
+                    f"UPDATE projects SET {assignments}, updated_at = ? WHERE id = ?",
+                    (*cleaned.values(), datetime.now(timezone.utc).isoformat(), project_id),
+                )
+        record = await self.get_project(project_id)
+        assert record is not None
+        return record
+
+    async def rename_project(self, project_id: int, new_name: str) -> ProjectRecord:
+        name = clean_project_name(new_name)
+        async with self._transaction() as conn:
+            await self._check_name_free(conn, name, project_id)
+            cursor = await conn.execute(
+                "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
+                (name, datetime.now(timezone.utc).isoformat(), project_id),
+            )
+            if cursor.rowcount == 0:
+                raise RecordNotFoundError(f"project id={project_id} not found")
+        record = await self.get_project(project_id)
+        assert record is not None
+        return record
+
+    async def delete_project(self, project_id: int) -> ProjectDeleteResult:
+        """Delete a project: its members leave it and its videos go; the journal keeps its records. The last project
+        cannot be deleted (LastProjectError). The links are removed explicitly as well as by the foreign keys."""
+        async with self._transaction() as conn:
+            if await self._scalar(conn, "SELECT 1 FROM projects WHERE id = ?", (project_id,)) is None:
+                raise RecordNotFoundError(f"project id={project_id} not found")
+            if int(await self._scalar(conn, "SELECT COUNT(*) FROM projects")) <= 1:
+                raise LastProjectError("Последний проект удалить нельзя")
+            members = await conn.execute("DELETE FROM project_accounts WHERE project_id = ?", (project_id,))
+            links = await conn.execute(
+                "SELECT COUNT(*) FROM video_pool WHERE project_id = ? AND source = 'links'", (project_id,)
+            )
+            links_count = int((await links.fetchone())[0])
+            await links.close()
+            await conn.execute("DELETE FROM video_pool WHERE project_id = ?", (project_id,))
+            await conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            await conn.execute("DELETE FROM app_settings WHERE key = ? AND value = ?", (UI_PROJECT_KEY, str(project_id)))
+        return ProjectDeleteResult(members.rowcount, links_count)
+
+    async def set_project_order(self, project_ids: Iterable[int]) -> None:
+        """The queue order: the given ids first in that order, the rest keep their relative order after them."""
+        wanted = list(dict.fromkeys(int(pid) for pid in project_ids))
+        async with self._transaction() as conn:
+            cursor = await conn.execute("SELECT id FROM projects ORDER BY sort ASC, id ASC")
+            current = [int(row[0]) for row in await cursor.fetchall()]
+            await cursor.close()
+            order = [pid for pid in wanted if pid in current] + [pid for pid in current if pid not in wanted]
+            for index, pid in enumerate(order):
+                await conn.execute("UPDATE projects SET sort = ? WHERE id = ?", (index, pid))
+
+    async def move_project(self, project_id: int, step: int) -> bool:
+        """Move a project up (-1) or down (+1) in the queue; False when it is already at that end."""
+        order = [project.id for project in await self.list_projects()]
+        if project_id not in order:
+            raise RecordNotFoundError(f"project id={project_id} not found")
+        index = order.index(project_id)
+        target = index + step
+        if not 0 <= target < len(order):
+            return False
+        order[index], order[target] = order[target], order[index]
+        await self.set_project_order(order)
+        return True
+
+    async def add_project_accounts(self, project_id: int, account_ids: Iterable[int]) -> int:
+        """Make the accounts members of the project; returns how many joined (members already in it are kept)."""
+        now = datetime.now(timezone.utc).isoformat()
+        added = 0
+        async with self._transaction() as conn:
+            if await self._scalar(conn, "SELECT 1 FROM projects WHERE id = ?", (project_id,)) is None:
+                raise RecordNotFoundError(f"project id={project_id} not found")
+            for account_id in dict.fromkeys(int(a) for a in account_ids):
+                if await self._scalar(conn, "SELECT 1 FROM accounts WHERE id = ?", (account_id,)) is None:
+                    raise RecordNotFoundError(f"account id={account_id} not found")
+                cursor = await conn.execute(
+                    "INSERT OR IGNORE INTO project_accounts (project_id, account_id, added_at) VALUES (?, ?, ?)",
+                    (project_id, account_id, now),
+                )
+                added += cursor.rowcount
+        return added
+
+    async def remove_project_accounts(self, project_id: int, account_ids: Iterable[int]) -> int:
+        """Take the accounts out of the project; returns how many left it."""
+        removed = 0
+        async with self._transaction() as conn:
+            for account_id in dict.fromkeys(int(a) for a in account_ids):
+                cursor = await conn.execute(
+                    "DELETE FROM project_accounts WHERE project_id = ? AND account_id = ?", (project_id, account_id)
+                )
+                removed += cursor.rowcount
+        return removed
+
+    async def list_project_accounts(self, project_id: int, active_only: bool = False) -> list[AccountRecord]:
+        """Members of the project (only those «в работе» with `active_only`), oldest account first."""
+        query = (
+            _ACCOUNT_SELECT
+            + " JOIN project_accounts pa ON pa.account_id = accounts.id WHERE pa.project_id = ?"
+            + (" AND accounts.is_active = 1" if active_only else "")
+            + " ORDER BY accounts.id ASC"
+        )
+        return [self._account_from_row(row) for row in await self._fetch_all(query, (project_id,))]
+
+    async def projects_of_account(self, account_id: int) -> list[ProjectRecord]:
+        rows = await self._fetch_all(
+            _PROJECT_SELECT
+            + " WHERE projects.id IN (SELECT project_id FROM project_accounts WHERE account_id = ?)"
+            + _PROJECT_ORDER,
+            (account_id,),
+        )
+        return [ProjectRecord.model_validate(dict(row)) for row in rows]
+
+    @staticmethod
+    async def _member_quota(
+        conn: aiosqlite.Connection, project_id: int, account_id: int, now: datetime
+    ) -> tuple[ProjectQuota, bool] | None:
+        """(today's count of a member, a new day began) — read only, a passed day counts as 0; None: not a member."""
+        cursor = await conn.execute(
+            """
+            SELECT pa.daily_done, pa.daily_reset_at, p.daily_per_account
+            FROM project_accounts pa JOIN projects p ON p.id = pa.project_id
+            WHERE pa.project_id = ? AND pa.account_id = ?
+            """,
+            (project_id, account_id),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        reset = _parse_utc_text(row["daily_reset_at"])
+        new_day = reset is None or now >= reset
+        done = 0 if new_day else int(row["daily_done"])
+        limit = row["daily_per_account"]
+        return ProjectQuota(done, limit, limit is None or done < int(limit)), new_day
+
+    async def project_daily_gate(self, project_id: int, account_id: int, now: datetime | None = None) -> ProjectQuota:
+        """May the account answer once more in this project today (the project's own ceiling only; the account's
+        lifecycle limits are checked separately)? An account that is not a member may not. Reads only: a passed day
+        counts as 0 here and is written by the next `bump_project_daily`."""
+        moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        async with self._lock:
+            found = await self._member_quota(self.connection, project_id, account_id, moment)
+        return found[0] if found is not None else ProjectQuota(0, None, False)
+
+    async def bump_project_daily(self, project_id: int, account_id: int, now: datetime | None = None) -> None:
+        """One more reply of the account in the project today; a new day restarts the counter in the same write
+        (nothing for an account that is not a member)."""
+        moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        async with self._transaction() as conn:
+            found = await self._member_quota(conn, project_id, account_id, moment)
+            if found is None:
+                return
+            quota, new_day = found
+            await conn.execute(
+                "UPDATE project_accounts SET daily_done = ?, daily_reset_at = COALESCE(?, daily_reset_at)"
+                " WHERE project_id = ? AND account_id = ?",
+                (quota.done + 1, self.next_daily_reset(moment).isoformat() if new_day else None, project_id, account_id),
+            )
+
+    async def adopt_config_accounts(self, account_ids: Iterable[int]) -> int:
+        """Accounts imported from config.yaml in the run that created «Основной» join it while it is the only project
+        (a fresh install keeps working); otherwise a new account stays without a project. Returns how many joined."""
+        ids = list(account_ids)
+        if not self.seeded_now or not ids:
+            return 0
+        projects = await self.list_projects()
+        if len(projects) != 1:
+            return 0
+        return await self.add_project_accounts(projects[0].id, ids)
+
     # ------------------------------------------------------------- video pool
 
-    async def add_video_to_pool(self, video_url: str, comments_target: int = 2) -> VideoPoolItem:
+    async def _pool_project(self, conn: aiosqlite.Connection, project_id: int | None) -> int:
+        """The project a pool write goes to: the given one (it must exist), else the fallback project."""
+        if project_id is None:
+            return await self._fallback_project_id(conn)
+        if await self._scalar(conn, "SELECT 1 FROM projects WHERE id = ?", (project_id,)) is None:
+            raise RecordNotFoundError(f"project id={project_id} not found")
+        return int(project_id)
+
+    @staticmethod
+    def _pool_filter(
+        status: str | None = "all", source: str | None = None, project_id: int | None = None
+    ) -> tuple[str, tuple[Any, ...]]:
+        """WHERE clause of a pool read: status "pending" (still needs replies) / "all" / exact; source; project
+        (None = every project)."""
+        where: list[str] = []
+        params: list[Any] = []
+        if status == "pending":
+            where.append(_PENDING_POOL_SQL)
+        elif status not in ("all", None):
+            where.append("status = ?")
+            params.append(status)
+        if source is not None:
+            where.append("source = ?")
+            params.append(source)
+        if project_id is not None:
+            where.append("project_id = ?")
+            params.append(project_id)
+        return (f" WHERE {' AND '.join(where)}" if where else ""), tuple(params)
+
+    async def add_video_to_pool(
+        self, video_url: str, comments_target: int = 2, project_id: int | None = None
+    ) -> VideoPoolItem:
+        """Put an own link into a project's pool (None: the fallback project). The same link may sit in several
+        projects; inside one project a video a topic search found before becomes the own link with a fresh start."""
         video_url = video_url.strip()
         if not video_url:
             raise ValueError("video_url must not be empty")
@@ -2243,31 +2950,37 @@ class Database:
         video_id = _extract_video_id(video_url)
         now = datetime.now(timezone.utc).isoformat()
         async with self._transaction() as conn:
+            project = await self._pool_project(conn, project_id)
             await conn.execute(
                 """
-                INSERT INTO video_pool (video_url, video_id, status, comments_target, comments_done, created_at)
-                VALUES (?, ?, 'pending', ?, 0, ?)
-                ON CONFLICT(video_url) DO UPDATE SET
+                INSERT INTO video_pool (video_url, video_id, status, comments_target, comments_done, created_at, project_id)
+                VALUES (?, ?, 'pending', ?, 0, ?, ?)
+                ON CONFLICT(project_id, video_url) DO UPDATE SET
                     comments_target = excluded.comments_target,
                     -- a video a topic search found before becomes the user's own link with a fresh start
                     comments_done = CASE WHEN source = 'search' THEN 0 ELSE comments_done END,
                     status = CASE WHEN source = 'search' THEN 'pending' ELSE status END,
                     source = 'links'
                 """,
-                (video_url, video_id, comments_target, now),
+                (video_url, video_id, comments_target, now, project),
             )
-            row = await (await conn.execute("SELECT * FROM video_pool WHERE video_url = ?", (video_url,))).fetchone()
+            row = await (
+                await conn.execute("SELECT * FROM video_pool WHERE project_id = ? AND video_url = ?", (project, video_url))
+            ).fetchone()
         if row is None:
             raise RecordNotFoundError(f"pool video {video_url} disappeared during creation")
         item = VideoPoolItem.model_validate(dict(row))
         logger.debug("Added/updated video pool item {} (target={})", item.video_id, item.comments_target)
         return item
 
-    async def queue_search_video(self, video_url: str, comments_target: int = 2) -> VideoPoolItem:
-        """Put a video found by a topic search into the pool for this run (source 'search').
+    async def queue_search_video(
+        self, video_url: str, comments_target: int = 2, project_id: int | None = None
+    ) -> VideoPoolItem:
+        """Put a video found by a topic search (or a reference link) into a project's pool for this run (source
+        'search'; None: the fallback project).
 
         A video found again starts a new round (pending, 0 replies): new comments may have appeared, and the
-        comments already answered are skipped by the payload check. A video that is in the user's own links
+        comments already answered are skipped by the payload check. A video that is in the project's own links
         keeps its record (source, progress); a finished one is handed back as pending for this run only.
         """
         video_url = video_url.strip()
@@ -2278,18 +2991,22 @@ class Database:
         video_id = _extract_video_id(video_url)
         now = datetime.now(timezone.utc).isoformat()
         async with self._transaction() as conn:
+            project = await self._pool_project(conn, project_id)
             await conn.execute(
                 """
-                INSERT INTO video_pool (video_url, video_id, status, comments_target, comments_done, created_at, source)
-                VALUES (?, ?, 'pending', ?, 0, ?, 'search')
-                ON CONFLICT(video_url) DO UPDATE SET
+                INSERT INTO video_pool (video_url, video_id, status, comments_target, comments_done, created_at, source,
+                                        project_id)
+                VALUES (?, ?, 'pending', ?, 0, ?, 'search', ?)
+                ON CONFLICT(project_id, video_url) DO UPDATE SET
                     comments_target = CASE WHEN source = 'search' THEN excluded.comments_target ELSE comments_target END,
                     comments_done = CASE WHEN source = 'search' THEN 0 ELSE comments_done END,
                     status = CASE WHEN source = 'search' THEN 'pending' ELSE status END
                 """,
-                (video_url, video_id, comments_target, now),
+                (video_url, video_id, comments_target, now, project),
             )
-            row = await (await conn.execute("SELECT * FROM video_pool WHERE video_url = ?", (video_url,))).fetchone()
+            row = await (
+                await conn.execute("SELECT * FROM video_pool WHERE project_id = ? AND video_url = ?", (project, video_url))
+            ).fetchone()
         if row is None:
             raise RecordNotFoundError(f"pool video {video_url} disappeared during creation")
         item = VideoPoolItem.model_validate(dict(row))
@@ -2297,32 +3014,20 @@ class Database:
             item = item.model_copy(update={"status": "pending", "comments_done": 0, "comments_target": comments_target})
         return item
 
-    async def get_next_pool_video(self) -> VideoPoolItem | None:
-        row = await self._fetch_one(
-            """
-            SELECT * FROM video_pool
-            WHERE source = 'links' AND status IN ('pending', 'in_progress') AND comments_done < comments_target
-            ORDER BY id ASC
-            LIMIT 1
-            """
-        )
+    async def get_next_pool_video(self, project_id: int | None = None) -> VideoPoolItem | None:
+        """The oldest own link that still needs replies (of one project, or of any with None)."""
+        clause, params = self._pool_filter("pending", "links", project_id)
+        row = await self._fetch_one(f"SELECT * FROM video_pool{clause} ORDER BY id ASC LIMIT 1", params)
         return VideoPoolItem.model_validate(dict(row)) if row else None
 
-    async def list_pool_videos(self, status: str = "pending", source: str | None = None) -> list[VideoPoolItem]:
+    async def list_pool_videos(
+        self, status: str = "pending", source: str | None = None, project_id: int | None = None
+    ) -> list[VideoPoolItem]:
         """Pool videos by status ("pending" = still needs replies, "all", or an exact status); source
-        'links' / 'search' narrows to the user's own links or the topic search finds, None takes both."""
-        where: list[str] = []
-        params: list[Any] = []
-        if status == "pending":
-            where.append("status IN ('pending', 'in_progress') AND comments_done < comments_target")
-        elif status not in ("all", None):
-            where.append("status = ?")
-            params.append(status)
-        if source is not None:
-            where.append("source = ?")
-            params.append(source)
-        clause = f" WHERE {' AND '.join(where)}" if where else ""
-        rows = await self._fetch_all(f"SELECT * FROM video_pool{clause} ORDER BY id ASC", tuple(params))
+        'links' / 'search' narrows to the user's own links or the topic search finds, None takes both;
+        `project_id` narrows to one project (None: every project)."""
+        clause, params = self._pool_filter(status, source, project_id)
+        rows = await self._fetch_all(f"SELECT * FROM video_pool{clause} ORDER BY id ASC", params)
         return [VideoPoolItem.model_validate(dict(row)) for row in rows]
 
     async def update_pool_video_progress(
@@ -2363,40 +3068,38 @@ class Database:
             new_status,
         )
 
-    async def count_pool_videos(self, status: str | None = "all") -> int:
+    async def count_pool_videos(
+        self, status: str | None = "all", project_id: int | None = None, source: str | None = None
+    ) -> int:
         """Count pool videos; status "pending" matches list_pool_videos (still needs comments)."""
-        if status == "all" or status is None:
-            return await self._count("SELECT COUNT(*) FROM video_pool")
-        if status == "pending":
-            return await self._count(
-                "SELECT COUNT(*) FROM video_pool"
-                " WHERE status IN ('pending', 'in_progress') AND comments_done < comments_target"
-            )
-        return await self._count("SELECT COUNT(*) FROM video_pool WHERE status = ?", (status,))
+        clause, params = self._pool_filter(status, source, project_id)
+        return await self._count(f"SELECT COUNT(*) FROM video_pool{clause}", params)
 
-    async def set_pool_comments_target(self, comments_target: int) -> int:
-        """Set the reply target of unfinished pool videos (pending / in_progress); returns how many changed.
-
-        Videos that already have that many replies become 'completed'.
+    async def set_pool_comments_target(self, comments_target: int, project_id: int | None = None) -> int:
+        """Set the reply target of unfinished pool videos (pending / in_progress) of one project (None: all);
+        returns how many changed. Videos that already have that many replies become 'completed'.
         """
         if comments_target < 1:
             raise ValueError("comments_target must be positive")
+        scope, params = ("", ()) if project_id is None else (" AND project_id = ?", (project_id,))
         async with self._transaction() as conn:
             cursor = await conn.execute(
-                "UPDATE video_pool SET comments_target = ? WHERE status IN ('pending', 'in_progress')",
-                (comments_target,),
+                f"UPDATE video_pool SET comments_target = ? WHERE status IN ('pending', 'in_progress'){scope}",
+                (comments_target, *params),
             )
             changed = cursor.rowcount
             await conn.execute(
                 "UPDATE video_pool SET status = 'completed'"
-                " WHERE status IN ('pending', 'in_progress') AND comments_done >= comments_target"
+                f" WHERE status IN ('pending', 'in_progress') AND comments_done >= comments_target{scope}",
+                params,
             )
         return changed
 
-    async def clear_video_pool(self) -> int:
-        """Delete every video pool record; returns how many were removed."""
+    async def clear_video_pool(self, project_id: int | None = None) -> int:
+        """Delete the pool of one project (None: every pool record); returns how many were removed."""
+        scope, params = ("", ()) if project_id is None else (" WHERE project_id = ?", (project_id,))
         async with self._transaction() as conn:
-            cursor = await conn.execute("DELETE FROM video_pool")
+            cursor = await conn.execute(f"DELETE FROM video_pool{scope}", params)
             return cursor.rowcount
 
 
@@ -2418,10 +3121,20 @@ __all__ = [
     "ActivityLogEntry",
     "ActivityMode",
     "ActivityStatus",
+    "DEFAULT_PROJECT_NAME",
     "Database",
+    "LastProjectError",
+    "MigrationError",
     "Payload",
     "PayloadStatus",
+    "PROJECT_FIELDS",
+    "PROJECT_ORDER",
+    "PROJECT_SELECT",
+    "PROJECTS_SEEDED_KEY",
     "PROXY_SCHEMES",
+    "ProjectDeleteResult",
+    "ProjectQuota",
+    "ProjectRecord",
     "ProxyDeleteResult",
     "ProxyRecord",
     "QueueItem",
@@ -2429,7 +3142,14 @@ __all__ = [
     "QueueStatus",
     "RecordNotFoundError",
     "SEARCH_PROXY_KEY",
+    "TARGET_MODES",
     "TestNode",
+    "UI_PROJECT_KEY",
     "VideoPoolItem",
+    "clean_project_fields",
+    "clean_project_name",
+    "clean_templates",
+    "clean_topics",
     "init_db",
+    "project_quota_today",
 ]
