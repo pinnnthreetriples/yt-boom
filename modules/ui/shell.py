@@ -447,7 +447,9 @@ class Controller:
         assert self.edit is not None
         edit = self.edit
         if key.startswith("paste:"):
-            parts = key[6:].replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            from config import repair_text
+
+            parts = repair_text(key[6:]).replace("\r\n", "\n").replace("\r", "\n").split("\n")
             if edit.field.multiline:
                 edit.text += parts[0]
                 for part in parts[1:]:
@@ -688,9 +690,20 @@ def run_shell(controller: Controller, on_run: Callable[[Run], Step], clear: Call
         controller.quit = True
         event.app.exit()
 
+    high: list[str] = []  # the Windows console sends an emoji as two keys: its UTF-16 surrogate halves
+
     @kb.add("<any>")
     def _char(event: KeyPressEvent) -> None:
+        from config import repair_text
+
         data = event.data
+        if len(data) == 1 and 0xD800 <= ord(data) <= 0xDBFF:
+            high[:] = [data]
+            return
+        if high:
+            data, high[:] = repair_text(high[0] + data), []
+        if len(data) == 1 and 0xDC00 <= ord(data) <= 0xDFFF:
+            return  # a lone half
         if len(data) == 1 and data.isprintable():
             feed(data if controller.edit else ("?" if data == "?" else normalize_key(data)), event)
         elif len(data) > 1 and controller.edit:  # a paste without bracketed paste mode

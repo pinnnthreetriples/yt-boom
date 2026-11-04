@@ -186,6 +186,9 @@ def update_config_file(config_path: Path, updates: dict[str, Any]) -> None:
                 target = target[k]
         target[keys[-1]] = val
 
+    from config import repair_text
+
+    raw = repair_text(raw)  # emoji typed in the Windows console arrive as surrogate halves
     config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
