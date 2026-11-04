@@ -104,7 +104,7 @@ class PoolManager:
         if comments_target < 1:
             raise ValueError("comments_target must be positive")
         urls, invalid = parse_video_text(text)
-        known = {v.video_url for v in await self._db.list_pool_videos(status="all")}
+        known = {v.video_url for v in await self._db.list_pool_videos(status="all", source="links")}
         result = PoolAddResult(invalid=invalid)
         for url in urls:
             if url in known:

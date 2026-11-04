@@ -950,6 +950,20 @@ class TestSearchThroughAccounts(unittest.IsolatedAsyncioTestCase):
         pending = await self.db.list_pool_videos(status="pending", source="links")
         self.assertEqual([v.video_id for v in pending], ["own_link_02"])
 
+    async def test_a_pasted_link_found_by_the_search_before_becomes_an_own_link(self) -> None:
+        from modules.pool_manager import PoolManager
+
+        url = "https://www.youtube.com/watch?v=found_vid02"
+        found = await self.db.queue_search_video(url, comments_target=1)
+        await self.db.update_pool_video_progress(found.id, comments_added=1)
+
+        added = await PoolManager(self.db).add_videos_from_text(url, comments_target=2)
+
+        self.assertEqual((added.added, added.existing), (1, 0))  # new to the user's own list
+        stored = (await self.db.list_pool_videos(status="all"))[0]
+        self.assertEqual((stored.source, stored.status, stored.comments_done, stored.comments_target), ("links", "pending", 0, 2))
+        self.assertEqual((await self.db.get_next_pool_video()).video_id, "found_vid02")
+
     async def test_nothing_found_opens_no_browser(self) -> None:
         await self.db.upsert_account("acc_a", str(self.base_dir / "a"))
         orch = self.orchestrator(self.collector([], {}))

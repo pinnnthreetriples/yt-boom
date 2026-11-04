@@ -2247,8 +2247,12 @@ class Database:
                 """
                 INSERT INTO video_pool (video_url, video_id, status, comments_target, comments_done, created_at)
                 VALUES (?, ?, 'pending', ?, 0, ?)
-                ON CONFLICT(video_url) DO UPDATE
-                    SET comments_target = excluded.comments_target
+                ON CONFLICT(video_url) DO UPDATE SET
+                    comments_target = excluded.comments_target,
+                    -- a video a topic search found before becomes the user's own link with a fresh start
+                    comments_done = CASE WHEN source = 'search' THEN 0 ELSE comments_done END,
+                    status = CASE WHEN source = 'search' THEN 'pending' ELSE status END,
+                    source = 'links'
                 """,
                 (video_url, video_id, comments_target, now),
             )
@@ -2297,7 +2301,7 @@ class Database:
         row = await self._fetch_one(
             """
             SELECT * FROM video_pool
-            WHERE status IN ('pending', 'in_progress') AND comments_done < comments_target
+            WHERE source = 'links' AND status IN ('pending', 'in_progress') AND comments_done < comments_target
             ORDER BY id ASC
             LIMIT 1
             """
