@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import random
 import time
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from loguru import logger
 
@@ -26,8 +26,16 @@ from modules.pool_manager import PoolManager
 from modules.proxy_library import sync_config_accounts
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.ui_test_runner import SubmissionResult
-from modules.youtube_collector import YouTubeCollector, extract_video_id
+from modules.youtube_collector import YouTubeCollector, empty_search_hint, extract_video_id
 from modules.youtube_runner import YouTubeRunner
+
+
+class SearchRunResult(NamedTuple):
+    """Outcome of a topic search run: accounts that could post, videos found, replies posted (or simulated)."""
+
+    accounts: int
+    found: int
+    replies: int
 
 
 class MultiAccountOrchestrator:
@@ -621,10 +629,11 @@ class MultiAccountOrchestrator:
         self,
         max_comments_per_video: int | None = None,
         comments_target_per_video: int = 2,
+        videos: list[VideoPoolItem] | None = None,
     ) -> int:
-        """Run the video pool, then wait for the warm-up sessions the lifecycle gate started."""
+        """Run the video pool (or the given `videos`), then wait for the warm-up sessions the lifecycle gate started."""
         try:
-            return await self._execute_video_pool(max_comments_per_video, comments_target_per_video)
+            return await self._execute_video_pool(max_comments_per_video, comments_target_per_video, videos)
         except BaseException:
             await self._cancel_visibility_checks()  # leaving on an error: do not wait out the check delay
             raise
@@ -636,9 +645,10 @@ class MultiAccountOrchestrator:
         self,
         max_comments_per_video: int | None = None,
         comments_target_per_video: int = 2,
+        videos: list[VideoPoolItem] | None = None,
     ) -> int:
         """
-        Post replies under the pending pool videos with the active accounts.
+        Post replies under the pending videos of the user's own links (or under `videos`) with the active accounts.
         - "each": every account passes the whole list, `concurrency` accounts at a time
           (1 = one account after another).
         - "share": the videos are spread across the accounts (least replies / round-robin),
@@ -651,7 +661,8 @@ class MultiAccountOrchestrator:
             logger.warning("ИНФО | Нет активных аккаунтов для выполнения пула видео")
             return 0
 
-        videos = await self._db.list_pool_videos(status="pending")
+        if videos is None:
+            videos = await self._db.list_pool_videos(status="pending", source="links")
         if not videos:
             logger.info("ИНФО | Нет видео в пуле для обработки")
             return 0
@@ -716,6 +727,57 @@ class MultiAccountOrchestrator:
                 logger.warning("ИНФО | Файл видео не найден: {}", videos_file)
 
         return await self.execute_video_pool()
+
+    async def run_search(
+        self,
+        query: str,
+        *,
+        min_views: int = 0,
+        max_views: int | None = None,
+        max_age_hours: int | None = None,
+        max_videos: int = 5,
+        comments_per_video: int = 2,
+    ) -> SearchRunResult:
+        """Topic search through the accounts: search (via the search proxy), the found videos go into the pool
+        (source 'search'), then the same run as the own links: every active account, `concurrency`,
+        account_mode and the lifecycle limits. A video found again is taken again; answered comments are skipped.
+        """
+        await self.ensure_db()
+        await self.sync_accounts_from_config()
+        accounts = await self._usable_accounts()
+        if not accounts:
+            logger.warning("ИНФО | Нет аккаунтов, которые могут отвечать сейчас: поиск по теме не запускался")
+            await self._finish_warmups()  # the lifecycle gate may have started warm-ups, as in a pool run
+            return SearchRunResult(0, 0, 0)
+
+        logger.info(
+            "Поиск видео по запросу {!r} [просмотров: {}..{}, не старше: {} ч, видео за запуск: {}]",
+            query,
+            min_views,
+            max_views if max_views is not None else "∞",
+            max_age_hours or "∞",
+            max_videos,
+        )
+        found = await self._collector.search_videos(
+            query=query,
+            min_views=min_views,
+            max_views=max_views,
+            limit=max_videos,
+            max_age_hours=max_age_hours,
+        )
+        if not found:
+            logger.warning(
+                "Не найдено видео по запросу {!r} с заданными фильтрами: {}",
+                query,
+                empty_search_hint(min_views, max_views, max_age_hours),
+            )
+            return SearchRunResult(len(accounts), 0, 0)
+
+        videos = [await self._db.queue_search_video(v["url"], comments_target=comments_per_video) for v in found]
+        for v in found:
+            logger.info("▶ Найдено: {!r} (ID: {}, просмотров: {:,})", v.get("title", ""), v["video_id"], v.get("view_count", 0))
+        replies = await self.execute_video_pool(videos=videos)
+        return SearchRunResult(len(accounts), len(videos), replies)
 
     async def close(self) -> None:
         """Close account browsers, collector and database connections."""

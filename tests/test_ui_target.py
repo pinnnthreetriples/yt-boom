@@ -229,5 +229,34 @@ class PreviewTest(TargetTabCase):
         self.assertIn("Комментарии не загрузились: offline", self.screen())
 
 
+class VideosPerRunTest(TargetTabCase):
+    def test_videos_per_run_by_arrows_and_by_number(self):
+        self.ctx.update({"collector.search_query": "котики"})
+        self.c.refresh()
+        self.assertIn("5 видео за запуск", self.screen())
+        self.go("videos")
+        self.keys("right")
+        self.assertEqual(self.cfg().collector.max_videos, 6)
+        self.keys("enter", "backspace")
+        self.type("12")
+        self.keys("enter")
+        self.assertEqual(self.cfg().collector.max_videos, 12)
+        self.assertIn("12 видео за запуск", self.screen())
+        self.keys("enter", "backspace", "backspace")
+        self.type("0")
+        self.keys("enter")
+        self.assertIn("от 1 до 50", self.screen())
+        self.assertEqual(self.cfg().collector.max_videos, 12)
+
+    def test_own_links_have_no_videos_per_run_row(self):
+        self.assertNotIn("видео за запуск", self.screen())
+
+    def test_search_finds_are_not_shown_as_own_links(self):
+        self.ctx.db(lambda db: db.queue_search_video("https://www.youtube.com/watch?v=found_vid01", comments_target=2))
+        self.c.refresh()
+        self.assertIn("0 ждут", self.screen())
+        self.assertTrue(self.tab.warn())
+
+
 if __name__ == "__main__":
     unittest.main()

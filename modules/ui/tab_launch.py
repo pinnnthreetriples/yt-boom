@@ -25,6 +25,12 @@ def _active_count(ctx: AppContext) -> int:
     return int(rows[0][0]) if rows else 0
 
 
+def _posting_count(ctx: AppContext) -> int:
+    """Accounts a run may post with: in work and sign-in not failed (the stage limits may still hold some back)."""
+    rows = ctx.query("SELECT COUNT(*) FROM accounts WHERE is_active = 1 AND COALESCE(auth_status, '') <> 'failed'")
+    return int(rows[0][0]) if rows else 0
+
+
 def _today_counts(ctx: AppContext) -> dict[str, int]:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     rows = ctx.query("SELECT status, COUNT(*) FROM activity_log WHERE created_at >= ? GROUP BY status", (today,))
@@ -66,9 +72,11 @@ def build_tab(ctx: AppContext) -> Tab:
         def enter():
             if not ctx.live:
                 return Run(lambda: run_target(ctx, dry_run=True), f"{icon('dry')} Пробный запуск · без публикации")
-            n = _active_count(ctx)
+            n = _posting_count(ctx)
+            if not n:
+                return Notice("warn", "Нет аккаунтов в работе с удачным входом: вкладка «Аккаунты»")
             return Confirm(
-                [Cell(f"{icon('live')} Публикуем ответы с {n} акк.?", "err")], ["Нет", "Да"],
+                [Cell(f"{icon('live')} Публикуем ответы · до {n} акк. (лимиты этапов учитываются)?", "err")], ["Нет", "Да"],
                 lambda i: Run(lambda: run_target(ctx, dry_run=False), f"{icon('live')} Боевой запуск") if i == 1 else None,
             )
 
@@ -154,7 +162,8 @@ def build_tab(ctx: AppContext) -> Tab:
 
 
 def run_target(ctx: AppContext, dry_run: bool) -> Notice:
-    """Run on the current target (auto-search, else the video list); the terminal shows the run's own output."""
+    """Run on the current target (auto-search, else the video list) with the accounts in work;
+    the terminal shows the run's own output."""
     from modules.wizard import _target_plan
 
     cfg = ctx.cfg()
@@ -169,15 +178,20 @@ def run_target(ctx: AppContext, dry_run: bool) -> Notice:
 
             done = asyncio.run(run_video_pool_cli(config_path=str(ctx.config_path), dry_run=dry_run))
             return Notice("ok", f"{name} завершён · ответов: {done}")
-        from youtube_bot import run_multi_video_pipeline
+        from modules.youtube_collector import empty_search_hint
+        from youtube_bot import run_search_cli
 
-        asyncio.run(run_multi_video_pipeline(
-            query, config_path=str(ctx.config_path),
-            min_views=getattr(cfg.collector, "min_views", 0), max_views=getattr(cfg.collector, "max_views", None),
-            max_videos=5, comments_per_video=limit,
-            target_mode=getattr(cfg.collector, "target_mode", "first_reply"), dry_run=dry_run,
+        col = cfg.collector
+        res = asyncio.run(run_search_cli(
+            query, str(ctx.config_path),
+            min_views=col.min_views or 0, max_views=col.max_views, max_age_hours=col.max_age_hours,
+            max_videos=col.max_videos, comments_per_video=limit, dry_run=dry_run,
         ))
-        return Notice("ok", f"{name} завершён")
+        if not res.accounts:
+            return Notice("warn", "Ни один аккаунт сейчас не может отвечать: вход, «В работе» и этапы во вкладке «Аккаунты»")
+        if not res.found:
+            return Notice("warn", fit(f"Видео по теме не найдено · {empty_search_hint(col.min_views or 0, col.max_views, col.max_age_hours)}", 110))
+        return Notice("ok", f"{name} завершён · видео: {res.found} · ответов: {res.replies}")
     except Exception as exc:
         return Notice("err", fit(f"{name} остановлен: {exc}", 70))
 

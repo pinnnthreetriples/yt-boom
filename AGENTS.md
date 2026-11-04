@@ -16,7 +16,7 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `config.py` — Pydantic models and config validator
 - `database.py` — async SQLite CRUD (`test_nodes`, `payloads`, `execution_queue`, `activity_log` tables) + `has_replied_to` deduplication
 - `main.py` — async test orchestrator and rate/throttle manager
-- `youtube_bot.py` — standalone CLI entry point for YouTube comment-reply bot (`--video`, `--search`, `--min-views`, `--max-views`, `--max-age-hours`, `--comments-per-video`, `--target-mode`, `--limit`, `--dry-run`, `--login`, `--list-replies`, `--status`, `--history`)
+- `youtube_bot.py` — standalone CLI entry point for YouTube comment-reply bot (`--video`, `--search`, `--min-views`, `--max-views`, `--max-age-hours`, `--max-videos`, `--comments-per-video`, `--target-mode`, `--limit`, `--dry-run`, `--login`, `--list-replies`, `--status`, `--history`)
 - `modules/collector.py` — public endpoint data fetcher (`curl_cffi`) + language validation filter
 - `modules/youtube_collector.py` — YouTube InnerTube topic video search with view count filter & popular/nested comments scraper
 - `modules/processor.py` — DeepSeek API text integration + `normalize_text()` typography formatter
@@ -24,7 +24,7 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/ui_test_runner.py` — Camoufox browser automation runner (with YouTube runner delegation)
 - `modules/youtube_runner.py` — specialized YouTube sub-comment runner (cookie dismissal, lazy-load comments, expand replies, contenteditable typing, submission)
 - `modules/multi_account_orchestrator.py` — replies under the video list with all active accounts: `limits.max_concurrent_sessions` accounts at a time; `limits.account_mode` `each` (every account passes the whole list) or `share` (replies under each video are split between accounts)
-- `modules/pool_manager.py` — video list (`video_pool` table): pasted / file links and reply progress
+- `modules/pool_manager.py` — video list (`video_pool` table): pasted / file links and reply progress; `video_pool.source` is `links` (own links) or `search` (topic search finds, re-queued on every run, never shown as own links)
 - `modules/validator.py` — read-only DOM/cache rendering verification module
 - `modules/ui/` — tabbed console interface: `app.py:run_app` (entry), `shell.py` (render and keys), `icons.py`, `tab_launch.py` / `tab_accounts.py` / `tab_proxies.py` / `tab_target.py` / `tab_replies.py`
 - `modules/google_authenticator.py` — automated Google sign-in state machine (TOTP 2FA, speedbump handling, in-situ channel creation)
@@ -64,7 +64,7 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - Check account session heartbeat (lightweight HTTP): `python youtube_bot.py --heartbeat [account]`
 - Run account warm-up: `python youtube_bot.py --warm-up <name> [--warm-up-duration 45]`
 - Publish the saved channel profile: `python youtube_bot.py --apply-profile <name>` (the draft is edited in the «Аккаунты» tab → account menu → «Профиль канала»)
-- Multi-video search & reply: `python youtube_bot.py --search "python" --min-views 10000 --max-views 500000 --comments-per-video 10 --dry-run`
+- Multi-video search & reply: `python youtube_bot.py --search "python" --min-views 10000 --max-views 500000 --comments-per-video 10 --dry-run` (through all active accounts: `MultiAccountOrchestrator.run_search`)
 - View activity history / audit log: `python youtube_bot.py --history`
 - List YouTube sub-comments: `python youtube_bot.py --video "https://www.youtube.com/watch?v=..." --list-replies --limit 5`
 - Video list with all accounts: `python youtube_bot.py --videos-file videos.txt --concurrency 2 --account-mode each --dry-run`

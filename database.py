@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS video_pool (
     comments_target   INTEGER NOT NULL DEFAULT 2 CHECK (comments_target > 0),
     comments_done     INTEGER NOT NULL DEFAULT 0 CHECK (comments_done >= 0),
     created_at        TEXT    NOT NULL,
-    last_processed_at TEXT
+    last_processed_at TEXT,
+    source            TEXT    NOT NULL DEFAULT 'links'  -- 'links' pasted by the user, 'search' found by a topic search
 );
 
 -- The proxy library: one row per proxy (host, port, login), assigned to any number of accounts via accounts.proxy_id.
@@ -463,6 +464,7 @@ class VideoPoolItem(BaseModel):
     comments_done: int = 0
     created_at: str
     last_processed_at: str | None = None
+    source: str = "links"  # 'links' pasted by the user, 'search' found by a topic search
 
 
 def _extract_video_id(url_or_id: str) -> str:
@@ -606,6 +608,7 @@ class Database:
             await conn.executescript(_MULTI_ACCOUNT_SCHEMA)
             await self._ensure_account_columns(conn)
             await self._ensure_account_mode_columns(conn)
+            await self._ensure_pool_columns(conn)
             await conn.commit()
             await self._migrate_account_proxies(conn, backed_up)
         logger.debug("Database schema ensured at {}", self._path)
@@ -712,6 +715,19 @@ class Database:
                 except aiosqlite.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
+
+    @staticmethod
+    async def _ensure_pool_columns(conn: aiosqlite.Connection) -> None:
+        """Incremental migration: `video_pool.source` (own links vs topic search) for pools created before it existed."""
+        cursor = await conn.execute("PRAGMA table_info(video_pool)")
+        existing = {str(row[1]) for row in await cursor.fetchall()}
+        await cursor.close()
+        if "source" not in existing:
+            try:
+                await conn.execute("ALTER TABLE video_pool ADD COLUMN source TEXT NOT NULL DEFAULT 'links'")
+            except aiosqlite.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -2243,6 +2259,40 @@ class Database:
         logger.debug("Added/updated video pool item {} (target={})", item.video_id, item.comments_target)
         return item
 
+    async def queue_search_video(self, video_url: str, comments_target: int = 2) -> VideoPoolItem:
+        """Put a video found by a topic search into the pool for this run (source 'search').
+
+        A video found again starts a new round (pending, 0 replies): new comments may have appeared, and the
+        comments already answered are skipped by the payload check. A video that is in the user's own links
+        keeps its record (source, progress); a finished one is handed back as pending for this run only.
+        """
+        video_url = video_url.strip()
+        if not video_url:
+            raise ValueError("video_url must not be empty")
+        if comments_target < 1:
+            raise ValueError("comments_target must be positive")
+        video_id = _extract_video_id(video_url)
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO video_pool (video_url, video_id, status, comments_target, comments_done, created_at, source)
+                VALUES (?, ?, 'pending', ?, 0, ?, 'search')
+                ON CONFLICT(video_url) DO UPDATE SET
+                    comments_target = CASE WHEN source = 'search' THEN excluded.comments_target ELSE comments_target END,
+                    comments_done = CASE WHEN source = 'search' THEN 0 ELSE comments_done END,
+                    status = CASE WHEN source = 'search' THEN 'pending' ELSE status END
+                """,
+                (video_url, video_id, comments_target, now),
+            )
+            row = await (await conn.execute("SELECT * FROM video_pool WHERE video_url = ?", (video_url,))).fetchone()
+        if row is None:
+            raise RecordNotFoundError(f"pool video {video_url} disappeared during creation")
+        item = VideoPoolItem.model_validate(dict(row))
+        if item.status == "completed" or item.comments_done >= item.comments_target:
+            item = item.model_copy(update={"status": "pending", "comments_done": 0, "comments_target": comments_target})
+        return item
+
     async def get_next_pool_video(self) -> VideoPoolItem | None:
         row = await self._fetch_one(
             """
@@ -2254,22 +2304,21 @@ class Database:
         )
         return VideoPoolItem.model_validate(dict(row)) if row else None
 
-    async def list_pool_videos(self, status: str = "pending") -> list[VideoPoolItem]:
-        if status == "all" or status is None:
-            rows = await self._fetch_all("SELECT * FROM video_pool ORDER BY id ASC")
-        elif status == "pending":
-            rows = await self._fetch_all(
-                """
-                SELECT * FROM video_pool
-                WHERE status IN ('pending', 'in_progress') AND comments_done < comments_target
-                ORDER BY id ASC
-                """
-            )
-        else:
-            rows = await self._fetch_all(
-                "SELECT * FROM video_pool WHERE status = ? ORDER BY id ASC",
-                (status,),
-            )
+    async def list_pool_videos(self, status: str = "pending", source: str | None = None) -> list[VideoPoolItem]:
+        """Pool videos by status ("pending" = still needs replies, "all", or an exact status); source
+        'links' / 'search' narrows to the user's own links or the topic search finds, None takes both."""
+        where: list[str] = []
+        params: list[Any] = []
+        if status == "pending":
+            where.append("status IN ('pending', 'in_progress') AND comments_done < comments_target")
+        elif status not in ("all", None):
+            where.append("status = ?")
+            params.append(status)
+        if source is not None:
+            where.append("source = ?")
+            params.append(source)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        rows = await self._fetch_all(f"SELECT * FROM video_pool{clause} ORDER BY id ASC", tuple(params))
         return [VideoPoolItem.model_validate(dict(row)) for row in rows]
 
     async def update_pool_video_progress(

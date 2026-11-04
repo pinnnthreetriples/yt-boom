@@ -360,13 +360,13 @@ _TARGET_AGES: list[tuple[int | None, str]] = [
 ]
 
 
-_TARGET_PENDING_SQL = "status IN ('pending', 'in_progress') AND comments_done < comments_target"
+_TARGET_PENDING_SQL = "source = 'links' AND status IN ('pending', 'in_progress') AND comments_done < comments_target"
 
 
 def _target_pool_info(db_path: Any) -> tuple[int, str | None]:
     """(videos waiting in the pool, URL of the next one); (0, None) if the DB has no pool yet.
 
-    Plain read-only sqlite3 (same filter as Database.list_pool_videos('pending')): this runs
+    Plain read-only sqlite3 (same filter as Database.list_pool_videos('pending', source='links')): this runs
     while menus are rebuilt, sometimes inside prompt_toolkit's event loop, where asyncio.run fails.
     """
     try:

@@ -97,6 +97,7 @@ class CollectorSettings(BaseModel):
     min_views: int = Field(default=0, ge=0)
     max_views: int | None = Field(default=None)
     max_age_hours: int | None = Field(default=None, ge=1)  # auto-search: only videos published within N hours
+    max_videos: int = Field(default=5, ge=1, le=50)  # auto-search: videos taken per run
     comments_per_video: int = Field(default=2, ge=1, le=100)
     target_mode: str = Field(default="first_reply")
 
