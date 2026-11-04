@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import random
 import time
-from typing import Any, Callable, NamedTuple
+from typing import Any, Awaitable, Callable, NamedTuple
 
 from loguru import logger
 
@@ -40,6 +41,15 @@ class SearchRunResult(NamedTuple):
     replies: int
 
 
+@dataclass
+class WarmupLedger:
+    """Background warm-ups of one launch, shared by the orchestrators of its projects: an account is warmed up at
+    most once per launch, and a failed warm-up is not retried by the next project."""
+
+    started: set[int] = field(default_factory=set)
+    failed_at: dict[int, datetime] = field(default_factory=dict)
+
+
 class ProjectRunResult(NamedTuple):
     """Outcome of one project's run: accounts that could post, videos taken (found + own links), replies posted
     (or simulated), and why it was skipped ("" when it ran)."""
@@ -59,6 +69,7 @@ class MultiAccountOrchestrator:
     """
 
     _project: ProjectRecord | None = None  # set per instance; the class default keeps a run without projects
+    _warmups: WarmupLedger | None = None
 
     def __init__(
         self,
@@ -77,10 +88,12 @@ class MultiAccountOrchestrator:
         visibility_checker: CommentVisibilityChecker | None = None,
         project: ProjectRecord | None = None,
         claimed: set[str] | None = None,
+        warmups: WarmupLedger | None = None,
     ) -> None:
         """`project`: run only its members, its video pool and its target / replies (`project_config`); None keeps
         the run without projects (every active account, every pool). `claimed`: the comments taken earlier in the
-        same launch (shared by the projects run one after another: one comment gets one reply from the whole bot)."""
+        same launch (shared by the projects run one after another: one comment gets one reply from the whole bot).
+        `warmups`: the warm-ups of that launch (shared the same way)."""
         base = config_or_path if isinstance(config_or_path, AppConfig) else load_config(config_or_path)
         self._project = project
         self._cfg = project_config(base, project) if project is not None else base
@@ -135,7 +148,8 @@ class MultiAccountOrchestrator:
         self._project_logged: set[int] = set()
         self._warmer = warmer or AccountWarmer(self._cfg.browser, simulator=self._simulator, rng=self._rng)
         self._warmup_tasks: dict[int, asyncio.Task[Any]] = {}
-        self._warmup_failed_at: dict[int, datetime] = {}
+        self._warmups = warmups if warmups is not None else WarmupLedger()
+        self._warmup_failed_at: dict[int, datetime] = self._warmups.failed_at
         self._gated_accounts: set[int] = set()  # accounts held back by their lifecycle limits during this run
         self._warmup_slot = asyncio.Semaphore(1)  # one warm-up browser at a time
         # An injected runner_factory means no real YouTube behind the runners (tests): nothing to look for then.
@@ -302,6 +316,8 @@ class MultiAccountOrchestrator:
         """
         if self._dry_run or acc.id in self._warmup_tasks or not acc.auto_warmup or not acc.is_active:
             return
+        if self._warmups is not None and acc.id in self._warmups.started:
+            return  # warmed up (or tried) earlier in this launch
         failed_at = self._warmup_failed_at.get(acc.id)
         if failed_at is not None and datetime.now(timezone.utc) - failed_at <= self.WARMUP_INTERVAL:
             return  # a failed warm-up is not retried on every account pick
@@ -315,6 +331,8 @@ class MultiAccountOrchestrator:
                     last = last.replace(tzinfo=timezone.utc)
                 if datetime.now(timezone.utc) - last <= self.WARMUP_INTERVAL:
                     return
+        if self._warmups is not None:
+            self._warmups.started.add(acc.id)
         self._warmup_tasks[acc.id] = asyncio.create_task(self._run_warmup(acc))
 
     async def _run_warmup(self, acc: AccountRecord) -> None:
@@ -422,6 +440,16 @@ class MultiAccountOrchestrator:
         rotated.sort(key=lambda a: a.total_replies + self._in_flight[a.id])
         return rotated[0]
 
+    async def _count_project_reply(self, acc: AccountRecord) -> None:
+        """One more reply of `acc` in the project today. It can never break the recording of a published reply: a
+        failure here (a locked database) is only logged, the journal, payloads and pool are still written."""
+        if self._project is None:
+            return
+        try:
+            await self._db.bump_project_daily(self._project.id, acc.id)
+        except Exception as exc:
+            logger.error("[ПРОЕКТ] {} · {}: счётчик дня проекта не обновлён: {}", self._project.name, acc.name, exc)
+
     async def _record_error(self, acc: AccountRecord) -> None:
         """A failed live submission counts toward the account's circuit breaker (3 in a row restrict it)."""
         if self._dry_run:
@@ -446,7 +474,8 @@ class MultiAccountOrchestrator:
         """
         needed = target if account is not None else max(0, target - video.comments_done)
         if needed <= 0:
-            await self._db.update_pool_video_progress(video.id, comments_added=0, completed=True)
+            if not self._dry_run:  # a dry run never changes the pool: a live run takes the same videos
+                await self._db.update_pool_video_progress(video.id, comments_added=0, completed=True)
             return 0
 
         logger.info(
@@ -593,8 +622,8 @@ class MultiAccountOrchestrator:
                         if not self._dry_run:  # inside the lock: the next worker of this account sees it
                             if sub_res.success:
                                 await self._db.record_account_comment_success(acc.id)
-                                if self._project is not None:
-                                    await self._db.bump_project_daily(self._project.id, acc.id)
+                                # inside the lock, like the account's counter: the next pick of this account sees it
+                                await self._count_project_reply(acc)
                             else:
                                 await self._record_error(acc)
 
@@ -644,11 +673,12 @@ class MultiAccountOrchestrator:
                         is_video_complete = account is None and (
                             video.comments_done + video_comments_done + 1 >= target
                         )
-                        await self._db.update_pool_video_progress(
-                            pool_video_id=video.id,
-                            comments_added=1,
-                            completed=is_video_complete,
-                        )
+                        if not self._dry_run:
+                            await self._db.update_pool_video_progress(
+                                pool_video_id=video.id,
+                                comments_added=1,
+                                completed=is_video_complete,
+                            )
                         if self._dry_run:
                             await self._db.increment_account_stats(acc.id, replies=1)
                         logger.success(
@@ -767,7 +797,7 @@ class MultiAccountOrchestrator:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             await self._close_runners()
-        if self._account_mode == "each" and not self._gated_accounts:
+        if self._account_mode == "each" and not self._gated_accounts and not self._dry_run:
             for video in videos:
                 await self._db.update_pool_video_progress(video.id, comments_added=0, completed=True)
         total_comments = sum(r for r in results if isinstance(r, int))
@@ -793,6 +823,17 @@ class MultiAccountOrchestrator:
 
         return await self.execute_video_pool()
 
+    async def _waiting_for_warmups(self, work: Awaitable[Any]) -> Any:
+        """Run `work`, then wait for the warm-ups the lifecycle gate started (also when it found nothing to do or
+        failed): `close()` would cancel them mid-session. Ctrl+C does not wait."""
+        try:
+            result = await work
+        except Exception:
+            await self._finish_warmups()
+            raise
+        await self._finish_warmups()
+        return result
+
     async def run_search(
         self,
         query: str,
@@ -807,12 +848,19 @@ class MultiAccountOrchestrator:
         (source 'search'), then the same run as the own links: every active account, `concurrency`,
         account_mode and the lifecycle limits. A video found again is taken again; answered comments are skipped.
         """
+        return await self._waiting_for_warmups(
+            self._run_search(query, min_views, max_views, max_age_hours, max_videos, comments_per_video)
+        )
+
+    async def _run_search(
+        self, query: str, min_views: int, max_views: int | None, max_age_hours: int | None, max_videos: int,
+        comments_per_video: int,
+    ) -> SearchRunResult:
         await self.ensure_db()
         await self.sync_accounts_from_config()
         accounts = await self._usable_accounts()
         if not accounts:
             logger.warning("ИНФО | Нет аккаунтов, которые могут отвечать сейчас: поиск по теме не запускался")
-            await self._finish_warmups()  # the lifecycle gate may have started warm-ups, as in a pool run
             return SearchRunResult(0, 0, 0)
 
         logger.info(
@@ -856,12 +904,13 @@ class MultiAccountOrchestrator:
         links: `concurrency`, account_mode, the lifecycle limits and the project's daily ceiling."""
         if self._project is None:
             raise RuntimeError("run_project needs a project")
-        project = self._project
+        return await self._waiting_for_warmups(self._run_project(self._project, topics))
+
+    async def _run_project(self, project: ProjectRecord, topics: list[str] | None) -> ProjectRunResult:
         await self.ensure_db()
         accounts = await self._usable_accounts()
         if not accounts:
             logger.warning("[ПРОЕКТ] {}: нет аккаунтов, которые могут отвечать сейчас", project.name)
-            await self._finish_warmups()  # the lifecycle gate may have started warm-ups, as in a pool run
             return ProjectRunResult(project.name, 0, 0, 0, "нет аккаунтов, которые могут отвечать сейчас")
         logger.info("[ПРОЕКТ] ▶ {} · аккаунтов: {}", project.name, len(accounts))
         videos = await self._collect_project_videos(project.search_topics if topics is None else topics)
@@ -999,4 +1048,5 @@ __all__ = [
     "MultiAccountOrchestrator",
     "ProjectRunResult",
     "SearchRunResult",
+    "WarmupLedger",
 ]

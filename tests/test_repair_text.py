@@ -26,10 +26,13 @@ class RepairText(unittest.TestCase):
     def test_config_with_escaped_halves_loads_whole_emoji(self):
         with open("config.yaml", "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
+        data["processor"]["custom_replies"] = []  # the processor's list would win over the top-level one below
+        data.pop("custom_replies", None)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cfg.yaml"
             text = yaml.safe_dump(repair_text(data), allow_unicode=True)
-            text += 'custom_replies:\n  - "ЧЕЛ ТЫ СЕРЬЕЗНО НЕ ЗНАЛ???\uD83D\uDE33"\n'
+            # as the operator's file has it: YAML escapes of the halves (a str with raw halves cannot be written as UTF-8)
+            text += 'custom_replies:\n  - "ЧЕЛ ТЫ СЕРЬЕЗНО НЕ ЗНАЛ???\\uD83D\\uDE33"\n'
             path.write_text(text, encoding="utf-8")
             cfg = load_config(path)
         self.assertIn("ЧЕЛ ТЫ СЕРЬЕЗНО НЕ ЗНАЛ???😳", (cfg.custom_replies or []) + list(cfg.processor.custom_replies or []))

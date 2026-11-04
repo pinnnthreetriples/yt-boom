@@ -111,6 +111,7 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
             await run_reply_bot(
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 config_path=str(self.config_path),
+                target_mode="raw",  # the target of a run without a project comes from «Основной»: name the mode
                 limit=1,
                 dry_run=True,
             )
@@ -167,6 +168,7 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
             await run_reply_bot(
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 config_path=str(self.config_path),
+                target_mode="raw",  # the target of a run without a project comes from «Основной»: name the mode
                 limit=1,
                 dry_run=False,
             )
@@ -209,6 +211,7 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
             await run_reply_bot(
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 config_path=str(self.config_path),
+                target_mode="raw",  # the target of a run without a project comes from «Основной»: name the mode
                 limit=1,
                 dry_run=False,
             )
@@ -253,6 +256,7 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
             await run_reply_bot(
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 config_path=str(self.config_path),
+                target_mode="raw",  # the target of a run without a project comes from «Основной»: name the mode
                 limit=1,
                 dry_run=False,
             )

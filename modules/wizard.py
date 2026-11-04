@@ -394,16 +394,7 @@ def load_accounts(config_path: Path) -> list[Any]:
         await db.connect()
         await db.init_schema()
         try:
-            accounts = await db.list_accounts()
-            if not accounts and hasattr(cfg.browser, "accounts"):
-                for acc in cfg.browser.accounts:
-                    await db.upsert_account(
-                        name=acc.name,
-                        session_path=acc.session_path,
-                        proxy_url=acc.proxy_url,
-                        is_active=acc.is_active,
-                    )
-                accounts = await db.list_accounts()
+            accounts = await seed_config_accounts(db, cfg)
             _proxy_tags.clear()
             for record in await db.list_proxies():
                 _proxy_tags[record.id] = f"[{record.country or record.last_exit_country or '??'}] {record.address}"
@@ -412,6 +403,21 @@ def load_accounts(config_path: Path) -> list[Any]:
             await db.close()
 
     return asyncio.run(_fetch())
+
+
+async def seed_config_accounts(db: Any, cfg: Any) -> list[Any]:
+    """The accounts of the database; an empty one gets the accounts of config.yaml (a fresh config: «default»).
+    In the start that created «Основной» they join it (`Database.adopt_config_accounts`), else they stay without one."""
+    accounts = await db.list_accounts()
+    if not accounts and hasattr(cfg.browser, "accounts"):
+        created = [
+            (await db.upsert_account(name=acc.name, session_path=acc.session_path, proxy_url=acc.proxy_url,
+                                     is_active=acc.is_active)).id
+            for acc in cfg.browser.accounts
+        ]
+        await db.adopt_config_accounts(created)
+        accounts = await db.list_accounts()
+    return accounts
 
 
 def _pools_db(config_path: Path, fn: Callable[[Any], Any]) -> Any:

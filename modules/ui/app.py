@@ -30,6 +30,7 @@ class AppContext:
         self.config_path = Path(config_path)
         self.live = False  # launch mode: dry run (False) or live (True); not saved, every start is a dry run
         self._cfg: tuple[tuple[int, int], Any] | None = None  # (file stamp, config): one read per change of the file
+        self.schema_error = ""  # why the database could not be brought up to date at start ("" = it was)
 
     def cfg(self) -> Any:
         """The config as the file says now (read again only when the file changed). Read-only for the tabs."""
@@ -138,6 +139,8 @@ def status_cells(ctx: AppContext) -> list[Cell]:
         cfg = ctx.cfg()
     except Exception:
         return [Cell("config.yaml не читается", "err")]
+    if ctx.schema_error:
+        return [Cell("база не обновилась", "err")]
     accounts = ctx.query("SELECT is_active, proxy_id FROM accounts")
     if not accounts:
         return [Cell("нет аккаунтов", "warn")]
@@ -181,6 +184,8 @@ def run_app(config_path: Path) -> None:
     _ensure_schema(ctx)
     _load_icon_choice(ctx)
     controller = Controller(build_tabs(ctx), status=lambda: status_cells(ctx))
+    if ctx.schema_error:
+        controller.notice = Notice("err", ctx.schema_error)
     controller.on_icons = lambda: _switch_icons(ctx, controller)
     run_shell(controller, _run, clear_terminal)
 
@@ -188,13 +193,32 @@ def run_app(config_path: Path) -> None:
 ICONS_SETTING = "ui_icons"
 
 
-def _ensure_schema(ctx: AppContext) -> None:
+def _ensure_schema(ctx: AppContext) -> str:
     """Bring an older database up to date before the tabs read it with plain sqlite3 (`video_pool.source`, the
-    projects and «Основной» seeded from config.yaml, `video_pool.project_id`, the journal's project / account)."""
+    projects and «Основной» seeded from config.yaml with the accounts of a fresh config, `video_pool.project_id`, the
+    journal's project / account). A failure is kept in `ctx.schema_error` (shown at start and as the status) and
+    returned; an unreadable config is left to the tabs."""
+    from modules.wizard import seed_config_accounts
+
     try:
-        ctx.db(lambda db: db.count_pool_videos())
+        cfg = ctx.cfg()
     except Exception:
-        pass  # no readable config or database yet: the tabs show what is missing
+        return ""  # no readable config yet: the tabs show what is missing
+    try:
+        ctx.db(lambda db: seed_config_accounts(db, cfg))
+        ctx.schema_error = ""
+    except Exception as exc:
+        ctx.schema_error = f"База не обновилась: {exc} · {_backup_words(exc, Path(cfg.app.db_path))}"
+    return ctx.schema_error
+
+
+def _backup_words(exc: Exception, db_path: Path) -> str:
+    """Where the copy made before the migration is (the newest `<db>.bak-*` when the error does not say)."""
+    backup = getattr(exc, "backup", None)
+    if backup is None:
+        copies = sorted(db_path.parent.glob(db_path.name + ".bak-*"), key=lambda p: p.stat().st_mtime)
+        backup = copies[-1] if copies else None
+    return f"копия: {backup}" if backup else "копии нет"
 
 
 def _load_icon_choice(ctx: AppContext) -> None:

@@ -616,6 +616,14 @@ class LastProjectError(ValueError):
     """The last project cannot be deleted: a run always needs one."""
 
 
+class MigrationError(RuntimeError):
+    """A schema migration did not run (or was rolled back); `backup` is the copy of the file made before it."""
+
+    def __init__(self, message: str, backup: Path | None = None) -> None:
+        super().__init__(message)
+        self.backup = backup
+
+
 def clean_project_name(name: Any) -> str:
     """A project name: trimmed, one line, 1..40 characters. ValueError (Russian text) otherwise."""
     text = str(name or "").strip()
@@ -792,6 +800,8 @@ class Database:
         self._path = Path(db_path).expanduser()
         self._busy_timeout_ms = busy_timeout_ms
         self._project_seed = project_seed
+        self.seeded_now = False  # this connection created «Основной» (the first start with projects)
+        self.last_backup: Path | None = None  # the copy of the file made before a migration of this start
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
 
@@ -859,15 +869,20 @@ class Database:
         `project_seed` (else the one given to the constructor) fills the first project «Основной» once.
         """
         seed = project_seed if project_seed is not None else self._project_seed
-        for attempt in range(1, _SCHEMA_ATTEMPTS + 1):
-            try:
-                await self._init_schema_once(seed)
-                return
-            except aiosqlite.OperationalError as exc:
-                if "locked" not in str(exc).lower() or attempt == _SCHEMA_ATTEMPTS:
-                    raise
-                logger.debug("База занята другим процессом, повтор инициализации схемы ({}/{})", attempt, _SCHEMA_ATTEMPTS)
-                await asyncio.sleep(0.2 * attempt)
+        try:
+            for attempt in range(1, _SCHEMA_ATTEMPTS + 1):
+                try:
+                    await self._init_schema_once(seed)
+                    return
+                except aiosqlite.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == _SCHEMA_ATTEMPTS:
+                        raise
+                    logger.debug("База занята другим процессом, повтор инициализации схемы ({}/{})", attempt, _SCHEMA_ATTEMPTS)
+                    await asyncio.sleep(0.2 * attempt)
+        except BaseException:
+            # a connection left open keeps aiosqlite's worker thread alive: the program would never exit
+            await self.close()
+            raise
 
     async def _init_schema_once(self, seed: dict[str, Any] | None = None) -> None:
         conn = self.connection
@@ -963,6 +978,7 @@ class Database:
             logger.warning("Резервная копия базы перед миграцией не создана: {}", exc)
             return None
         logger.info("Резервная копия базы перед миграцией ({}): {}", tag, target)
+        self.last_backup = target
         return target
 
     @staticmethod
@@ -988,8 +1004,11 @@ class Database:
         of the database file; the row count is compared before and after (a mismatch rolls everything back)."""
         if "project_id" in await self._columns(conn, "video_pool"):
             return
-        if not backed_up:
-            await self._backup_before_migration(conn, "projects")
+        if not backed_up and await self._backup_before_migration(conn, "projects") is None:
+            raise MigrationError(
+                "список видео не перестроен под проекты: не удалось сделать резервную копию базы "
+                f"(нужно место на диске и права записи рядом с {self._path.name}); база не изменена"
+            )
         await conn.execute("BEGIN IMMEDIATE")
         try:
             if "project_id" not in await self._columns(conn, "video_pool"):  # another process may have done it
@@ -1002,7 +1021,8 @@ class Database:
                 )
                 after = int(await self._scalar(conn, "SELECT COUNT(*) FROM video_pool_new"))
                 if after != before:
-                    raise RuntimeError(f"video_pool rebuild copied {after} of {before} rows")
+                    raise MigrationError(f"перестройка списка видео скопировала {after} строк из {before}; изменения отменены",
+                                         self.last_backup)
                 await conn.execute("DROP TABLE video_pool")
                 await conn.execute("ALTER TABLE video_pool_new RENAME TO video_pool")
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_video_pool_status ON video_pool(status, id)")
@@ -1052,6 +1072,7 @@ class Database:
         if not seeded:
             if empty:
                 await self._insert_project(conn, DEFAULT_PROJECT_NAME, _clean_seed(seed))
+                self.seeded_now = True
             project_id = await self._fallback_project_id(conn)
             members = await conn.execute(
                 "INSERT OR IGNORE INTO project_accounts (project_id, account_id, added_at) SELECT ?, id, ? FROM accounts",
@@ -2827,10 +2848,11 @@ class Database:
         )
         return [ProjectRecord.model_validate(dict(row)) for row in rows]
 
+    @staticmethod
     async def _member_quota(
-        self, conn: aiosqlite.Connection, project_id: int, account_id: int, now: datetime
-    ) -> ProjectQuota | None:
-        """Today's count of a member (a passed day restarts it in the table); None when it is not a member."""
+        conn: aiosqlite.Connection, project_id: int, account_id: int, now: datetime
+    ) -> tuple[ProjectQuota, bool] | None:
+        """(today's count of a member, a new day began) — read only, a passed day counts as 0; None: not a member."""
         cursor = await conn.execute(
             """
             SELECT pa.daily_done, pa.daily_reset_at, p.daily_per_account
@@ -2843,34 +2865,46 @@ class Database:
         await cursor.close()
         if row is None:
             return None
-        done = int(row["daily_done"])
         reset = _parse_utc_text(row["daily_reset_at"])
-        if reset is None or now >= reset:
-            done = 0
-            await conn.execute(
-                "UPDATE project_accounts SET daily_done = 0, daily_reset_at = ? WHERE project_id = ? AND account_id = ?",
-                (self.next_daily_reset(now).isoformat(), project_id, account_id),
-            )
+        new_day = reset is None or now >= reset
+        done = 0 if new_day else int(row["daily_done"])
         limit = row["daily_per_account"]
-        return ProjectQuota(done, limit, limit is None or done < int(limit))
+        return ProjectQuota(done, limit, limit is None or done < int(limit)), new_day
 
     async def project_daily_gate(self, project_id: int, account_id: int, now: datetime | None = None) -> ProjectQuota:
         """May the account answer once more in this project today (the project's own ceiling only; the account's
-        lifecycle limits are checked separately)? An account that is not a member may not."""
+        lifecycle limits are checked separately)? An account that is not a member may not. Reads only: a passed day
+        counts as 0 here and is written by the next `bump_project_daily`."""
         moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        async with self._transaction() as conn:
-            quota = await self._member_quota(conn, project_id, account_id, moment)
-        return quota if quota is not None else ProjectQuota(0, None, False)
+        async with self._lock:
+            found = await self._member_quota(self.connection, project_id, account_id, moment)
+        return found[0] if found is not None else ProjectQuota(0, None, False)
 
     async def bump_project_daily(self, project_id: int, account_id: int, now: datetime | None = None) -> None:
-        """One more reply of the account in the project today (nothing for an account that is not a member)."""
+        """One more reply of the account in the project today; a new day restarts the counter in the same write
+        (nothing for an account that is not a member)."""
         moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         async with self._transaction() as conn:
-            if await self._member_quota(conn, project_id, account_id, moment) is not None:
-                await conn.execute(
-                    "UPDATE project_accounts SET daily_done = daily_done + 1 WHERE project_id = ? AND account_id = ?",
-                    (project_id, account_id),
-                )
+            found = await self._member_quota(conn, project_id, account_id, moment)
+            if found is None:
+                return
+            quota, new_day = found
+            await conn.execute(
+                "UPDATE project_accounts SET daily_done = ?, daily_reset_at = COALESCE(?, daily_reset_at)"
+                " WHERE project_id = ? AND account_id = ?",
+                (quota.done + 1, self.next_daily_reset(moment).isoformat() if new_day else None, project_id, account_id),
+            )
+
+    async def adopt_config_accounts(self, account_ids: Iterable[int]) -> int:
+        """Accounts imported from config.yaml in the run that created «Основной» join it while it is the only project
+        (a fresh install keeps working); otherwise a new account stays without a project. Returns how many joined."""
+        ids = list(account_ids)
+        if not self.seeded_now or not ids:
+            return 0
+        projects = await self.list_projects()
+        if len(projects) != 1:
+            return 0
+        return await self.add_project_accounts(projects[0].id, ids)
 
     # ------------------------------------------------------------- video pool
 
@@ -3090,6 +3124,7 @@ __all__ = [
     "DEFAULT_PROJECT_NAME",
     "Database",
     "LastProjectError",
+    "MigrationError",
     "Payload",
     "PayloadStatus",
     "PROJECT_FIELDS",

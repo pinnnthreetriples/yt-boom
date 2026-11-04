@@ -29,7 +29,7 @@ from modules.lifecycle_engine import (
     release_restriction,
 )
 from modules.process_guard import bind_to_kill_on_close_job
-from modules.projects import project_plan, project_seed
+from modules.projects import project_config, project_plan, project_seed
 from modules.profile_manager import ProfileEditor
 from modules.proxy_library import log_proxy_routes, run_config_proxy_migration
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
@@ -39,6 +39,34 @@ from modules.youtube_runner import YouTubeRunner
 
 
 from modules.logger_config import configure_windows_encoding, setup_bot_logging
+
+
+async def _settings_without_project(db: Database, cfg: AppConfig, log: bool = True) -> AppConfig | None:
+    """Target and replies for a run without --project (`--search`, `--account`, `--video`): config.yaml no longer
+    holds them (the interface writes into the projects), so they come from the only project, else from «Основной».
+    None (logged, with the hint to name --project) when there are several projects and no «Основной»."""
+    projects = await db.list_projects()
+    project = projects[0] if len(projects) == 1 else await db.get_project_by_name(DEFAULT_PROJECT_NAME)
+    if project is None:
+        names = ", ".join(f"«{p.name}»" for p in projects) or "нет"
+        logger.error("Проектов несколько и «{}» нет: укажите, чьи цель и ответы взять — --project ИМЯ (проекты: {})",
+                     DEFAULT_PROJECT_NAME, names)
+        return None
+    if log:
+        logger.info("Цель и ответы — из проекта «{}» (без --project; аккаунты — как раньше)", project.name)
+    return project_config(cfg, project, project.search_topics[0] if project.search_topics else None)
+
+
+def _cli_settings(args: argparse.Namespace, cfg: AppConfig) -> AppConfig:
+    """`_settings_without_project` for main(): the filters and limits of the command line default to it; exit 1."""
+    async def resolve() -> AppConfig | None:
+        async with _open_db(cfg) as db:
+            return await _settings_without_project(db, cfg, log=False)
+
+    settings = asyncio.run(resolve())
+    if settings is None:
+        sys.exit(1)
+    return settings
 
 
 def _open_db(cfg: AppConfig) -> Database:
@@ -1141,7 +1169,7 @@ async def run_projects(
     start); Ctrl+C closes the current one and propagates. `topics` replaces the projects' topics for this launch only
     (nothing is saved); `progress["project"]` names the project running now (the interface reports a Ctrl+C with it).
     """
-    from modules.multi_account_orchestrator import MultiAccountOrchestrator, ProjectRunResult
+    from modules.multi_account_orchestrator import MultiAccountOrchestrator, ProjectRunResult, WarmupLedger
 
     cfg = load_config(config_path)
     if headless is not None:
@@ -1154,6 +1182,7 @@ async def run_projects(
     if not queue:
         logger.warning("Нет проектов в запуске: отметьте проект «в запуске» во вкладке «Проекты»")
     claimed: set[str] = set()
+    warmups = WarmupLedger()
     summary = ProjectsRunSummary([])
     for project in queue:
         reason = _project_skip_reason(project, topics)
@@ -1171,6 +1200,7 @@ async def run_projects(
             account_mode=account_mode,
             project=project,
             claimed=claimed,
+            warmups=warmups,
         )
         try:
             summary.results.append(await orchestrator.run_project(topics))
@@ -1214,6 +1244,14 @@ async def run_search_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
+    db = _open_db(cfg)
+    await db.connect()
+    await db.init_schema()
+    settings = await _settings_without_project(db, cfg)
+    if settings is None:
+        await db.close()
+        return SearchRunResult(0, 0, 0)
+    cfg = settings
     if target_mode:
         cfg.collector.target_mode = target_mode
     if custom_reply and custom_reply.strip():
@@ -1222,12 +1260,9 @@ async def run_search_cli(
     elif reply_mode:
         cfg.processor.reply_mode = reply_mode
     if cfg.processor.reply_mode == "custom" and not [r for r in cfg.processor.custom_replies if r and r.strip()]:
-        logger.error("Включен режим 'Свой текст' (custom), но список 'custom_replies' пуст и --custom-reply не передан")
+        logger.error("Включен режим 'Свой текст' (custom), но список шаблонов пуст и --custom-reply не передан")
+        await db.close()
         return SearchRunResult(0, 0, 0)
-
-    db = _open_db(cfg)
-    await db.connect()
-    await db.init_schema()
     await log_proxy_routes(db)
 
     orchestrator = MultiAccountOrchestrator(
@@ -1404,6 +1439,11 @@ async def run_reply_bot(
     db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
+    settings = await _settings_without_project(db, cfg)
+    if settings is None:
+        await db.close()
+        return
+    cfg = settings
 
     rng = random.Random()
     effective_mode = "custom" if custom_reply else (reply_mode or getattr(cfg.processor, "reply_mode", "ai"))
@@ -1733,12 +1773,17 @@ async def run_multi_video_pipeline(
     max_age_hours keeps only videos published within that many hours: None = collector.max_age_hours, 0 = any age.
     """
     cfg = load_config(config_path)
-    max_age_hours = cfg.collector.max_age_hours if max_age_hours is None else (max_age_hours or None)
     if headless is not None:
         cfg.browser.headless = headless
     db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
+    settings = await _settings_without_project(db, cfg)
+    if settings is None:
+        await db.close()
+        return
+    cfg = settings
+    max_age_hours = cfg.collector.max_age_hours if max_age_hours is None else (max_age_hours or None)
 
     rng = random.Random()
     effective_mode = "custom" if custom_reply else (reply_mode or getattr(cfg.processor, "reply_mode", "ai"))
@@ -2394,7 +2439,7 @@ def main() -> None:
         return
 
     if args.search:
-        run_search_from_args(args, cfg, args.search)
+        run_search_from_args(args, _cli_settings(args, cfg), args.search)
         return
 
     # Check if user explicitly provided a CLI action or if interactive wizard should open
@@ -2425,6 +2470,9 @@ def main() -> None:
     if args.project:
         logger.warning("--project не действует вместе с --video / --account: запуск без проектов")
 
+    cfg = _cli_settings(args, cfg)
+    search_query = cfg.collector.search_query
+    default_limit = cfg.limits.max_iterations_per_session or 2
     if not args.video and search_query:
         run_search_from_args(args, cfg, search_query)
         return

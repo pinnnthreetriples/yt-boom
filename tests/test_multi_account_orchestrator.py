@@ -425,7 +425,9 @@ class TestMultiAccountOrchestrator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order, ["acc_a", "acc_a", "acc_b", "acc_b"])
         comments = [cid for kind, _, cid in events if kind == "start"]
         self.assertEqual(len(comments), len(set(comments)))
-        self.assertEqual(await self.db.list_pool_videos(status="pending"), [])
+        # a dry run leaves the pool as it was: a live run takes the same videos
+        self.assertEqual([(v.status, v.comments_done) for v in await self.db.list_pool_videos(status="all")],
+                         [("pending", 0), ("pending", 0)])
 
     async def test_each_mode_two_threads_runs_accounts_together(self) -> None:
         """«each», 2 threads: both accounts work at the same time, still on different comments."""
