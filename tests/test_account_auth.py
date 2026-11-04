@@ -160,6 +160,21 @@ class TestAccountLineParsing(unittest.TestCase):
         acc = parse_account_line("bob@gmail.com pw http://u:p@1.2.3.4:8080 country=PL locale=pl-PL")
         self.assertEqual((acc.totp_secret, acc.proxy, acc.expected_country, acc.locale), (None, "http://u:p@1.2.3.4:8080", "PL", "pl-PL"))
 
+    def test_free_form_password_with_colons_is_kept_whole(self):
+        acc = parse_account_line("bob@gmail.com y_:VVCH,4&$.eD7")
+        self.assertEqual((acc.password, acc.totp_secret), ("y_:VVCH,4&$.eD7", None))
+        acc = parse_account_line("bob@gmail.com p:a:JBSWY3DP")  # the whole token is the password, not "p:a" + secret
+        self.assertEqual((acc.password, acc.totp_secret), ("p:a:JBSWY3DP", None))
+        acc = parse_account_line("bob@gmail.com p:a:ss JBSWY3DP rescue@mail.ru 1.2.3.4:8080:user:pass mode=mature")
+        self.assertEqual(
+            (acc.password, acc.totp_secret, acc.recovery_email, acc.proxy, acc.lifecycle_mode),
+            ("p:a:ss", "JBSWY3DP", "rescue@mail.ru", "1.2.3.4:8080:user:pass", "mature"),
+        )
+
+    def test_free_form_bad_proxy_is_rejected_not_dropped(self):
+        with self.assertRaises(ValueError):
+            parse_account_line("bob@gmail.com pw 1.2.3.4:99999")
+
     def test_free_form_rejects_bad_lines_without_echoing_them(self):
         for bad in ("bob@gmail.com SECRETPW not_a_secret", "bob@gmail.com SECRETPW 1.2.3.4:8080 5.6.7.8:80", "nomail SECRETPW JBSWY3DP"):
             with self.assertRaises(ValueError, msg=bad) as caught:
