@@ -1,6 +1,6 @@
 """The tabbed console shell: one screen, tabs on top, rows of icons, one hint line at the bottom.
 
-Keys are the same everywhere: Tab / Shift+Tab (or 1-5) switch tabs, ↑↓ move, ←→ change the value of the row,
+Keys are the same everywhere: Tab / Shift+Tab (or the tab's number) switch tabs, ↑↓ move, ←→ change the value of the row,
 Space shows the row's details, Enter opens its actions, Esc goes back, ? lists the keys, Q quits.
 
 A tab builds a `View` (rows and hotkeys) from the current data. Enter on a row returns a step: an inline `Menu`
@@ -47,6 +47,7 @@ class Row:
     on_value: Callable[[int], "Notice | None"] | None = None
     enter: Callable[[], "Step"] | None = None
     selectable: bool = True
+    space: Callable[[], "Step"] | None = None  # Space does this instead of showing details (a tick on a list)
 
 
 @dataclass
@@ -98,9 +99,11 @@ class Back:
 
 @dataclass
 class GoTab:
-    """Switch to another tab (the first-run list on «Запуск» leads to the tab that needs setting up)."""
+    """Switch to another tab, by its name («Цель») or its position (the first-run list on «Запуск» leads to the tab
+    that needs setting up)."""
 
-    tab: int
+    tab: int | str
+    notice: Notice | None = None  # shown on the tab it leads to
 
 
 Step = Union[Menu, Field, Confirm, Screen, Run, Notice, Back, GoTab, None]
@@ -285,7 +288,8 @@ class Controller:
         elif isinstance(step, GoTab):
             self._close_overlays()
             self.expanded.clear()
-            self.tab = step.tab
+            self.tab = self._tab_index(step.tab)
+            self.notice = step.notice
             self.refresh()
         elif isinstance(step, Run):
             self.menu, self.edit, self.confirm = None, None, None
@@ -294,6 +298,11 @@ class Controller:
         else:  # None: the action closed itself
             self.menu, self.edit, self.confirm = None, None, None
             self.refresh()
+
+    def _tab_index(self, tab: int | str) -> int:
+        if isinstance(tab, str):
+            return next((i for i, t in enumerate(self.tabs) if t.name == tab), self.tab)
+        return tab if 0 <= tab < len(self.tabs) else self.tab
 
     def finish_run(self, result: Step) -> None:
         """The outer loop ran the work: show what it returned (a Notice, or the next step)."""
@@ -340,7 +349,7 @@ class Controller:
         row = self.current_row()
         if key in {"up", "down"}:
             self.select(self._move(self.selectable_rows(), self.current_id(), -1 if key == "up" else 1))
-        elif key in {"tab", "s-tab"} or (len(key) == 1 and key in "12345" and int(key) <= len(self.tabs)):
+        elif key in {"tab", "s-tab"} or (len(key) == 1 and key in "123456789" and int(key) <= len(self.tabs)):
             self._close_overlays()
             self.expanded.clear()
             if key == "tab":
@@ -356,6 +365,8 @@ class Controller:
         elif key == "space" and row:
             if self.marking:
                 self.marked = [m for m in self.marked if m != row.id] if row.id in self.marked else [*self.marked, row.id]
+            elif row.space:
+                self.apply(row.space(), row.id)
             elif row.detail:
                 self.expanded ^= {row.id}
         elif key == "enter" and row:
@@ -549,7 +560,7 @@ def render(c: Controller) -> list[Frag]:
     if c.help:
         line([])
         for keys, text in HELP:
-            line([("", "   "), ("class:key", f"{keys:<10}"), ("", text)])
+            line([("", "   "), ("class:key", f"{keys:<10}"), ("", text.replace("{tabs}", str(len(c.tabs))))])
 
     # bottom line: notice or hint on the left, keys on the right
     line([])
@@ -619,7 +630,7 @@ def _keys_hint(c: Controller) -> str:
 
 
 HELP: list[tuple[str, str]] = [
-    ("Tab", "следующая вкладка (Shift+Tab — назад, 1–5 — сразу)"),
+    ("Tab", "следующая вкладка (Shift+Tab — назад, 1–{tabs} — сразу)"),
     ("↑ ↓", "выбрать строку"),
     ("← →", "сменить значение в строке"),
     ("Пробел", "подробнее о строке"),

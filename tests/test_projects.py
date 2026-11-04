@@ -461,7 +461,7 @@ class ProjectConfigTest(DbCase):
         db = await self.open()
         project = await db.create_project("P")
         self.assertEqual(project_plan(project), ([], "нет тем и ссылок"))
-        self.assertEqual(project_problems(project, 0, True), ["нет аккаунтов", "нет тем и ссылок"])
+        self.assertEqual(project_problems(project, 0, True), ["нет аккаунтов", "нет видео"])
         project = await db.update_project(project.id, search_topics=["a", "b"], use_similar=True, use_title_words=True,
                                           reply_mode="custom")
         self.assertEqual([s.kind for s in project_plan(project).steps], ["topic", "topic"])  # no links: no references

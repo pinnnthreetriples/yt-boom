@@ -13,6 +13,7 @@ from config import AppConfig
 from database import Database, ProjectRecord
 
 DEEPSEEK_PLACEHOLDER = "sk-your-deepseek-key"  # the key of config.example.yaml: the config needs one, it is not real
+NO_VIDEOS = "нет видео"
 REFERENCE_LINKS = 5  # own links a run takes as references (the newest ones), to keep the requests few
 
 
@@ -110,9 +111,8 @@ def project_problems(project: ProjectRecord, active_members: int, has_key: bool)
         problems.append("нет аккаунтов")
     elif not active_members:
         problems.append("нет аккаунтов в работе")
-    plan = project_plan(project)
-    if not plan.steps:
-        problems.append(plan.reason)
+    if not project_plan(project).steps:
+        problems.append(NO_VIDEOS)  # the plan's reason says why (Space on the project)
     if project.reply_mode == "custom" and not project.custom_replies:
         problems.append("нет шаблонов")
     if project.reply_mode == "ai" and not has_key:
@@ -122,6 +122,7 @@ def project_problems(project: ProjectRecord, active_members: int, has_key: bool)
 
 __all__ = [
     "DEEPSEEK_PLACEHOLDER",
+    "NO_VIDEOS",
     "PlanStep",
     "ProjectPlan",
     "REFERENCE_LINKS",

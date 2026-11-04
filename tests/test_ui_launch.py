@@ -1,4 +1,5 @@
-"""Tab «Запуск»: first-run list, start (dry / live with a question), threads, window, journal and one record."""
+"""Tab «Запуск»: first-run list, start (dry / live with a question), threads, window, journal and one record; a launch
+runs the projects «в запуске» (`run_projects`)."""
 from __future__ import annotations
 
 import asyncio
@@ -11,11 +12,15 @@ from unittest.mock import AsyncMock, patch
 
 import yaml
 
+from config import load_config
 from database import Database
+from modules.multi_account_orchestrator import ProjectRunResult
+from modules.projects import project_seed
 from modules.ui import icons
 from modules.ui.app import AppContext, status_cells
 from modules.ui.shell import Confirm, Controller, Run, Tab, frags_text, render
 from modules.ui.tab_launch import build_tab, run_target
+from youtube_bot import ProjectsRunSummary
 
 
 class LaunchCase(unittest.TestCase):
@@ -42,7 +47,7 @@ class LaunchCase(unittest.TestCase):
         self.ctx = AppContext(self.config_path)
 
     async def _init_db(self):
-        db = Database(str(self.db_path))
+        db = Database(str(self.db_path), project_seed=project_seed(load_config(self.config_path)))
         await db.connect()
         await db.init_schema()
         await db.close()
@@ -53,13 +58,16 @@ class LaunchCase(unittest.TestCase):
     def raw(self) -> dict:
         return yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
 
-    def add_accounts(self, *names: str) -> None:
+    def add_accounts(self, *names: str, member: bool = True) -> None:
+        """New accounts; `member`: they join «Основной» (a new account belongs to no project by itself)."""
         async def go():
             db = Database(str(self.db_path))
             await db.connect()
             await db.init_schema()
             for name in names:
-                await db.upsert_account(name, session_path=str(self.root / "sessions" / name))
+                acc = await db.upsert_account(name, session_path=str(self.root / "sessions" / name))
+                if member:
+                    await db.add_project_accounts((await db.list_projects())[0].id, [acc.id])
             await db.close()
 
         asyncio.run(go())
@@ -177,57 +185,64 @@ class LaunchCase(unittest.TestCase):
         self.assertIn("удалено 3", c.notice.text)
         self.assertIn("записей нет", self.screen(c))
 
-    def test_run_target_without_videos_tells_where_to_go(self):
-        data = self.raw()
-        data["collector"]["search_query"] = None
-        self.config_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
-        notice = run_target(self.ctx, dry_run=True)
-        self.assertEqual(notice.kind, "warn")
-        self.assertIn("«Цель»", notice.text)
+    def launch(self, result, **kwargs):
+        run = AsyncMock(return_value=result) if not isinstance(result, BaseException) else AsyncMock(side_effect=result)
+        with patch("youtube_bot.run_projects", run):
+            notice = run_target(self.ctx, dry_run=kwargs.pop("dry_run", True), **kwargs)
+        return notice, run
 
-    def test_run_target_search_reports_errors_as_a_notice(self):
-        with patch("youtube_bot.run_search_cli", side_effect=RuntimeError("сеть")):
-            notice = run_target(self.ctx, dry_run=True)
-        self.assertEqual(notice.kind, "err")
-        self.assertIn("сеть", notice.text)
-
-    def set_search(self, **collector) -> None:
-        data = self.raw()
-        data["collector"].update(collector)
-        data["limits"]["max_iterations_per_session"] = 3
-        self.config_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
-
-    def test_run_target_search_goes_through_the_accounts_with_the_tab_settings(self):
-        from modules.multi_account_orchestrator import SearchRunResult
-
-        self.set_search(min_views=10000, max_views=500000, max_age_hours=24, max_videos=7)
-        search = AsyncMock(return_value=SearchRunResult(2, 7, 5))
-        with patch("youtube_bot.run_search_cli", search):
-            notice = run_target(self.ctx, dry_run=True)
-        args, kwargs = search.call_args
-        self.assertEqual(args, ("iphone 17 обзор", str(self.config_path)))
-        self.assertEqual(kwargs, {"min_views": 10000, "max_views": 500000, "max_age_hours": 24, "max_videos": 7,
-                                  "comments_per_video": 3, "dry_run": True})
+    def test_run_target_runs_the_projects_and_says_what_happened(self):
+        notice, run = self.launch(ProjectsRunSummary([ProjectRunResult("Основной", 2, 7, 5)]))
+        args, kwargs = run.call_args
+        self.assertEqual(args, (str(self.config_path), True, None))
+        self.assertIn("progress", kwargs)
         self.assertEqual(notice.kind, "ok")
         self.assertIn("видео: 7 · ответов: 5", notice.text)
 
-    def test_run_target_search_nothing_found_says_what_to_loosen(self):
-        from modules.multi_account_orchestrator import SearchRunResult
+    def test_run_target_one_project(self):
+        notice, run = self.launch(ProjectsRunSummary([ProjectRunResult("Основной", 1, 1, 1)]), project_ids=[7])
+        self.assertEqual(run.call_args.args, (str(self.config_path), True, [7]))
 
-        self.set_search(min_views=10000, max_views=500000, max_age_hours=24)
-        with patch("youtube_bot.run_search_cli", AsyncMock(return_value=SearchRunResult(1, 0, 0))):
-            notice = run_target(self.ctx, dry_run=True)
+    def test_run_target_nothing_found_says_what_to_loosen(self):
+        main = self.ctx.projects()[0]
+        self.ctx.update_project(main.id, min_views=10000, max_views=500000, max_age_hours=24)
+        notice, _ = self.launch(ProjectsRunSummary([ProjectRunResult("Основной", 1, 0, 0, "видео не найдено")]))
         self.assertEqual(notice.kind, "warn")
-        self.assertIn("Видео по теме не найдено", notice.text)
+        self.assertIn("Видео не найдено", notice.text)
         self.assertIn("шире свежесть (до 24 ч), шире просмотры (10 тыс – 500 тыс)", notice.text)
 
-    def test_run_target_search_without_accounts_able_to_post(self):
-        from modules.multi_account_orchestrator import SearchRunResult
+    def test_run_target_skips_say_where_to_go(self):
+        for reason, words in (("нет аккаунтов, которые могут отвечать сейчас", "«Аккаунты»"),
+                              ("нет тем и ссылок", "«Цель»"), ("нет аккаунтов", "«Проекты»"),
+                              ("нет шаблонов", "«Ответы»")):
+            notice, _ = self.launch(ProjectsRunSummary([ProjectRunResult("Основной", 0, 0, 0, reason)]))
+            self.assertEqual(notice.kind, "warn")
+            self.assertIn(words, notice.text)
+        notice, _ = self.launch(ProjectsRunSummary([]))
+        self.assertIn("Нет проектов в запуске", notice.text)
 
-        with patch("youtube_bot.run_search_cli", AsyncMock(return_value=SearchRunResult(0, 0, 0))):
+    def test_run_target_several_projects_in_one_line(self):
+        notice, _ = self.launch(ProjectsRunSummary([ProjectRunResult("Крипта", 2, 4, 5),
+                                                    ProjectRunResult("Фитнес", 0, 0, 0, "нет аккаунтов")]))
+        self.assertEqual(notice.kind, "ok")
+        self.assertIn("ответов: 5 · Крипта: 5 · Фитнес: пропущен (нет аккаунтов)", notice.text)
+
+    def test_run_target_errors_and_stops_are_notices(self):
+        notice, _ = self.launch(RuntimeError("сеть"))
+        self.assertEqual(notice.kind, "err")
+        self.assertIn("сеть", notice.text)
+        notice, _ = self.launch(ProjectsRunSummary([ProjectRunResult("Крипта", 1, 1, 1)], "Фитнес", "RuntimeError: браузер"))
+        self.assertEqual(notice.kind, "err")
+        self.assertIn("остановлен на проекте «Фитнес»: RuntimeError: браузер", notice.text)
+
+    def test_ctrl_c_says_on_which_project(self):
+        async def interrupted(*args, progress=None, **kwargs):
+            progress["project"] = "Крипта"
+            raise KeyboardInterrupt
+
+        with patch("youtube_bot.run_projects", interrupted):
             notice = run_target(self.ctx, dry_run=False)
-        self.assertEqual(notice.kind, "warn")
-        self.assertIn("«Аккаунты»", notice.text)
+        self.assertEqual((notice.kind, notice.text), ("warn", "Боевой запуск прерван на проекте «Крипта»"))
 
     def test_live_start_without_accounts_able_to_post_says_so(self):
         self.add_accounts("one")

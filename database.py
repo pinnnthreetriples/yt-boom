@@ -306,6 +306,7 @@ _PROJECT_SELECT = f"""
     FROM projects
 """
 _PROJECT_ORDER = " ORDER BY projects.sort ASC, projects.id ASC"
+PROJECT_SELECT, PROJECT_ORDER = _PROJECT_SELECT, _PROJECT_ORDER  # the interface reads projects with plain sqlite3
 
 
 class _Unset:
@@ -3092,6 +3093,8 @@ __all__ = [
     "Payload",
     "PayloadStatus",
     "PROJECT_FIELDS",
+    "PROJECT_ORDER",
+    "PROJECT_SELECT",
     "PROJECTS_SEEDED_KEY",
     "PROXY_SCHEMES",
     "ProjectDeleteResult",

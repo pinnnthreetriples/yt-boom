@@ -1,4 +1,4 @@
-"""Console helpers shared by the tabbed interface (`modules.ui`): config writes, sessions, accounts, target plan.
+"""Console helpers shared by the tabbed interface (`modules.ui`): config writes, sessions, accounts, target labels.
 
 `run_wizard_app` starts the interface (`python youtube_bot.py --wizard`, start_bot.bat).
 """
@@ -360,28 +360,6 @@ _TARGET_AGES: list[tuple[int | None, str]] = [
 ]
 
 
-_TARGET_PENDING_SQL = "source = 'links' AND status IN ('pending', 'in_progress') AND comments_done < comments_target"
-
-
-def _target_pool_info(db_path: Any) -> tuple[int, str | None]:
-    """(videos waiting in the pool, URL of the next one); (0, None) if the DB has no pool yet.
-
-    Plain read-only sqlite3 (same filter as Database.list_pool_videos('pending', source='links')): this runs
-    while menus are rebuilt, sometimes inside prompt_toolkit's event loop, where asyncio.run fails.
-    """
-    try:
-        uri = f"file:{quote(Path(db_path).as_posix(), safe='/:')}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
-        try:
-            count = conn.execute(f"SELECT COUNT(*) FROM video_pool WHERE {_TARGET_PENDING_SQL}").fetchone()[0]
-            row = conn.execute(f"SELECT video_url FROM video_pool WHERE {_TARGET_PENDING_SQL} ORDER BY id LIMIT 1").fetchone()
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return 0, None
-    return int(count), (row[0] if row else None)
-
-
 def _logged_in_names(cfg: Any) -> list[str]:
     """Names of the accounts whose session is logged in to YouTube (read-only sqlite3, safe inside menus).
 
@@ -399,20 +377,6 @@ def _logged_in_names(cfg: Any) -> list[str]:
     if not rows:
         return ["default"] if check_youtube_session(cfg.browser.session_root)[0] else []
     return [name for name, path in rows if check_youtube_session(Path(path))[0]]
-
-
-def _target_plan(cfg: Any) -> tuple[str, int, str]:
-    """What a launch runs on, in priority order: auto-search, else the video list.
-
-    Returns ("search", 0, query) / ("pool", waiting videos, next URL) / ("none", 0, "") when there is nothing.
-    """
-    query = getattr(cfg.collector, "search_query", None)
-    if query:
-        return "search", 0, query
-    count, first = _target_pool_info(cfg.app.db_path)
-    if count and first:
-        return "pool", count, first
-    return "none", 0, ""
 
 
 def load_accounts(config_path: Path) -> list[Any]:

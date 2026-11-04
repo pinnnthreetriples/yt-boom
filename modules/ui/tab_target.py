@@ -1,22 +1,20 @@
-"""Tab «Цель»: which videos (search topic or own links), whom to answer, how many replies, a preview."""
+"""Tab «Цель» of the current project: topics, videos per topic, freshness, views, whom to answer, replies per video,
+own links, reference links, a preview. Every change is written into the project, not into config.yaml."""
 from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any, Callable
+from typing import Any
 
 from modules.ui.app import AppContext
 from modules.ui.icons import icon
-from modules.ui.shell import Cell, Confirm, Field, Menu, Notice, Row, Run, Screen, Tab, View, fit
+from modules.ui.shell import Cell, Confirm, Field, Hotkey, Menu, Notice, Row, Run, Screen, Step, Tab, View, fit
+from modules.ui.tab_projects import no_project_view, switch_row
 
-_SOURCES = ["поиск по теме", "свои ссылки"]
 _LIMITS = [str(n) for n in range(1, 51)]
-_VIDEOS = [str(n) for n in range(1, 51)]  # auto-search: videos per run
-_PENDING_SQL = "source = 'links' AND status IN ('pending', 'in_progress') AND comments_done < comments_target"
-
-
-def _db(ctx: AppContext, fn: Callable[[Any], Any]) -> Any:
-    return ctx.db(fn)
+_VIDEOS = [str(n) for n in range(1, 51)]  # videos per topic and run
+# Reference links: (use_similar, use_title_words) in the order ←→ goes through them.
+_REFERENCES = [(False, False), (True, False), (False, True), (True, True)]
 
 
 def views_label(low: int, high: int | None) -> str:
@@ -37,6 +35,16 @@ def views_label(low: int, high: int | None) -> str:
     return "любые"
 
 
+def age_label(hours: int | None) -> str:
+    """'любые' / 'до 2 дня' / 'до 30 ч' for a freshness limit."""
+    from modules.wizard import _TARGET_AGES
+
+    if not hours:
+        return "любые"
+    label = next((text for value, text in _TARGET_AGES if value == hours), f"{hours} ч")
+    return f"до {label}"
+
+
 def parse_views(text: str) -> tuple[int, int | None]:
     """«10к 500к», «10000-500000», «10 тыс», «0 1млн» -> (min, max or None); ValueError on nonsense."""
     numbers = []
@@ -55,84 +63,83 @@ def parse_views(text: str) -> tuple[int, int | None]:
     return low, high
 
 
-def _pool_counts(ctx: AppContext) -> tuple[int, int]:
-    """(videos waiting, videos done) in the video list."""
-    waiting = ctx.query(f"SELECT COUNT(*) FROM video_pool WHERE {_PENDING_SQL}")
-    total = ctx.query("SELECT COUNT(*) FROM video_pool WHERE source = 'links'")
-    w = int(waiting[0][0]) if waiting else 0
-    return w, (int(total[0][0]) if total else 0) - w
+def _first_link(ctx: AppContext, project_id: int) -> str | None:
+    """The project's next own link (else its first one): the preview reads its comments."""
+    rows = ctx.query(
+        "SELECT video_url FROM video_pool WHERE project_id = ? AND source = 'links'"
+        " ORDER BY (status IN ('pending', 'in_progress') AND comments_done < comments_target) DESC, id LIMIT 1",
+        (project_id,),
+    )
+    return str(rows[0][0]) if rows else None
 
 
-def _fetch_preview(ctx: AppContext, url: str, limit: int) -> list[Any]:
+def _fetch_preview(ctx: AppContext, project: Any, url: str | None, limit: int) -> tuple[str | None, list[Any]]:
+    """(video, comments): the given own link, else the first video the first topic finds within the filters."""
     from modules.projects import open_database
     from modules.youtube_collector import YouTubeCollector
 
     cfg = ctx.cfg()
 
-    async def fetch() -> list[Any]:
+    async def fetch() -> tuple[str | None, list[Any]]:
         async with open_database(cfg) as db:
             proxy = await db.search_proxy_url()
         async with YouTubeCollector(cfg.collector, proxy) as collector:
-            return await collector.fetch_video_sub_comments(url, max_sub_comments=limit)
+            video = url
+            if video is None:
+                found = await collector.search_videos(
+                    query=project.search_topics[0], limit=1, min_views=project.min_views, max_views=project.max_views,
+                    max_age_hours=project.max_age_hours,
+                )
+                video = found[0]["url"] if found else None
+            if video is None:
+                return None, []
+            return video, await collector.fetch_video_sub_comments(video, max_sub_comments=limit)
 
     return asyncio.run(fetch())
 
 
+def references_active(project: Any) -> bool:
+    return bool(project.links_total and (project.use_similar or project.use_title_words))
+
+
 def build_tab(ctx: AppContext) -> Tab:
-    from modules.wizard import _TARGET_AGES, _TARGET_MODE_EXAMPLES, _TARGET_MODES, _target_plan, _target_pool_info, _target_short_url
+    from modules.wizard import _TARGET_AGES, _TARGET_MODE_EXAMPLES, _TARGET_MODES, _target_short_url
 
-    state: dict[str, Any] = {"last_query": None, "want_search": False, "preview": None}
+    state: dict[str, Any] = {"preview": None}
 
-    # ---- source
+    def save(**fields: Any) -> Notice | None:
+        """Write into the current project; a bad value comes back as a notice."""
+        project = ctx.project()
+        if project is None:
+            return Notice("warn", "Проектов нет")
+        try:
+            ctx.update_project(project.id, **fields)
+        except ValueError as exc:
+            return Notice("warn", str(exc))
+        return None
 
-    def set_source(index: int) -> Notice | None:
-        query = ctx.cfg().collector.search_query
-        if index == 1:
-            if query:
-                state["last_query"] = query
-                ctx.update({"collector.search_query": None})
-            state["want_search"] = False
-            return Notice("ok", "Видео из своих ссылок")
-        if state["last_query"]:
-            ctx.update({"collector.search_query": state["last_query"]})
-            return Notice("ok", f"Поиск: «{state['last_query']}»")
-        state["want_search"] = True
-        return Notice("info", "Введите тему поиска: Enter на строке темы")
-
-    def edit_topic() -> Field:
-        def submit(text: str) -> Notice:
-            text = " ".join(text.split())
-            if not text:
-                return Notice("warn", "Тема не введена")
-            ctx.update({"collector.search_query": text})
-            state["last_query"], state["want_search"] = text, False
-            return Notice("ok", f"Тема поиска: «{text}»")
-
-        return Field("тема поиска", submit, initial=ctx.cfg().collector.search_query or state["last_query"] or "")
+    # ---- filters
 
     def edit_views() -> Field:
-        collector = ctx.cfg().collector
+        project = ctx.project()
 
         def submit(text: str) -> Notice:
             if not text.strip():
-                ctx.update({"collector.min_views": 0, "collector.max_views": None})
-                return Notice("ok", "Просмотры: любые")
+                return save(min_views=0, max_views=None) or Notice("ok", "Просмотры: любые")
             try:
                 low, high = parse_views(text)
             except ValueError:
                 return Notice("warn", "Не понял диапазон: напишите «от до», например «10к 500к»")
-            ctx.update({"collector.min_views": low, "collector.max_views": high})
-            return Notice("ok", f"Просмотры: {views_label(low, high)}")
+            return save(min_views=low, max_views=high) or Notice("ok", f"Просмотры: {views_label(low, high)}")
 
-        current = f"{collector.min_views or 0} {collector.max_views or ''}".strip()
+        current = f"{project.min_views or 0} {project.max_views or ''}".strip()
         return Field("просмотры «от до», например 10к 500к · пусто — любые", submit, initial=current)
 
-    def set_age(index: int) -> None:
-        ctx.update({"collector.max_age_hours": _TARGET_AGES[index][0]})
+    def set_age(index: int) -> Notice | None:
+        return save(max_age_hours=_TARGET_AGES[index][0])
 
     def set_videos(index: int) -> Notice:
-        ctx.update({"collector.max_videos": index + 1})
-        return Notice("ok", f"Видео за запуск: {index + 1}")
+        return save(max_videos=index + 1) or Notice("ok", f"Видео на тему за запуск: {index + 1}")
 
     def edit_videos() -> Field:
         def submit(text: str) -> Notice:
@@ -140,7 +147,7 @@ def build_tab(ctx: AppContext) -> Tab:
                 return Notice("warn", "Нужно число от 1 до 50")
             return set_videos(int(text) - 1)
 
-        return Field("видео за запуск, 1–50", submit, initial=str(ctx.cfg().collector.max_videos))
+        return Field("видео на тему за запуск, 1–50", submit, initial=str(ctx.project().max_videos))
 
     # ---- links
 
@@ -150,39 +157,52 @@ def build_tab(ctx: AppContext) -> Tab:
                 return Notice("info", "Ничего не вставлено")
             from modules.pool_manager import PoolManager
 
-            target = ctx.cfg().limits.max_iterations_per_session or 2
-            res = _db(ctx, lambda db: PoolManager(db).add_videos_from_text(text, comments_target=target))
+            project = ctx.project()
+            res = ctx.db(lambda db: PoolManager(db).add_videos_from_text(text, project.comments_per_video, project.id))
             return Notice("ok" if res.added else "warn", f"+{res.added} добавлено · {res.existing} уже были · {res.invalid} не распознано")
 
         return Field("ссылки на видео, по одной в строке", submit, multiline=True)
 
     def clear_links() -> Confirm:
+        project = ctx.project()
+
         def pick(i: int) -> Notice | None:
             if i != 1:
                 return None
-            return Notice("ok", f"Удалено видео: {_db(ctx, lambda db: db.clear_video_pool())}")
+            return Notice("ok", f"Удалено видео: {ctx.db(lambda db: db.clear_video_pool(project.id))}")
 
-        return Confirm([Cell("Очистить список видео?", "warn")], ["Нет", "Очистить"], pick)
+        return Confirm([Cell(f"Очистить список видео проекта «{project.name}»?", "warn")], ["Нет", "Очистить"], pick)
 
     def links_menu() -> Menu:
-        waiting, done = _pool_counts(ctx)
+        project = ctx.project()
         return Menu([
             Row("paste", [Cell(icon("add"), "", 3), Cell("вставить ссылки")], hint="Добавить видео в список", enter=paste_links),
-            Row("show", [Cell(icon("preview"), "", 3), Cell("показать список"), Cell(str(waiting + done), "dim")],
+            Row("show", [Cell(icon("preview"), "", 3), Cell("показать список"), Cell(str(project.links_total), "dim")],
                 hint="Видео в списке и сколько ответов написано", enter=lambda: Screen(lambda: links_view(ctx))),
-            Row("clear", [Cell(icon("trash"), "", 3), Cell("очистить")], hint="Удалить весь список", enter=clear_links),
+            Row("clear", [Cell(icon("trash"), "", 3), Cell("очистить")], hint="Удалить весь список проекта", enter=clear_links),
         ])
+
+    def set_references(index: int) -> Notice:
+        similar, words = _REFERENCES[index]
+        kinds = ", ".join(name for on, name in ((similar, "похожие"), (words, "слова из названий")) if on)
+        return save(use_similar=similar, use_title_words=words) or Notice("ok", f"Ориентир: {kinds or 'выкл'}")
+
+    def next_references() -> Notice:
+        project = ctx.project()
+        return set_references((_REFERENCES.index((project.use_similar, project.use_title_words)) + 1) % len(_REFERENCES))
 
     # ---- reply mode and limit
 
-    def set_mode(index: int) -> None:
-        ctx.update({"collector.target_mode": _TARGET_MODES[index][0]})
+    def set_mode(index: int) -> Notice | None:
+        return save(target_mode=_TARGET_MODES[index][0])
 
     def set_limit(index: int) -> Notice:
         limit = index + 1
-        ctx.update({"limits.max_iterations_per_session": limit, "limits.total_iterations": limit,
-                    "collector.comments_per_video": limit})
-        changed = _db(ctx, lambda db: db.set_pool_comments_target(limit))
+        project = ctx.project()
+        failed = save(comments_per_video=limit)
+        if failed:
+            return failed
+        changed = ctx.db(lambda db: db.set_pool_comments_target(limit, project.id))
         return Notice("ok", f"Ответов на видео: {limit}" + (f" · в списке обновлено: {changed}" if changed else ""))
 
     def edit_limit() -> Field:
@@ -191,26 +211,29 @@ def build_tab(ctx: AppContext) -> Tab:
                 return Notice("warn", "Нужно число от 1 до 50")
             return set_limit(int(text) - 1)
 
-        return Field("ответов на видео, 1–50", submit, initial=str(ctx.cfg().limits.max_iterations_per_session or 2))
+        return Field("ответов на видео, 1–50", submit, initial=str(ctx.project().comments_per_video))
 
     # ---- preview
 
     def preview() -> Notice | Run:
-        cfg = ctx.cfg()
-        url = _target_pool_info(cfg.app.db_path)[1]
-        if not url:
-            return Notice("info", "Предпросмотр — по первому видео из своих ссылок: список пуст")
-        limit = cfg.limits.max_iterations_per_session or 2
+        project = ctx.project()
+        url = _first_link(ctx, project.id)
+        if url is None and not project.search_topics:
+            return Notice("info", "Предпросмотр — по первому видео проекта: нет ни своих ссылок, ни тем")
+        limit = max(project.comments_per_video, 5)
 
         def work() -> Notice:
             try:
-                found = _fetch_preview(ctx, url, max(limit, 5))
+                video, found = _fetch_preview(ctx, project, url, limit)
             except Exception as exc:
                 return Notice("err", fit(f"Комментарии не загрузились: {exc}", 70))
-            state["preview"] = (url, found)
-            return Notice("ok" if found else "warn", f"Комментариев: {len(found)} · {_target_short_url(url)}")
+            if video is None:
+                return Notice("warn", f"По теме «{fit(project.search_topics[0], 40)}» видео не найдено")
+            state["preview"] = (video, found)
+            return Notice("ok" if found else "warn", f"Комментариев: {len(found)} · {_target_short_url(video)}")
 
-        return Run(work, f"{icon('preview')} Загружаю комментарии · {_target_short_url(url)}")
+        what = _target_short_url(url) if url else f"тема «{fit(project.search_topics[0], 30)}»"
+        return Run(work, f"{icon('preview')} Загружаю комментарии · {what}")
 
     def preview_lines() -> list[list[Cell]]:
         if not state["preview"]:
@@ -227,46 +250,64 @@ def build_tab(ctx: AppContext) -> Tab:
 
     # ---- view
 
-    def build() -> View:
-        cfg = ctx.cfg()
-        collector = cfg.collector
-        query = collector.search_query
-        search = bool(query) or state["want_search"]
-        rows = [Row(
-            "source", [Cell(icon("videos" if search else "links"), "", 3), Cell(_SOURCES[0 if search else 1])],
-            hint="Откуда брать видео", values=_SOURCES, value_index=0 if search else 1, on_value=set_source,
-        )]
-        if search:
-            rows.append(Row(
-                "topic", [Cell(icon("topic"), "", 3), Cell(f"«{query}»" if query else "тема не задана", "" if query else "warn")],
-                hint="Тема поиска · Enter — изменить", enter=edit_topic,
-            ))
-            ages = [label for _, label in _TARGET_AGES]
-            age_index = next((i for i, (v, _) in enumerate(_TARGET_AGES) if v == collector.max_age_hours), 0)
-            age_text = ages[age_index] if collector.max_age_hours in {v for v, _ in _TARGET_AGES} else f"{collector.max_age_hours} ч"
-            rows.append(Row(
-                "age", [Cell(icon("fresh"), "", 3), Cell(age_text.lower() if age_index == 0 else f"до {age_text}")],
-                hint="Свежесть видео: как давно опубликованы", values=ages, value_index=age_index, on_value=set_age,
-            ))
-            rows.append(Row(
-                "views", [Cell(icon("views"), "", 3), Cell(views_label(collector.min_views or 0, collector.max_views))],
-                hint="Просмотры видео · Enter — изменить", enter=edit_views,
-            ))
-            videos = max(1, min(50, collector.max_videos))
-            rows.append(Row(
-                "videos", [Cell(icon("videos"), "", 3), Cell(f"{videos} видео за запуск")],
-                hint="Сколько найденных видео брать за запуск · Enter — ввести число", values=_VIDEOS,
-                value_index=videos - 1, on_value=set_videos, enter=edit_videos,
-            ))
+    def topics_row(project: Any) -> Row:
+        topics = project.search_topics
+        if topics:
+            shown = ", ".join(f"«{fit(t, 16)}»" for t in topics[:2]) + (" …" if len(topics) > 2 else "")
+            text, style = f"темы {len(topics)} · {shown}", ""
         else:
-            waiting, done = _pool_counts(ctx)
-            rows.append(Row(
-                "pool", [Cell(icon("videos"), "", 3), Cell(f"{waiting} ждут", "" if waiting else "warn", 10),
-                         Cell(f"{icon('sent')} {done}", "dim")],
-                hint="Видео ждут ответа · пройдено · Enter — вставить, показать, очистить", enter=links_menu,
-            ))
+            text, style = "тем нет", "" if project.links_total else "warn"
+        return Row("topics", [Cell(icon("topic"), "", 3), Cell(text, style)],
+                   hint="Темы поиска: за запуск обходятся все · Enter — список", enter=lambda: Screen(lambda: topics_view(ctx)))
 
-        mode = "first_reply" if collector.target_mode == "first_sub_comment" else collector.target_mode
+    def filter_rows(project: Any) -> list[Row]:
+        ages = [label for _, label in _TARGET_AGES]
+        age_index = next((i for i, (v, _) in enumerate(_TARGET_AGES) if v == project.max_age_hours), 0)
+        videos = max(1, min(50, project.max_videos))
+        return [
+            Row("videos", [Cell(icon("videos"), "", 3), Cell(f"{videos} видео на тему за запуск")],
+                hint="Сколько найденных видео брать с каждой темы · Enter — ввести число", values=_VIDEOS,
+                value_index=videos - 1, on_value=set_videos, enter=edit_videos),
+            Row("age", [Cell(icon("fresh"), "", 3), Cell(age_label(project.max_age_hours))],
+                hint="Свежесть видео: как давно опубликованы", values=ages, value_index=age_index, on_value=set_age),
+            Row("views", [Cell(icon("views"), "", 3), Cell(views_label(project.min_views, project.max_views))],
+                hint="Просмотры видео · Enter — изменить", enter=edit_views),
+        ]
+
+    def links_row(project: Any) -> Row:
+        done = project.links_total - project.links_waiting
+        return Row(
+            "pool", [Cell(icon("links"), "", 3), Cell("свои ссылки", "", 13),
+                     Cell(f"{project.links_waiting} ждут", "" if project.links_waiting else "dim", 10),
+                     Cell(f"{icon('sent')} {done}", "dim")],
+            hint="Видео ждут ответа · пройдено · Enter — вставить, показать, очистить", enter=links_menu,
+        )
+
+    def references_row(project: Any) -> Row:
+        def box(on: bool) -> str:
+            return "▣" if on else "▢"
+
+        text = f"ориентир: похожие {box(project.use_similar)} · слова из названия {box(project.use_title_words)}"
+        if not project.links_total:
+            return Row("refs", [Cell(icon("similar"), "", 3), Cell(text, "dim")],
+                       hint="Ориентир ищет новые видео по своим ссылкам — сначала вставьте ссылки")
+        index = _REFERENCES.index((project.use_similar, project.use_title_words))
+        return Row(
+            "refs", [Cell(icon("similar"), "", 3), Cell(text)],
+            hint="По своим ссылкам: похожие видео рядом и поиск по словам из названия · ←→ / Пробел",
+            values=["выкл", "похожие", "слова", "оба"], value_index=index, on_value=set_references,
+            space=next_references,
+        )
+
+    def build() -> View:
+        project = ctx.project()
+        if project is None:
+            return no_project_view()
+        rows = [row for row in [switch_row(ctx)] if row]
+        rows.append(topics_row(project))
+        if project.search_topics or references_active(project):
+            rows += filter_rows(project)
+        mode = "first_reply" if project.target_mode == "first_sub_comment" else project.target_mode
         mode_index = next((i for i, (v, _, _) in enumerate(_TARGET_MODES) if v == mode), 0)
         rows.append(Row(
             "mode", [Cell(icon("reply_to"), "", 3), Cell(_TARGET_MODES[mode_index][1].lower())],
@@ -274,25 +315,106 @@ def build_tab(ctx: AppContext) -> Tab:
             on_value=set_mode,
             detail=lambda: [[Cell(line)] for line in _TARGET_MODE_EXAMPLES.get(mode, [])],
         ))
-        limit = max(1, min(50, cfg.limits.max_iterations_per_session or 2))
+        limit = max(1, min(50, project.comments_per_video))
         rows.append(Row(
             "limit", [Cell(icon("limit"), "", 3), Cell(f"{limit} на видео")],
             hint="Ответов на видео · Enter — ввести число", values=_LIMITS, value_index=limit - 1,
             on_value=set_limit, enter=edit_limit,
         ))
+        rows += [links_row(project), references_row(project)]
         rows.append(Row("preview", [Cell(icon("preview"), "", 3), Cell("предпросмотр", "accent")],
-                        hint="Комментарии следующего видео: кому ответим", enter=preview))
+                        hint="Комментарии первого видео проекта: кому ответим", enter=preview))
         return View(rows=rows, bottom=([[Cell("")]] + preview_lines()) if state["preview"] else [],
                     keys="←→ значение · Enter изменить")
 
-    return Tab("Цель", icon("tab_target"), build, warn=lambda: _target_plan(ctx.cfg())[0] == "none")
+    def warn() -> bool:
+        from modules.projects import project_plan
+
+        return any(not project_plan(p).steps for p in ctx.projects() if p.enabled)
+
+    return Tab("Цель", icon("tab_target"), build, warn=warn)
+
+
+# --------------------------------------------------------------------------- topics
+
+
+def topics_view(ctx: AppContext) -> View:
+    """The current project's topics: Enter edits one, + adds, D / Delete removes; empty and repeated ones are refused."""
+    project = ctx.project()
+    if project is None:
+        return no_project_view()
+    topics = list(project.search_topics)
+
+    def store(new: list[str], done: str) -> Notice:
+        from database import clean_topics
+
+        try:
+            cleaned = clean_topics(new)
+        except ValueError as exc:
+            return Notice("warn", str(exc))
+        if len(cleaned) < len(new):
+            return Notice("warn", "Такая тема уже есть")
+        try:
+            ctx.update_project(project.id, search_topics=cleaned)
+        except ValueError as exc:
+            return Notice("warn", str(exc))
+        return Notice("ok", done)
+
+    def edit(index: int) -> Field:
+        def submit(text: str) -> Step:
+            text = " ".join(text.split())
+            if not text:
+                return Notice("warn", "Пустая тема не сохранена")
+            if text == topics[index]:
+                return None
+            return store([*topics[:index], text, *topics[index + 1:]], f"Тема: «{fit(text, 50)}»")
+
+        return Field("тема поиска", submit, initial=topics[index])
+
+    def add(_row: Any) -> Field:
+        def submit(text: str) -> Step:
+            text = " ".join(text.split())
+            if not text:
+                return Notice("warn", "Пустая тема не добавлена")
+            return store([*topics, text], f"Тема добавлена: «{fit(text, 50)}»")
+
+        return Field("новая тема поиска", submit)
+
+    def remove(row: Any) -> Step:
+        if row is None or not row.id.startswith("t"):
+            return None
+        index = int(row.id[1:])
+
+        def pick(i: int) -> Step:
+            if i != 1:
+                return None
+            return store([t for j, t in enumerate(topics) if j != index], f"Удалена тема «{fit(topics[index], 40)}»")
+
+        return Confirm([Cell(f"Удалить тему «{fit(topics[index], 40)}»?", "warn")], ["Нет", "Удалить"], pick)
+
+    rows = [Row(f"t{i}", [Cell(icon("topic"), "", 3), Cell(fit(text, 66))], hint="Enter — изменить · D — удалить",
+                enter=lambda i=i: edit(i)) for i, text in enumerate(topics)]
+    if not rows:
+        rows.append(Row("empty", [Cell("тем нет · + добавить", "dim")], selectable=False))
+    return View(
+        rows=rows, title=[Cell(f"{icon('topic')} {project.name} › темы · {len(topics)}")],
+        keys="Enter изменить · + добавить · D удалить",
+        hotkeys=[Hotkey("+", add), Hotkey("=", add), Hotkey("D", remove), Hotkey("delete", remove)],
+    )
 
 
 def links_view(ctx: AppContext) -> View:
-    """The video list: one row per video with its reply progress."""
+    """The current project's own links: one row per video with its reply progress."""
     from modules.wizard import _target_short_url
 
-    videos = ctx.query("SELECT id, video_url, comments_done, comments_target, status FROM video_pool WHERE source = 'links' ORDER BY id LIMIT 200")
+    project = ctx.project()
+    if project is None:
+        return no_project_view()
+    videos = ctx.query(
+        "SELECT id, video_url, comments_done, comments_target, status FROM video_pool"
+        " WHERE project_id = ? AND source = 'links' ORDER BY id LIMIT 200",
+        (project.id,),
+    )
     rows = []
     for vid, url, done, target, status in videos:
         finished = status == "completed" or done >= target
@@ -301,4 +423,7 @@ def links_view(ctx: AppContext) -> View:
                         hint="Готово" if finished else "Ждёт ответов"))
     if not rows:
         rows.append(Row("empty", [Cell("список пуст", "dim")], selectable=False))
-    return View(rows=rows, title=[Cell(f"{icon('links')} свои ссылки")], keys="")
+    return View(rows=rows, title=[Cell(f"{icon('links')} {project.name} › свои ссылки")], keys="")
+
+
+__all__ = ["age_label", "build_tab", "links_view", "parse_views", "topics_view", "views_label"]

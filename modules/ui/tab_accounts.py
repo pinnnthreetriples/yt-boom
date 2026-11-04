@@ -1,7 +1,9 @@
 """Tab «Аккаунты»: one row per account (state, proxy, stage, today's quota, auto warm-up) and everything done to them.
 
-Enter on a row opens its menu (proxy, mode, in work, auto warm-up, warm up now, channel profile, sign-in, rename,
-and «Снять ограничение» for an account stopped by errors); «+» adds accounts, «R» refreshes, X ticks several.
+Enter on a row opens its menu (proxy, mode, in work, projects, auto warm-up, warm up now, channel profile, sign-in,
+rename, and «Снять ограничение» for an account stopped by errors); «+» adds accounts, «R» refreshes, X ticks several.
+With several projects the rows are grouped by project (an account in several shows once, in its first project's
+group, with «📁2»); an account in no project does not work and says so.
 Browser and network work (sign-in, warm-up, profile publishing, proxy check) runs as a `Run` step.
 """
 from __future__ import annotations
@@ -108,8 +110,26 @@ def proxy_cell(acc: Any, record: Any) -> tuple[str, str, str]:
     return f"{country} {record.host}", "", f"Прокси {country} {record.address}"
 
 
-def row_hint(acc: Any, logged: bool, record: Any) -> str:
-    parts = [account_state(acc, logged)[1], stage_info(acc)[1]]
+NO_PROJECT = "без проекта — не работает"
+NEW_WITHOUT_PROJECT = "без проекта — добавьте в проект, чтобы работали"
+
+
+def memberships(ctx: AppContext) -> dict[int, list[Any]]:
+    """Account id -> its projects, in queue order."""
+    projects = {p.id: p for p in ctx.projects()}
+    order = list(projects)
+    out: dict[int, list[Any]] = {}
+    for account_id, project_id in ctx.query("SELECT account_id, project_id FROM project_accounts"):
+        if project_id in projects:
+            out.setdefault(int(account_id), []).append(projects[project_id])
+    for items in out.values():
+        items.sort(key=lambda p: order.index(p.id))
+    return out
+
+
+def row_hint(acc: Any, logged: bool, record: Any, projects: list[Any] | None = None) -> str:
+    parts = [NO_PROJECT] if projects == [] else []
+    parts += [account_state(acc, logged)[1], stage_info(acc)[1]]
     q = quota_info(acc)[1]
     if q:
         parts.append(q)
@@ -120,7 +140,7 @@ def row_hint(acc: Any, logged: bool, record: Any) -> str:
     return " · ".join(parts)
 
 
-def account_detail(acc: Any) -> list[list[Cell]]:
+def account_detail(acc: Any, projects: list[Any] | None = None) -> list[list[Cell]]:
     from modules.account_menu_logic import account_card_rows
 
     card = {label: (value, style) for label, value, style in account_card_rows(acc)}
@@ -131,28 +151,53 @@ def account_detail(acc: Any) -> list[list[Cell]]:
         lines.append([Cell(f"ошибок подряд: {acc.consecutive_errors}", "err")])
     if acc.email and acc.email.lower() != acc.name.lower():
         lines.append([Cell(acc.email)])
+    if projects is not None:
+        lines.append([Cell("проекты: " + ", ".join(p.name for p in projects), "") if projects else Cell(NO_PROJECT, "warn")])
     return lines
 
 
-def account_row(ctx: AppContext, acc: Any, logged: bool, record: Any) -> Row:
+def account_row(ctx: AppContext, acc: Any, logged: bool, record: Any, projects: list[Any],
+                grouped: bool = False) -> Row:
+    """One account; `projects`: the ones it is in (none: it does not work); `grouped`: «📁2» for several."""
     state_icon, _, _ = account_state(acc, logged)
     stage_icon, _, _ = stage_info(acc)
     pie, _ = quota_info(acc)
     proxy, proxy_style, _ = proxy_cell(acc, record)
+    cells = [
+        Cell(icon(state_icon), "", 3),
+        Cell(acc.name, "dim" if not acc.is_active else ("warn" if not projects else ""), 17),
+        Cell(proxy, proxy_style, 21, grow=True),
+        Cell(icon(stage_icon), "", 3),
+        Cell(pie, "accent", 2),
+        Cell(icon("warmup") if acc.auto_warmup else "", "", 3),
+    ]
+    if grouped:
+        cells.append(Cell(f"{icon('project')}{len(projects)}" if len(projects) > 1 else "", "dim", 4))
     return Row(
         f"a{acc.id}",
-        [
-            Cell(icon(state_icon), "", 3),
-            Cell(acc.name, "dim" if not acc.is_active else "", 17),
-            Cell(proxy, proxy_style, 21, grow=True),
-            Cell(icon(stage_icon), "", 3),
-            Cell(pie, "accent", 2),
-            Cell(icon("warmup") if acc.auto_warmup else "", "", 3),
-        ],
-        hint=row_hint(acc, logged, record),
-        detail=lambda: account_detail(_fresh(ctx, acc.id) or acc),
+        cells,
+        hint=row_hint(acc, logged, record, projects),
+        detail=lambda: account_detail(_fresh(ctx, acc.id) or acc, projects),
         enter=lambda: account_menu(ctx, acc.id),
     )
+
+
+def grouped_rows(ctx: AppContext, entries: list[tuple[Any, bool, Any]], of: dict[int, list[Any]]) -> list[Row]:
+    """Rows under project headers «📁 Крипта · 4» (queue order, then «без проекта»); each account once."""
+    rows: list[Row] = []
+    groups: list[tuple[str, int, list[tuple[Any, bool, Any]]]] = []
+    for project in ctx.projects():
+        mine = [e for e in entries if of.get(e[0].id) and of[e[0].id][0].id == project.id]
+        if mine:
+            groups.append((project.name, project.accounts_count, mine))
+    loose = [e for e in entries if not of.get(e[0].id)]
+    if loose:
+        groups.append(("без проекта", len(loose), loose))
+    for name, count, mine in groups:
+        rows.append(Row(f"h-{name}", [Cell(f"{icon('project')} {name} · {count}", "warn" if name == "без проекта" else "dim")],
+                        selectable=False))
+        rows += [account_row(ctx, acc, logged, record, of.get(acc.id, []), grouped=True) for acc, logged, record in mine]
+    return rows
 
 
 # --------------------------------------------------------------------------- tab
@@ -161,7 +206,11 @@ def account_row(ctx: AppContext, acc: Any, logged: bool, record: Any) -> Row:
 def build_tab(ctx: AppContext) -> Tab:
     def build() -> View:
         entries = load(ctx)
-        rows = [account_row(ctx, acc, logged, record) for acc, logged, record in entries]
+        of = memberships(ctx)
+        if len(ctx.projects()) > 1:
+            rows = grouped_rows(ctx, entries, of)
+        else:
+            rows = [account_row(ctx, acc, logged, record, of.get(acc.id, [])) for acc, logged, record in entries]
         if not rows:
             rows = [Row("add", [Cell(icon("add"), "", 3), Cell("добавить аккаунт", "accent")],
                         hint="Добавить аккаунты: строки «почта пароль 2FA» или файл", enter=lambda: add_field(ctx))]
@@ -177,7 +226,8 @@ def build_tab(ctx: AppContext) -> Tab:
         )
 
     def warn() -> bool:
-        return any(acc.is_active and (not logged or record is None) for acc, logged, record in load(ctx))
+        of = memberships(ctx)
+        return any(acc.is_active and (not logged or record is None or not of.get(acc.id)) for acc, logged, record in load(ctx))
 
     return Tab("Аккаунты", icon("tab_accounts"), build, warn)
 
@@ -199,6 +249,7 @@ def account_menu(ctx: AppContext, account_id: int) -> Step:
         return Notice("warn", "Аккаунт не найден")
     proxies = {p.id: p for p in ctx.db(lambda db: db.list_proxies())}
     proxy_text, proxy_style, proxy_words = proxy_cell(acc, proxies.get(acc.proxy_id))
+    in_projects = memberships(ctx).get(account_id, [])
     mode = AccountLifecycleEngine.mode_of(acc)
     modes = [MODE_LABELS[m].lower() for m in _MODES]
 
@@ -231,6 +282,10 @@ def account_menu(ctx: AppContext, account_id: int) -> Step:
             hint="Войти автоматически или вручную, проверить вход, выйти", enter=lambda: login_menu(ctx, account_id)),
         Row("m-rename", [Cell(icon("rename"), "", 3), Cell("переименовать")],
             hint="Имя для вас: ник или почта", enter=lambda: rename_field(ctx, account_id)),
+        Row("m-projects", [Cell(icon("project"), "", 3), Cell("проекты", "", 14),
+                           Cell(str(len(in_projects)) if in_projects else "нет", "" if in_projects else "warn")],
+            hint=("В проектах: " + ", ".join(p.name for p in in_projects) if in_projects else NO_PROJECT) + " · Enter — список",
+            enter=lambda: Screen(lambda: account_projects_view(ctx, account_id))),
     ]
     if acc.consecutive_errors >= CIRCUIT_BREAKER_ERRORS:
         rows.append(Row("m-release", [Cell(icon("stopped"), "", 3), Cell("снять ограничение", "warn")],
@@ -240,6 +295,34 @@ def account_menu(ctx: AppContext, account_id: int) -> Step:
 
 def _menu_or_empty(step: Step) -> Menu:
     return step if isinstance(step, Menu) else Menu([])
+
+
+def account_projects_view(ctx: AppContext, account_id: int) -> View:
+    """The projects with ▣ (the account is in it) / ▢: Enter or Space toggles."""
+    acc = _fresh(ctx, account_id)
+    if acc is None:
+        return View(rows=[Row("none", [Cell("Аккаунт не найден", "warn")], selectable=False)])
+    inside = {p.id for p in memberships(ctx).get(account_id, [])}
+
+    def toggle(project: Any) -> Callable[[], Notice]:
+        def run() -> Notice:
+            if project.id in inside:
+                ctx.db(lambda db: db.remove_project_accounts(project.id, [account_id]))
+                return Notice("ok", f"«{acc.name}» вышел из «{project.name}»")
+            ctx.db(lambda db: db.add_project_accounts(project.id, [account_id]))
+            return Notice("ok", f"«{acc.name}» в проекте «{project.name}»")
+
+        return run
+
+    rows = [Row(f"p{p.id}", [Cell("▣" if p.id in inside else "▢", "ok" if p.id in inside else "dim", 3),
+                             Cell(p.name, "", 20, grow=True), Cell("" if p.enabled else "пропуск", "dim")],
+                hint=("в проекте · Enter — убрать" if p.id in inside else "не в проекте · Enter — добавить"),
+                enter=toggle(p), space=toggle(p))
+            for p in ctx.projects()]
+    if not rows:
+        rows.append(Row("empty", [Cell("проектов нет", "dim")], selectable=False))
+    top = [] if inside else [[Cell(icon("project"), "", 3), Cell(NO_PROJECT, "warn")]]
+    return View(rows=rows, top=top, title=[Cell(f"{acc.name} › проекты")], keys="Enter/Пробел — добавить/убрать")
 
 
 def warm_now(ctx: AppContext, account_id: int) -> Step:
@@ -684,9 +767,15 @@ def register(ctx: AppContext, lines: list[str], mode: str, total: int) -> Step:
     if not result.added:
         return Notice("warn", fit(text, 74))
     names = [a.name for a in result.added]
+
+    def warm_then_remind() -> Notice:
+        done = warm_selected(ctx, names)
+        return Notice(done.kind, fit(f"{done.text} · {NEW_WITHOUT_PROJECT}", 110))
+
+    # decision 7: a new account joins no project — say it in the notice that closes the adding
     return Confirm([Cell(fit(text + ". Войти и прогреть сейчас?", 60), "ok")], ["Позже", "Войти и прогреть"],
-                   lambda i: Run(lambda: warm_selected(ctx, names), f"{icon('warmup')} Вход и прогрев · {len(names)} акк.")
-                   if i == 1 else Notice("ok", fit(text, 74)))
+                   lambda i: Run(warm_then_remind, f"{icon('warmup')} Вход и прогрев · {len(names)} акк.")
+                   if i == 1 else Notice("ok", fit(f"{text} · {NEW_WITHOUT_PROJECT}", 110)))
 
 
 def warm_selected(ctx: AppContext, names: list[str]) -> Notice:
@@ -738,5 +827,30 @@ def bulk_menu(ctx: AppContext, ids: list[int]) -> Menu:
             enter=choices("автопрогрев", [("вкл", {"auto_warmup": True}), ("выкл", {"auto_warmup": False})])),
         Row("b-proxy", [Cell(icon("tab_proxies"), "", 3), Cell("прокси…")], hint=f"Один прокси для {n} акк.",
             enter=lambda: proxy_menu(ctx, ids[0], accounts=ids)),
+        Row("b-project-add", [Cell(icon("project"), "", 3), Cell("добавить в проект…")], hint=f"{n} акк. — в проект",
+            enter=lambda: projects_menu(ctx, ids, add=True)),
+        Row("b-project-remove", [Cell(icon("project"), "", 3), Cell("убрать из проекта…")], hint=f"{n} акк. — из проекта",
+            enter=lambda: projects_menu(ctx, ids, add=False)),
         Row("b-warm-now", [Cell(icon("warmup"), "", 3), Cell("прогреть сейчас")], hint="Вход (если нужен) и прогрев", enter=warm),
     ])
+
+
+def projects_menu(ctx: AppContext, ids: list[int], add: bool) -> Step:
+    """Pick the project the marked accounts join (or leave)."""
+    projects = ctx.projects()
+    if not projects:
+        return Notice("warn", "Проектов нет: вкладка «Проекты»")
+
+    def change(project: Any) -> Callable[[], Notice]:
+        def run() -> Notice:
+            if add:
+                count = ctx.db(lambda db: db.add_project_accounts(project.id, ids))
+                return Notice("ok", f"В «{project.name}» добавлено {count} из {len(ids)} акк.")
+            count = ctx.db(lambda db: db.remove_project_accounts(project.id, ids))
+            return Notice("ok" if count else "info", f"Из «{project.name}» убрано {count} из {len(ids)} акк.")
+
+        return run
+
+    return Menu([Row(f"bp-{p.id}", [Cell(icon("project"), "", 3), Cell(p.name, "", 20), Cell(f"{icon('tab_accounts')} {p.accounts_count}", "dim")],
+                     hint=("Добавить в" if add else "Убрать из") + f" «{p.name}» · {len(ids)} акк.", enter=change(p))
+                 for p in projects])
