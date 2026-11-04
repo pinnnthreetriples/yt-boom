@@ -15,6 +15,7 @@ from database import (
     AccountRecord,
     ActivityLogCreate,
     Database,
+    ProjectRecord,
     VideoPoolItem,
 )
 from modules.account_warmer import AccountWarmer
@@ -23,11 +24,11 @@ from modules.geo_guard import warn_if_exit_mismatch
 from modules.interaction_simulator import InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine, explain_block
 from modules.pool_manager import PoolManager
-from modules.projects import project_seed
+from modules.projects import REFERENCE_LINKS, project_config, project_seed
 from modules.proxy_library import sync_config_accounts
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
 from modules.ui_test_runner import SubmissionResult
-from modules.youtube_collector import YouTubeCollector, empty_search_hint, extract_video_id
+from modules.youtube_collector import YouTubeCollector, empty_search_hint, extract_video_id, title_keywords
 from modules.youtube_runner import YouTubeRunner
 
 
@@ -39,12 +40,25 @@ class SearchRunResult(NamedTuple):
     replies: int
 
 
+class ProjectRunResult(NamedTuple):
+    """Outcome of one project's run: accounts that could post, videos taken (found + own links), replies posted
+    (or simulated), and why it was skipped ("" when it ran)."""
+
+    project: str
+    accounts: int
+    found: int
+    replies: int
+    skipped: str = ""
+
+
 class MultiAccountOrchestrator:
     """
     Posts replies under the video pool with several YouTube accounts:
     `concurrency` accounts (or videos) at a time, account_mode "each" / "share",
     error isolation per account and video.
     """
+
+    _project: ProjectRecord | None = None  # set per instance; the class default keeps a run without projects
 
     def __init__(
         self,
@@ -61,16 +75,20 @@ class MultiAccountOrchestrator:
         runner_factory: Callable[[AccountRecord], Any] | None = None,
         warmer: AccountWarmer | None = None,
         visibility_checker: CommentVisibilityChecker | None = None,
+        project: ProjectRecord | None = None,
+        claimed: set[str] | None = None,
     ) -> None:
-        if isinstance(config_or_path, AppConfig):
-            self._cfg = config_or_path
-        else:
-            self._cfg = load_config(config_or_path)
+        """`project`: run only its members, its video pool and its target / replies (`project_config`); None keeps
+        the run without projects (every active account, every pool). `claimed`: the comments taken earlier in the
+        same launch (shared by the projects run one after another: one comment gets one reply from the whole bot)."""
+        base = config_or_path if isinstance(config_or_path, AppConfig) else load_config(config_or_path)
+        self._project = project
+        self._cfg = project_config(base, project) if project is not None else base
 
         if headless is not None:
             self._cfg.browser.headless = headless
 
-        self._db = db or Database(self._cfg.app.db_path, project_seed=project_seed(self._cfg))
+        self._db = db or Database(self._cfg.app.db_path, project_seed=project_seed(base))
         self._concurrency = max(1, concurrency)
         self._semaphore = asyncio.Semaphore(self._concurrency)
         self._dry_run = dry_run
@@ -111,9 +129,10 @@ class MultiAccountOrchestrator:
         self._in_flight: dict[int, int] = defaultdict(int)
         self._account_offset: int = 0
         # Comments taken in this run: parallel accounts must not pick the same one before its payload exists.
-        self._claimed: set[str] = set()
+        self._claimed: set[str] = claimed if claimed is not None else set()
         self._skipped_logged: set[int] = set()
         self._lifecycle_logged: set[tuple[int, str]] = set()
+        self._project_logged: set[int] = set()
         self._warmer = warmer or AccountWarmer(self._cfg.browser, simulator=self._simulator, rng=self._rng)
         self._warmup_tasks: dict[int, asyncio.Task[Any]] = {}
         self._warmup_failed_at: dict[int, datetime] = {}
@@ -149,6 +168,14 @@ class MultiAccountOrchestrator:
     @property
     def pool_manager(self) -> PoolManager:
         return self._pool_mgr
+
+    @property
+    def project(self) -> ProjectRecord | None:
+        return self._project
+
+    @property
+    def _project_id(self) -> int | None:
+        return self._project.id if self._project is not None else None
 
     async def ensure_db(self) -> None:
         """Ensure database connection and schema initialization."""
@@ -250,6 +277,24 @@ class MultiAccountOrchestrator:
             self._schedule_warmup(acc)
         return False
 
+    async def _passes_project_gate(self, acc: AccountRecord) -> bool:
+        """The project's own daily ceiling for this account (`daily_per_account`); always true without a project.
+
+        It comes on top of the account's lifecycle limits: an account answers only when both let it.
+        """
+        if self._project is None:
+            return True
+        quota = await self._db.project_daily_gate(self._project.id, acc.id)
+        if quota.allowed:
+            return True
+        if acc.id not in self._project_logged:
+            self._project_logged.add(acc.id)
+            reason = (
+                f"в проекте сегодня {quota.done}/{quota.limit}" if quota.limit is not None else "не участник проекта"
+            )
+            logger.warning("[ПРОЕКТ] {} · {}: пропущен — {}", self._project.name, acc.name, reason)
+        return False
+
     def _schedule_warmup(self, acc: AccountRecord) -> None:
         """Start a background warm-up unless one runs already, the last one is under 4 h old, or this is a dry run.
 
@@ -329,13 +374,19 @@ class MultiAccountOrchestrator:
         fresh = await self._db.get_account(acc.id)
         if fresh is not None and not fresh.is_active:  # switched off in the wizard while the run was going
             return False
-        return fresh is None or await self._passes_lifecycle_gate(fresh)
+        if fresh is not None and not await self._passes_lifecycle_gate(fresh):
+            return False
+        return await self._passes_project_gate(fresh or acc)
 
     async def _usable_accounts(self) -> list[AccountRecord]:
-        """Active accounts that can post: sign-in not failed, not waiting for a first sign-in, allowed by their age."""
-        accounts = await self._db.list_active_accounts()
-        if not accounts:
-            accounts = await self.sync_accounts_from_config()
+        """Active accounts that can post: sign-in not failed, not waiting for a first sign-in, allowed by their age
+        (and, in a project, its members only, within the project's daily ceiling)."""
+        if self._project is not None:
+            accounts = await self._db.list_project_accounts(self._project.id, active_only=True)
+        else:
+            accounts = await self._db.list_active_accounts()
+            if not accounts:
+                accounts = await self.sync_accounts_from_config()
         for acc in [acc for acc in accounts if acc.proxy_unavailable]:  # fail closed: never post from the own IP
             accounts.remove(acc)
             if acc.id not in self._skipped_logged:
@@ -344,7 +395,10 @@ class MultiAccountOrchestrator:
                     resolve_account_proxy(acc)
                 except ProxyUnavailableError as exc:
                     logger.error("ИНФО | {}", exc)
-        usable = [acc for acc in accounts if self._is_usable(acc) and await self._passes_lifecycle_gate(acc)]
+        usable = [
+            acc for acc in accounts
+            if self._is_usable(acc) and await self._passes_lifecycle_gate(acc) and await self._passes_project_gate(acc)
+        ]
         for acc in accounts:
             if acc not in usable and not self._is_usable(acc) and acc.id not in self._skipped_logged:
                 self._skipped_logged.add(acc.id)
@@ -491,6 +545,8 @@ class MultiAccountOrchestrator:
                                 mode="dry_run" if self._dry_run else "live",
                                 status="failed",
                                 error=f"Reply generation failed: {exc}",
+                                project_id=self._project_id,
+                                account_id=acc.id,
                             )
                         )
                         continue
@@ -529,12 +585,16 @@ class MultiAccountOrchestrator:
                                     mode="dry_run" if self._dry_run else "live",
                                     status="failed",
                                     error=str(exc),
+                                    project_id=self._project_id,
+                                    account_id=acc.id,
                                 )
                             )
                             continue
                         if not self._dry_run:  # inside the lock: the next worker of this account sees it
                             if sub_res.success:
                                 await self._db.record_account_comment_success(acc.id)
+                                if self._project is not None:
+                                    await self._db.bump_project_daily(self._project.id, acc.id)
                             else:
                                 await self._record_error(acc)
 
@@ -556,6 +616,8 @@ class MultiAccountOrchestrator:
                             status=status,
                             error=sub_res.error if not sub_res.success else None,
                             duration_sec=getattr(sub_res, "duration_seconds", None),
+                            project_id=self._project_id,
+                            account_id=acc.id,
                         )
                     )
 
@@ -663,7 +725,7 @@ class MultiAccountOrchestrator:
             return 0
 
         if videos is None:
-            videos = await self._db.list_pool_videos(status="pending", source="links")
+            videos = await self._db.list_pool_videos(status="pending", source="links", project_id=self._project_id)
         if not videos:
             logger.info("ИНФО | Нет видео в пуле для обработки")
             return 0
@@ -723,7 +785,9 @@ class MultiAccountOrchestrator:
         if videos_file is not None:
             v_path = Path(videos_file).expanduser()
             if v_path.exists():
-                await self._pool_mgr.load_videos_from_file(v_path)
+                await self._pool_mgr.load_videos_from_file(
+                    v_path, self._project.comments_per_video if self._project else 2, project_id=self._project_id
+                )
             else:
                 logger.warning("ИНФО | Файл видео не найден: {}", videos_file)
 
@@ -774,11 +838,138 @@ class MultiAccountOrchestrator:
             )
             return SearchRunResult(len(accounts), 0, 0)
 
-        videos = [await self._db.queue_search_video(v["url"], comments_target=comments_per_video) for v in found]
+        videos = [
+            await self._db.queue_search_video(v["url"], comments_target=comments_per_video, project_id=self._project_id)
+            for v in found
+        ]
         for v in found:
             logger.info("▶ Найдено: {!r} (ID: {}, просмотров: {:,})", v.get("title", ""), v["video_id"], v.get("view_count", 0))
         replies = await self.execute_video_pool(videos=videos)
         return SearchRunResult(len(accounts), len(videos), replies)
+
+    # ------------------------------------------------------------------ projects
+
+    async def run_project(self, topics: list[str] | None = None) -> ProjectRunResult:
+        """One project's run: its members only, its filters, its replies. The videos come, in this order, from every
+        topic (`topics` replaces the project's own for this run only), the reference links (similar videos, title
+        words) and the own links still waiting; a video is taken once per run. Then the same reply run as the own
+        links: `concurrency`, account_mode, the lifecycle limits and the project's daily ceiling."""
+        if self._project is None:
+            raise RuntimeError("run_project needs a project")
+        project = self._project
+        await self.ensure_db()
+        accounts = await self._usable_accounts()
+        if not accounts:
+            logger.warning("[ПРОЕКТ] {}: нет аккаунтов, которые могут отвечать сейчас", project.name)
+            await self._finish_warmups()  # the lifecycle gate may have started warm-ups, as in a pool run
+            return ProjectRunResult(project.name, 0, 0, 0, "нет аккаунтов, которые могут отвечать сейчас")
+        logger.info("[ПРОЕКТ] ▶ {} · аккаунтов: {}", project.name, len(accounts))
+        videos = await self._collect_project_videos(project.search_topics if topics is None else topics)
+        if not videos:
+            logger.warning("[ПРОЕКТ] {}: видео не найдено", project.name)
+            return ProjectRunResult(project.name, len(accounts), 0, 0, "видео не найдено")
+        replies = await self.execute_video_pool(videos=videos)
+        return ProjectRunResult(project.name, len(accounts), len(videos), replies)
+
+    async def _collect_project_videos(self, topics: list[str]) -> list[VideoPoolItem]:
+        """The run's videos, unique by video id: topics, then reference links, then the own links waiting."""
+        assert self._project is not None
+        project = self._project
+        taken: dict[str, VideoPoolItem] = {}
+        own = await self._db.list_pool_videos(status="all", source="links", project_id=project.id)
+        own_ids = {video.video_id for video in own}
+        for topic in topics:
+            await self._take_found(taken, await self._search_topic(topic), f"тема «{topic}»")
+        references = sorted(own, key=lambda video: video.id, reverse=True)[:REFERENCE_LINKS]
+        if references and project.use_similar:  # the cap counts new videos only: the taken ones are left out
+            found = await self._similar_videos(references, own_ids | set(taken))
+            await self._take_found(taken, found, "похожие на свои ссылки")
+        if references and project.use_title_words:
+            found = await self._title_word_videos(references, own_ids | set(taken))
+            await self._take_found(taken, found, "слова из названий")
+        waiting = await self._db.list_pool_videos(status="pending", source="links", project_id=project.id)
+        for video in waiting:
+            taken.setdefault(video.video_id, video)
+        if waiting:
+            logger.info("[ПРОЕКТ] {} · свои ссылки: ждут {}", project.name, len(waiting))
+        return list(taken.values())
+
+    def _filters(self) -> dict[str, Any]:
+        col = self._cfg.collector
+        return {"min_views": col.min_views or 0, "max_views": col.max_views, "max_age_hours": col.max_age_hours}
+
+    async def _search_topic(self, query: str, extra: int = 0) -> list[dict[str, Any]]:
+        """A topic search within the project's filters: `max_videos` (+ `extra` that the caller will leave out)."""
+        limit = self._cfg.collector.max_videos + extra
+        try:
+            found = await self._collector.search_videos(query=query, limit=limit, **self._filters())
+        except Exception as exc:  # one topic failing must not stop the project
+            logger.warning("[ПРОЕКТ] Поиск «{}» не удался: {}", query, exc)
+            return []
+        if not found:
+            logger.warning("Не найдено видео по запросу {!r} с заданными фильтрами: {}", query, empty_search_hint(**self._filters()))
+        return found
+
+    async def _similar_videos(self, references: list[VideoPoolItem], exclude: set[str]) -> list[dict[str, Any]]:
+        """Recommendations next to the reference links, at most `max_videos` for the whole run."""
+        limit = self._cfg.collector.max_videos
+        found: list[dict[str, Any]] = []
+        for reference in references:
+            if len(found) >= limit:
+                break
+            try:
+                related = await self._collector.related_videos(
+                    reference.video_id, limit=limit + len(exclude), **self._filters()
+                )
+            except Exception as exc:
+                logger.warning("[ПРОЕКТ] Похожие на {} не получены: {}", reference.video_id, exc)
+                continue
+            self._add_new(found, related, exclude, limit)
+        return found
+
+    async def _title_word_videos(self, references: list[VideoPoolItem], exclude: set[str]) -> list[dict[str, Any]]:
+        """A topic search by the significant words of each reference link's title, at most `max_videos` in total."""
+        limit = self._cfg.collector.max_videos
+        found: list[dict[str, Any]] = []
+        queries: set[str] = set()
+        for reference in references:
+            if len(found) >= limit:
+                break
+            try:
+                query = title_keywords(await self._collector.video_title(reference.video_id))
+            except Exception as exc:
+                logger.warning("[ПРОЕКТ] Название {} не получено: {}", reference.video_id, exc)
+                continue
+            if not query or query.casefold() in queries:
+                logger.info("[ПРОЕКТ] {}: в названии нет слов для поиска, пропуск", reference.video_id)
+                continue
+            queries.add(query.casefold())
+            logger.info("[ПРОЕКТ] Слова из названия {}: «{}»", reference.video_id, query)
+            self._add_new(found, await self._search_topic(query, extra=len(exclude)), exclude, limit)
+        return found
+
+    @staticmethod
+    def _add_new(found: list[dict[str, Any]], videos: list[dict[str, Any]], exclude: set[str], limit: int) -> None:
+        for video in videos:
+            if len(found) >= limit:
+                return
+            if video["video_id"] not in exclude and all(v["video_id"] != video["video_id"] for v in found):
+                found.append(video)
+
+    async def _take_found(self, taken: dict[str, VideoPoolItem], found: list[dict[str, Any]], label: str) -> None:
+        """Queue found videos into the project's pool for this run (a video already taken is skipped)."""
+        assert self._project is not None
+        added = 0
+        for video in found:
+            if video["video_id"] in taken:
+                continue
+            taken[video["video_id"]] = await self._db.queue_search_video(
+                video["url"], comments_target=self._cfg.collector.comments_per_video, project_id=self._project.id
+            )
+            added += 1
+            logger.info("▶ Найдено ({}): {!r} (ID: {}, просмотров: {:,})", label, video.get("title", ""),
+                        video["video_id"], video.get("view_count", 0))
+        logger.info("[ПРОЕКТ] {} · {}: новых видео {}", self._project.name, label, added)
 
     async def close(self) -> None:
         """Close account browsers, collector and database connections."""
@@ -806,4 +997,6 @@ class MultiAccountOrchestrator:
 
 __all__ = [
     "MultiAccountOrchestrator",
+    "ProjectRunResult",
+    "SearchRunResult",
 ]

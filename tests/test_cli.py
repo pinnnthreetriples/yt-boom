@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import yaml
+from types import SimpleNamespace
 
 from config import load_config
 from database import Database
@@ -366,20 +367,17 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
         with open(self.config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(cfg_mod, f)
 
+        # Without --search / --video / --account a run goes through the projects «в запуске» (the topic of
+        # config.yaml lives in the project «Основной» since the migration); the global search is not used.
         with patch.object(sys, "argv", ["youtube_bot.py", "--config", str(self.config_path), "--dry-run"]), \
-             patch("youtube_bot.run_search_cli", new_callable=AsyncMock) as mock_cfg_multi:
+             patch("youtube_bot.run_search_cli", new_callable=AsyncMock) as mock_cfg_multi, \
+             patch("youtube_bot.run_projects_cli", new_callable=AsyncMock) as mock_projects:
+            mock_projects.return_value = SimpleNamespace(stopped_at=None)
             bot_main()
-            mock_cfg_multi.assert_called_once_with(
-                "topic from config",
-                str(self.config_path),
-                min_views=0,
-                max_views=None,
-                max_age_hours=None,
-                max_videos=5,
-                comments_per_video=7,
-                target_mode="sub_comment",
-                dry_run=True,
-                **run_defaults,
+            mock_cfg_multi.assert_not_called()
+            mock_projects.assert_called_once_with(
+                str(self.config_path), None, dry_run=True, headless=None, concurrency=None, account_mode=None,
+                topics=None,
             )
 
         # Test --headless flag passes headless=True
