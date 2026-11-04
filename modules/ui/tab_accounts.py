@@ -144,7 +144,7 @@ def account_row(ctx: AppContext, acc: Any, logged: bool, record: Any) -> Row:
         [
             Cell(icon(state_icon), "", 3),
             Cell(acc.name, "dim" if not acc.is_active else "", 17),
-            Cell(proxy, proxy_style, 21),
+            Cell(proxy, proxy_style, 21, grow=True),
             Cell(icon(stage_icon), "", 3),
             Cell(pie, "accent", 2),
             Cell(icon("warmup") if acc.auto_warmup else "", "", 3),
@@ -406,7 +406,7 @@ def proxy_menu(ctx: AppContext, account_id: int, accounts: list[int] | None = No
 
         rows.append(Row(
             f"p{record.id}",
-            [Cell(icon(state), "", 3), Cell(f"{country} {record.address}", "", 26), Cell("● сейчас" if record.id == current else "", "dim")],
+            [Cell(icon(state), "", 3), Cell(f"{country} {record.address}", "", 26, grow=True), Cell("● сейчас" if record.id == current else "", "dim")],
             hint=f"{country} {record.address} · аккаунтов {record.accounts_count}" + (" · ищет видео" if record.is_search else ""),
             enter=assign,
         ))
@@ -415,7 +415,7 @@ def proxy_menu(ctx: AppContext, account_id: int, accounts: list[int] | None = No
         names = ctx.db(lambda db: db.clear_account_proxy(targets))
         return Notice("warn", f"Без прокси — пишут с вашего IP: {len(names) or len(targets)} акк.")
 
-    rows.append(Row("p-none", [Cell(icon("own_ip"), "", 3), Cell("без прокси · свой IP", "warn", 26),
+    rows.append(Row("p-none", [Cell(icon("own_ip"), "", 3), Cell("без прокси · свой IP", "warn", 26, grow=True),
                                Cell("● сейчас" if current is None else "", "dim")],
                     hint="Свой IP — без прокси", enter=direct))
     rows.append(Row("p-new", [Cell(icon("add"), "", 3), Cell("вставить новый", "accent")],

@@ -16,7 +16,8 @@ from typing import Callable, Union
 
 from prompt_toolkit.utils import get_cwidth
 
-WIDTH = 76
+BASE_WIDTH = 76  # the layout is drawn for this many columns
+WIDTH = BASE_WIDTH  # run_shell stretches it to the window; cells marked `grow` take the extra room
 
 Frag = tuple[str, str]  # (style names, text)
 
@@ -26,6 +27,7 @@ class Cell:
     text: str
     style: str = ""
     width: int = 0  # columns the cell takes; 0 = its own width
+    grow: bool = False  # a wide window adds its extra columns to this cell (a long text column)
 
 
 @dataclass
@@ -154,8 +156,9 @@ def cells_frags(cells: list[Cell], extra_style: str = "") -> list[Frag]:
     for i, cell in enumerate(cells):
         text = cell.text
         if cell.width:
-            text = fit(text, cell.width - 1)  # a cut text never touches the next column
-            text += " " * (cell.width - width(text))
+            cols = cell.width + (max(0, WIDTH - BASE_WIDTH) if cell.grow else 0)
+            text = fit(text, cols - 1)  # a cut text never touches the next column
+            text += " " * (cols - width(text))
         elif i < len(cells) - 1:
             text += " "
         style = " ".join(f"class:{s}" for s in f"{cell.style} {extra_style}".split())
@@ -633,8 +636,8 @@ HELP: list[tuple[str, str]] = [
 
 STYLE = {
     "ok": "ansigreen", "warn": "ansiyellow", "err": "ansired bold", "dim": "ansibrightblack",
-    "accent": "ansicyan", "key": "ansiyellow bold", "marker": "ansicyan bold", "selected": "bold",
-    "tab": "", "tab-on": "reverse bold", "cursor": "ansicyan",
+    "accent": "ansicyan", "key": "ansiyellow bold", "marker": "ansicyan bold", "selected": "bg:#3a3a3a",
+    "tab": "", "tab-on": "bg:#4e4e4e", "cursor": "ansicyan",
 }
 
 
@@ -642,11 +645,9 @@ def run_shell(controller: Controller, on_run: Callable[[Run], Step], clear: Call
     """Show the shell until Q; a `Run` step leaves the menu, runs through `on_run` and comes back."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from prompt_toolkit.application import Application
+    from prompt_toolkit.application import get_app
     from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
     from prompt_toolkit.keys import Keys
-    from prompt_toolkit.layout import HSplit, Layout, Window
-    from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.styles import Style
 
     from modules.tui import normalize_key
@@ -684,11 +685,37 @@ def run_shell(controller: Controller, on_run: Callable[[Run], Step], clear: Call
         elif len(data) > 1 and controller.edit:  # a paste without bracketed paste mode
             feed("paste:" + data, event)
 
+    def draw() -> list[Frag]:
+        global WIDTH
+        try:
+            WIDTH = max(BASE_WIDTH, get_app().output.get_size().columns - 1)
+        except Exception:
+            WIDTH = BASE_WIDTH
+        # a row's details (Space) may read the database through asyncio.run, too: draw outside the event loop
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(render, controller).result()
+
     style = Style.from_dict(STYLE)
+    try:
+        _loop(controller, on_run, clear, kb, style, draw)
+    finally:
+        _reset_width()
+
+
+def _reset_width() -> None:
+    global WIDTH
+    WIDTH = BASE_WIDTH
+
+
+def _loop(controller: Controller, on_run: Callable[[Run], Step], clear: Callable[[], None], kb, style, draw) -> None:
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.layout import HSplit, Layout, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+
     while not controller.quit:
         clear()
         app: Application[None] = Application(
-            layout=Layout(HSplit([Window(FormattedTextControl(lambda: render(controller), show_cursor=False),
+            layout=Layout(HSplit([Window(FormattedTextControl(draw, show_cursor=False),
                                          dont_extend_height=True, wrap_lines=False)])),
             key_bindings=kb, style=style, full_screen=False, mouse_support=False, erase_when_done=True,
         )

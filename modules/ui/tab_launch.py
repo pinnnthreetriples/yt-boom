@@ -52,7 +52,7 @@ def _record_cells(rec: tuple[Any, ...], with_date: bool = False) -> list[Cell]:
     return [
         Cell(icon(name), "", 3),
         Cell(_time(created, with_date), "dim", 12 if with_date else 6),
-        Cell(" ".join(str(text).split()), "err" if status == "failed" else "dim", 46),
+        Cell(" ".join(str(text).split()), "err" if status == "failed" else "dim", 46, grow=True),
     ]
 
 
