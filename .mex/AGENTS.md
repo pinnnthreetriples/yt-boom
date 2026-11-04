@@ -1,7 +1,7 @@
 ---
 name: agents
 description: Always-loaded project anchor. Read this first. Contains project identity, non-negotiables, commands, and pointer to ROUTER.md for full context.
-last_updated: 2026-11-03
+last_updated: 2026-11-04
 ---
 
 # YouTube Comment Replier & Telemetry Pipeline
@@ -14,16 +14,17 @@ An automated Python 3.11+ web testing and telemetry pipeline driving persistent 
 - Never store raw passwords or TOTP secrets in SQLite — all credentials must be encrypted via Windows DPAPI (`secret_store.protect_secret()`).
 - Never force single-process Gecko (`dom.ipc.processCount: 1`) or disable Fission in Camoufox — multi-process is strictly required for YouTube Polymer rendering.
 - Always use asynchronous APIs (`aiosqlite`, `AsyncCamoufox`, `asyncio`) — blocking calls in the main event loop are prohibited.
-- Always verify all 761 project unit and integration tests pass (`python run_tests.py`) before completing tasks.
+- Always verify all project unit and integration tests pass (`python run_tests.py`) before completing tasks.
 
 ## Commands
 - Run all tests: `python run_tests.py`
-- Launch the console interface (five tabs «Запуск» / «Аккаунты» / «Прокси» / «Цель» / «Ответы»): `python youtube_bot.py` (or `python youtube_bot.py --wizard`); accounts are added, imported, warmed up and configured in the «Аккаунты» tab
+- Launch the console interface (six tabs «Запуск» / «Аккаунты» / «Прокси» / «Проекты» / «Цель» / «Ответы»): `python youtube_bot.py` (or `python youtube_bot.py --wizard`); accounts are added, imported, warmed up and configured in the «Аккаунты» tab
 - Publish the saved channel profile (nickname, description, avatar): `python youtube_bot.py --apply-profile <name>`; edit it in the «Аккаунты» tab → account menu → «Профиль канала»
 - Authenticate single account: `python youtube_bot.py --auth-account <name>`
 - Batch import accounts: `python youtube_bot.py --import-accounts-file <path>`
 - List accounts: `python youtube_bot.py --list-accounts`
-- Multi-video search & reply: `python youtube_bot.py --search "<topic>" --min-views 10000 --max-views 500000 --dry-run` (all active accounts, like own links; filters / `--max-videos` / `--comments-per-video` default to `collector.*`, `--max-views 0` / `--max-age-hours 0` turn a limit off, `--account NAME` = only that account)
+- Run / search & reply: `python youtube_bot.py --dry-run` runs the projects «в запуске» one after another, `--project NAME` only that one; `python youtube_bot.py --search "<topic>" --dry-run` without `--project` is the old global search (all active accounts, filters / `--max-videos` / `--comments-per-video` default to `collector.*`, `--max-views 0` / `--max-age-hours 0` turn a limit off, `--account NAME` = only that account); with `--project` the topic replaces the project's topics for this run only
+- Projects: `python youtube_bot.py --list-projects`, `--project-add NAME`, `--project-accounts NAME acc1,acc2`, `--project-remove-account NAME acc`; `--videos-file FILE` loads into `--project` (default «Основной»)
 - Check database status: `python youtube_bot.py --status`
 - MEX memory check: `mex doctor` and `mex check`
 

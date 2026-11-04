@@ -282,6 +282,7 @@ async def add_account_cli(
             f"[OK] Account {account.name!r} registered successfully "
             f"(id={account.id}, session={account.session_path}, proxy={mask_proxy_url(account.proxy_url) or 'direct'})"
         )
+        await _warn_without_project(db, [account])
     finally:
         await db.close()
 
@@ -372,6 +373,7 @@ async def add_credentials_account_cli(
             f"country={account.expected_country or '-'}, locale={account.locale or '-'}). "
             f"Next: --auth-account {account.name}"
         )
+        await _warn_without_project(db, [account])
         return True
 
 
@@ -572,6 +574,7 @@ async def import_accounts_file_cli(
         for number, reason in imported.errors:
             print(f"[ERROR] line {number}: {reason}", file=sys.stderr)
         print(f"[OK] Registered {len(registered)} account(s), skipped {failed_lines} invalid line(s)")
+        await _warn_without_project(db, list(registered.values()))
 
         queue = [a for a in registered.values() if force or a.auth_status != "authenticated"]
         if len(queue) < len(registered):
@@ -907,9 +910,10 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
         if not accounts:
             print("  No accounts found in database or configuration.")
         else:
+            in_projects = await _projects_by_account(db)
             header = (
                 f"{'ID':<4} | {'Name':<16} | {'Status':<8} | {'Auth':<13} | {'Geo':<12} | {'Exp':<3} | {'Locale':<7} | {'Replies':<8} | "
-                f"{'Email':<24} | {'Proxy':<30} | {'Session Path'}"
+                f"{'Email':<24} | {'Proxy':<30} | {'Projects':<20} | {'Session Path'}"
             )
             print(header)
             print("-" * 123)
@@ -932,6 +936,7 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
                     f"{acc.total_replies:<8} | "
                     f"{mask_email(acc.email):<24} | "
                     f"{proxy_display:<30} | "
+                    f"{(', '.join(in_projects.get(acc.id, [])) or '— без проекта')[:20]:<20} | "
                     f"{acc.session_path}"
                 )
                 print(row)
@@ -951,6 +956,97 @@ async def _project_by_name(db: Database, name: str | None) -> ProjectRecord | No
         hint = "" if name else " — укажите проект: --project ИМЯ"
         logger.error("Проект «{}» не найден{} (проекты: {})", wanted, hint, names)
     return project
+
+
+# --------------------------------------------------------------------------- projects (CLI)
+
+
+async def _warn_without_project(db: Database, accounts: Iterable[AccountRecord]) -> None:
+    """Decision of the projects: a new account joins no project and does not work until it does — say so."""
+    loose = [account.name for account in accounts if not await db.projects_of_account(account.id)]
+    if loose:
+        print(
+            f"[!] Без проекта (не работают, пока не добавлены в проект): {', '.join(loose)} — "
+            f"--project-accounts ПРОЕКТ {','.join(loose)} или вкладка «Проекты»"
+        )
+
+
+async def _projects_by_account(db: Database) -> dict[int, list[str]]:
+    names: dict[int, list[str]] = {}
+    for project in await db.list_projects():
+        for account in await db.list_project_accounts(project.id):
+            names.setdefault(account.id, []).append(project.name)
+    return names
+
+
+async def print_projects_table(config_path: str = "config.yaml") -> None:
+    """`--list-projects`: every project in queue order with its launch flag, members, topics, links and replies."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        projects = await db.list_projects()
+        print("\n" + "=" * 90)
+        print("                        ПРОЕКТЫ (по порядку запуска)")
+        print("=" * 90)
+        print(f"{'ID':<4} | {'Название':<24} | {'Запуск':<6} | {'Акк.':<4} | {'Тем':<3} | {'Ссылки':<9} | {'Ответы':<14} | Лимит")
+        print("-" * 90)
+        for p in projects:
+            replies = "ИИ" if p.reply_mode == "ai" else f"шаблоны {len(p.custom_replies)}"
+            print(
+                f"{p.id:<4} | {p.name[:24]:<24} | {'да' if p.enabled else 'нет':<6} | {p.accounts_count:<4} | "
+                f"{len(p.search_topics):<3} | {f'{p.links_waiting}/{p.links_total}':<9} | {replies:<14} | "
+                f"{p.daily_per_account or '-'}"
+            )
+        print("=" * 90 + "\n")
+
+
+async def project_add_cli(name: str, config_path: str = "config.yaml") -> bool:
+    """`--project-add NAME`: a new project (AI replies, no topics, no accounts) at the end of the queue."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        try:
+            project = await db.create_project(name)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return False
+    print(f"[OK] Проект «{project.name}» создан (id={project.id}). Аккаунты: --project-accounts \"{project.name}\" acc1,acc2")
+    return True
+
+
+async def _project_and_accounts(db: Database, name: str, accounts: str) -> tuple[ProjectRecord, list[AccountRecord]] | None:
+    project = await db.get_project_by_name(name)
+    if project is None:
+        print(f"[ERROR] Проект «{name}» не найден (--list-projects)", file=sys.stderr)
+        return None
+    found: list[AccountRecord] = []
+    for identifier in [part.strip() for part in accounts.split(",") if part.strip()]:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Аккаунт {identifier!r} не найден (--list-accounts)", file=sys.stderr)
+            return None
+        found.append(account)
+    if not found:
+        print("[ERROR] Аккаунты не указаны: имена через запятую", file=sys.stderr)
+        return None
+    return project, found
+
+
+async def project_accounts_cli(name: str, accounts: str, config_path: str = "config.yaml", add: bool = True) -> bool:
+    """`--project-accounts NAME acc1,acc2` adds the accounts to the project; `--project-remove-account` takes them out.
+    Nothing changes when the project or one of the accounts is unknown."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        resolved = await _project_and_accounts(db, name, accounts)
+        if resolved is None:
+            return False
+        project, found = resolved
+        ids = [account.id for account in found]
+        if add:
+            changed = await db.add_project_accounts(project.id, ids)
+            print(f"[OK] «{project.name}»: добавлено {changed} из {len(ids)} (уже были: {len(ids) - changed})")
+        else:
+            changed = await db.remove_project_accounts(project.id, ids)
+            print(f"[OK] «{project.name}»: убрано {changed} из {len(ids)}")
+    return True
 
 
 async def run_video_pool_cli(
@@ -2016,6 +2112,7 @@ async def print_activity_history(
     await db.init_schema()
     try:
         entries = await db.list_activity_logs(page=1, page_size=limit, status_filter=status_filter)
+        project_names = {p.id: p.name for p in await db.list_projects()}
         print("\n" + "=" * 90)
         print("                        ЖУРНАЛ ОТРАБОТОК (ACTIVITY AUDIT LOG)")
         print("=" * 90)
@@ -2024,15 +2121,16 @@ async def print_activity_history(
             print("=" * 90 + "\n")
             return
 
-        header = f"{'ID':<5} | {'Время (UTC)':<19} | {'Статус':<9} | {'Режим':<7} | {'Автор':<15} | {'Видео':<12} | {'Ответ (фрагмент)'}"
+        header = f"{'ID':<5} | {'Время (UTC)':<19} | {'Статус':<9} | {'Режим':<7} | {'Проект':<12} | {'Автор':<15} | {'Видео':<12} | {'Ответ (фрагмент)'}"
         print(header)
         print("-" * 90)
         for e in entries:
             t = e.created_at[:19].replace("T", " ") if e.created_at else "---"
+            project = "—" if e.project_id is None else project_names.get(e.project_id, "удалён")
             author = (e.target_author or "@unknown")[:14]
             vid = (e.video_title or e.video_id)[:11]
             reply = (e.reply_text or e.error or "")[:25].replace("\n", " ")
-            print(f"{e.id:<5} | {t:<19} | {e.status:<9} | {e.mode:<7} | {author:<15} | {vid:<12} | {reply}...")
+            print(f"{e.id:<5} | {t:<19} | {e.status:<9} | {e.mode:<7} | {project[:12]:<12} | {author:<15} | {vid:<12} | {reply}...")
         print("=" * 90 + "\n")
     finally:
         await db.close()
@@ -2128,7 +2226,11 @@ def main() -> None:
     parser.add_argument("--auto-warmup", nargs=2, default=None, metavar=("NAME", "on|off"), help="Allow (on) or forbid (off) the background warm-up of the account during a run")
     parser.add_argument("--set-active", nargs=2, default=None, metavar=("NAME", "on|off"), help="Put the account in work (on) or switch it off (off): runs skip it and it is not warmed up")
     parser.add_argument("--reset-restricted", type=str, default=None, metavar="NAME", help="Lift the circuit breaker of a restricted account (3 errors in a row)")
-    parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
+    parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats and projects from DB")
+    parser.add_argument("--list-projects", action="store_true", help="List the projects in launch order: in the launch, accounts, topics, links, replies, daily limit")
+    parser.add_argument("--project-add", type=str, default=None, metavar="NAME", help="Create a project (AI replies, no topics, no accounts)")
+    parser.add_argument("--project-accounts", nargs=2, default=None, metavar=("NAME", "ACC1,ACC2"), help="Add accounts (names or emails, comma-separated) to a project")
+    parser.add_argument("--project-remove-account", nargs=2, default=None, metavar=("NAME", "ACC"), help="Take accounts (comma-separated) out of a project")
     parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt): the links go into --project (default «Основной») and that project runs its waiting links")
     parser.add_argument("--project", type=str, default=None, metavar="NAME", help="Run only this project (its topics, reference links and own links, its accounts and replies); without it a run with no --search/--video/--account goes through every project «в запуске» one after another. With --search: the topic replaces the project's topics for this run only (nothing is saved)")
     parser.add_argument("--concurrency", "-j", type=int, default=None, help="Accounts working at the same time (default: limits.max_concurrent_sessions)")
@@ -2190,6 +2292,17 @@ def main() -> None:
     if args.list_accounts:
         asyncio.run(print_accounts_table(args.config))
         return
+
+    if args.list_projects:
+        asyncio.run(print_projects_table(args.config))
+        return
+
+    if args.project_add:
+        sys.exit(0 if asyncio.run(project_add_cli(args.project_add, args.config)) else 1)
+
+    for pair, add in ((args.project_accounts, True), (args.project_remove_account, False)):
+        if pair:
+            sys.exit(0 if asyncio.run(project_accounts_cli(pair[0], pair[1], args.config, add=add)) else 1)
 
     if args.add_account:
         account_spec: str = args.add_account
