@@ -98,8 +98,29 @@ _TRANSLIT = {
     "х": "x", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sh", "э": "e", "ю": "u", "я": "ya",
 }
 _CYRILLIC_WORD = re.compile(r"(?<![\w@#])[а-яёА-ЯЁ]{4,}(?!\w)")
-_PROTECTED_SPAN = re.compile(r"@[\w.\-]+|(?:https?://|www\.)\S+|#\w+")
+# Never touched: @mentions, links with a scheme or www, #hashtags and any whitespace-delimited token with a dot
+# followed by a letter or a slash (bare links like vk.com/путь and Cyrillic domains like привет.рф).
+_PROTECTED_SPAN = re.compile(r"@[\w.\-]+|(?:https?://|www\.)\S+|#\w+|\S*\.(?=[^\W\d_]|/)\S*")
+_NON_RUSSIAN_CYRILLIC = re.compile(r"[іїєґўІЇЄҐЎ]")
+_CYRILLIC_LETTER = re.compile(r"[а-яёА-ЯЁіїєґўІЇЄҐЎ]")
 _HARD_LETTERS = re.compile(r"[ьъыЬЪЫ]")
+
+
+# Common Ukrainian words that have none of the special letters ("Дякую дуже гарно"): a text with one is not Russian.
+_UKRAINIAN_WORDS = frozenset(
+    "дякую дякуємо дуже гарно добре як це ви що який яка яке які якщо також тільки мені тобі цей ця".split()
+)
+
+
+def _is_clearly_russian(text: str) -> bool:
+    """Russian text: Cyrillic letters are the majority, no Ukrainian / Belarusian letter (і ї є ґ ў), no typical word."""
+    if _NON_RUSSIAN_CYRILLIC.search(text):
+        return False
+    if _UKRAINIAN_WORDS.intersection(re.findall(r"[а-яё]+", text.lower())):
+        return False
+    cyrillic = len(_CYRILLIC_LETTER.findall(text))
+    letters = sum(1 for c in text if c.isalpha())
+    return cyrillic > 0 and cyrillic * 2 > letters
 
 
 def _translit_chunk(chunk: str, *, capitalize: bool, upper: bool) -> str:
@@ -121,11 +142,19 @@ def mix_latin(
     alphabets. With the given probability per message one word (rarely two) gets a 2-4 letter prefix or suffix
     transliterated. Words with ь/ъ/ы, @mentions, #hashtags, URLs and non-Cyrillic text are left alone; a result
     longer than `max_length` (transliteration can lengthen a word) is discarded and the text returned unchanged.
+    Only Russian messages are mixed: one with Ukrainian / Belarusian letters, or where Cyrillic is not the majority
+    of the letters (an English message with one Russian word), stays as it is; so do links without a scheme.
     """
     generator = rng or random.Random()
     if probability <= 0 or generator.random() >= probability:
         return text
     protected = [m.span() for m in _PROTECTED_SPAN.finditer(text)]
+    keep = [True] * len(text)
+    for a, b in protected:
+        keep[a:b] = [False] * (b - a)
+    unprotected = "".join(c for c, k in zip(text, keep) if k)
+    if not _is_clearly_russian(unprotected):
+        return text
     words = [
         m
         for m in _CYRILLIC_WORD.finditer(text)
@@ -258,8 +287,11 @@ class DeepSeekProcessor:
     async def close(self) -> None:
         await self._client.close()
 
-    async def paraphrase(self, text: str) -> str:
+    async def paraphrase(self, text: str, *, source: str | None = None) -> str:
         """Reword `text` keeping its meaning, with one retry when the result is unusable or a near-copy.
+
+        `source` is the raw template before {placeholders} were filled: the language of the rewrite follows its own
+        wording, not a quoted comment that got substituted into it.
 
         A variant is unusable when it is empty, too long, drops a mention, or reaches SIMILARITY_LIMIT against the
         template or a recently produced variant. When no usable variant comes out (API error, two bad results) the
@@ -272,10 +304,14 @@ class DeepSeekProcessor:
         if forced != "auto":
             name = _LANGUAGE_NAMES.get(forced, forced.upper())
             template_rule = f"Write the rewrite ONLY in {name}. If the text is in another language, translate it into {name}."
-        elif _CYRILLIC.search(text):
+        elif _is_clearly_russian(source if source is not None else text):
             template_rule = "The text is in Russian. Write the rewrite ONLY in Russian, never in English, and never translate it."
         else:
             template_rule = "Write the rewrite in the exact same language as the text. Never translate it."
+            if source is not None and source != text:
+                template_rule += (
+                    " The language is decided by the wording of the template itself, not by a quoted comment inside it."
+                )
         for attempt in (1, 2):
             prompt = f"Comment:\n{text}"
             if self._recent_variants:
