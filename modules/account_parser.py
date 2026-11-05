@@ -93,10 +93,15 @@ def _mode_field(mode: str | None) -> str | None:
     return value
 
 
-def _free_form_to_colon_line(text: str) -> str:
+_PASSWORD_STAND_IN = "x"  # colon-free placeholder: the free-form password is put back after the colon form is parsed
+
+
+def _free_form_to_colon_line(text: str) -> tuple[str, str]:
     """`email password [totp] [recovery@mail] [proxy] [country=PL] [locale=pl-PL]` (spaces/tabs, any order after the
-    password) -> the colon form. Extra fields are told apart by shape: a proxy has `://` or `host:port`, the recovery
-    e-mail has '@', `country=` / `locale=` / `mode=` are keys, anything else is the TOTP secret (groups like `JBSW Y3DP` are joined).
+    password) -> (the colon form with `_PASSWORD_STAND_IN` as the password, the real password). Extra fields are told
+    apart by shape: a proxy has `://` or `host:port`, the recovery e-mail has '@', `country=` / `locale=` / `mode=`
+    are keys, anything else is the TOTP secret (groups like `JBSW Y3DP` are joined). The password is a whole token,
+    so it may hold colons, which the colon form would otherwise split into a "TOTP secret".
     """
     tokens = text.split()
     if len(tokens) < 2 or "@" not in tokens[0]:
@@ -119,12 +124,12 @@ def _free_form_to_colon_line(text: str) -> str:
             recovery_email = token
         else:
             secret_parts.append(token)
-    pieces = [email, password, "".join(secret_parts)]
+    pieces = [email, _PASSWORD_STAND_IN, "".join(secret_parts)]
     if recovery_email is not None or proxy is not None:
         pieces.append(recovery_email or "")
     if proxy is not None:
         pieces.append(proxy)
-    return ":".join([*pieces, *geo])
+    return ":".join([*pieces, *geo]), password
 
 
 def parse_account_line(
@@ -146,8 +151,9 @@ def parse_account_line(
     text = line.strip()
     if not text:
         raise ValueError("пустая строка аккаунта")
+    free_form_password: str | None = None
     if not _EMAIL_PREFIX.match(text) and re.search(r"\s", text):
-        text = _free_form_to_colon_line(text)
+        text, free_form_password = _free_form_to_colon_line(text)
     email, separator, rest = text.partition(":")
     email = email.strip()
     if not separator or "@" not in email:
@@ -164,7 +170,8 @@ def parse_account_line(
     tail = _PROXY_TAIL.search(rest)
     if tail:
         candidates.append((rest[: tail.start()], tail.group(1)))
-    candidates.append((rest, None))  # no proxy in the line (or the "proxy" was part of the password)
+    if not (tail and free_form_password is not None):  # free form: the proxy token was already told apart by shape
+        candidates.append((rest, None))  # no proxy in the line (or the "proxy" was part of the password)
 
     first_error: ValueError | None = None
     for body, line_proxy in candidates:
@@ -178,7 +185,7 @@ def parse_account_line(
             continue
         return ParsedAccount(
             email=email,
-            password=password,
+            password=free_form_password if free_form_password is not None else password,
             totp_secret=totp_secret,
             recovery_email=recovery_email,
             proxy=effective_proxy,

@@ -20,6 +20,11 @@ from secret_store import SecretStoreError, protect_secret, reveal_secret
 
 NodeStatus = Literal["idle", "busy", "cooldown", "disabled"]
 PayloadStatus = Literal["pending", "submitted", "validated", "failed"]
+
+# A failed payload whose error starts with this mark is a target YouTube gives no Reply button (replies off for that
+# comment): every account sees the same, so it is skipped by every later run instead of being retried for a minute each.
+REPLY_UNAVAILABLE_MARK = "reply_unavailable"
+REPLY_UNAVAILABLE_TTL_SECONDS = 7 * 24 * 3600.0
 QueueStatus = Literal["queued", "running", "done", "failed"]
 QueueKind = Literal["submit", "validate"]
 ActivityMode = Literal["live", "dry_run"]
@@ -219,6 +224,11 @@ _ACTIVITY_PROJECT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("account_id", "INTEGER REFERENCES accounts(id) ON DELETE SET NULL"),
 )
 
+# Result of the anonymous visibility check of a published reply (NULL = never checked). Written after the insert,
+# by `Database.set_activity_visibility`; observability only, it never touches `status` or any counter.
+_ACTIVITY_VISIBILITY_COLUMNS: tuple[tuple[str, str], ...] = (("visibility", "TEXT"),)
+VISIBILITY_STATES: tuple[str, ...] = ("seen", "unseen", "unknown")
+
 _ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
     ("email", "TEXT"),
     ("password", "TEXT"),
@@ -397,6 +407,7 @@ class ActivityLogEntry(BaseModel):
     payload_id: int | None = None
     project_id: int | None = None
     account_id: int | None = None
+    visibility: str | None = None  # seen / unseen / unknown; None = the reply was not checked
 
 
 class ActivityLogCreate(BaseModel):
@@ -1035,7 +1046,7 @@ class Database:
     async def _ensure_activity_columns(self, conn: aiosqlite.Connection) -> None:
         """Incremental migration: the journal records the project and the account of each reply."""
         existing = await self._columns(conn, "activity_log")
-        for column, ddl in _ACTIVITY_PROJECT_COLUMNS:
+        for column, ddl in (*_ACTIVITY_PROJECT_COLUMNS, *_ACTIVITY_VISIBILITY_COLUMNS):
             if column not in existing:
                 try:
                     await conn.execute(f"ALTER TABLE activity_log ADD COLUMN {column} {ddl}")
@@ -1415,6 +1426,15 @@ class Database:
             rows = await cursor.fetchall()
             await cursor.close()
 
+            cursor = await conn.execute(
+                "SELECT 1 FROM payloads WHERE source_ref = ? AND status = 'failed' AND error LIKE ? AND created_at > ? LIMIT 1",
+                (source_ref, f"{REPLY_UNAVAILABLE_MARK}%", now - REPLY_UNAVAILABLE_TTL_SECONDS),
+            )
+            no_reply_button = await cursor.fetchone()
+            await cursor.close()
+            if no_reply_button is not None:
+                return None
+
             for row in rows:
                 status = row["status"]
                 if status in ("submitted", "validated"):
@@ -1479,7 +1499,41 @@ class Database:
             "SELECT COUNT(*) FROM payloads WHERE source_ref = ? AND status IN ('pending', 'submitted', 'validated')",
             (source_ref,),
         )
+        if count > 0:
+            return True
+        # a target without a Reply button counts as handled too: no account can answer it
+        return await self.is_reply_unavailable(source_ref)
+
+    async def is_reply_unavailable(self, source_ref: str) -> bool:
+        """True when a recent run found that YouTube hides the Reply button on this comment."""
+        count = await self._count(
+            "SELECT COUNT(*) FROM payloads WHERE source_ref = ? AND status = 'failed' AND error LIKE ? AND created_at > ?",
+            (source_ref, f"{REPLY_UNAVAILABLE_MARK}%", time.time() - REPLY_UNAVAILABLE_TTL_SECONDS),
+        )
         return count > 0
+
+    async def mark_reply_unavailable(
+        self,
+        *,
+        node_id: int | None = None,
+        source_ref: str,
+        language: str = "en",
+        source_text: str | None = None,
+        reason: str = "",
+    ) -> None:
+        """Remember a target without a Reply button (a failed payload carrying REPLY_UNAVAILABLE_MARK)."""
+        if not source_ref or not source_ref.strip():
+            raise ValueError("source_ref must not be empty")
+        now = time.time()
+        error = _truncate(f"{REPLY_UNAVAILABLE_MARK}: {reason}".strip(": "))
+        async with self._transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO payloads (node_id, source_ref, source_text, text, language, status, error, created_at, validated_at)
+                VALUES (?, ?, ?, '', ?, 'failed', ?, ?, ?)
+                """,
+                (node_id, source_ref, source_text, language, error, now, now),
+            )
 
     async def list_payloads(self, status: PayloadStatus | None = None, limit: int = 50) -> list[Payload]:
         if limit < 1:
@@ -1848,6 +1902,13 @@ class Database:
         if row is None:
             raise RecordNotFoundError(f"activity_log {log_id} not found")
         return ActivityLogEntry.model_validate(dict(row))
+
+    async def set_activity_visibility(self, log_id: int, state: str) -> None:
+        """Store the visibility check result of one journal record; a record that is gone is a silent no-op."""
+        if state not in VISIBILITY_STATES:
+            raise ValueError(f"visibility must be one of {VISIBILITY_STATES}, got {state!r}")
+        async with self._transaction() as conn:
+            await conn.execute("UPDATE activity_log SET visibility = ? WHERE id = ?", (state, log_id))
 
     async def count_successful_replies_for_video(self, video_id: str, status: str | None = None) -> int:
         """Count replies successfully submitted or simulated for a specific video."""

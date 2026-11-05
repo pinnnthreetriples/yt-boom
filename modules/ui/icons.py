@@ -53,6 +53,9 @@ _ICONS: dict[str, tuple[str, str]] = {
     "videos": ("🎬", "▤"),
     "clock": ("🕒", "◷"),
     "journal": ("📜", "≡"),
+    # visibility check of a published reply: seen by anonymous visitors / not confirmed
+    "seen": ("🟢", "●"),
+    "unseen": ("🟡", "!"),
     # target and replies
     "topic": ("🔍", "?"),
     "links": ("🔗", "&"),
