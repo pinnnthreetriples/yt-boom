@@ -1329,6 +1329,8 @@ async def run_search_cli(
         dry_run=dry_run,
         headless=headless,
         account_mode=account_mode,
+        custom_reply=custom_reply,  # an explicit text bypasses the template deck
+        deck_project_id=await _deck_project_id(db),  # the project whose templates this run uses: same deck as --video
     )
     try:
         return await orchestrator.run_search(

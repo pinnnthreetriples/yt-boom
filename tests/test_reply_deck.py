@@ -427,7 +427,9 @@ class TestDeckInOrchestrator(unittest.IsolatedAsyncioTestCase):
         except Exception:
             pass
 
-    async def build(self, behaviour, *, dry_run: bool, vid: str) -> tuple[MultiAccountOrchestrator, list[str]]:
+    async def build(
+        self, behaviour, *, dry_run: bool, vid: str, custom_reply: str | None = None
+    ) -> tuple[MultiAccountOrchestrator, list[str]]:
         """An orchestrator whose runner calls `behaviour(text)` (returns a result, raises, or blocks)."""
         posted: list[str] = []
 
@@ -461,7 +463,7 @@ class TestDeckInOrchestrator(unittest.IsolatedAsyncioTestCase):
         await self.db.add_video_to_pool(f"https://www.youtube.com/watch?v={vid}", comments_target=1)
         orchestrator = MultiAccountOrchestrator(
             self.config, db=self.db, concurrency=1, account_mode="share", collector=collector,
-            runner_factory=factory, rng=random.Random(11), dry_run=dry_run,
+            runner_factory=factory, rng=random.Random(11), dry_run=dry_run, custom_reply=custom_reply,
         )
         return orchestrator, posted
 
@@ -555,6 +557,55 @@ class TestDeckInOrchestrator(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(orchestrator._deck._reserved.get("acc_1"))
 
 
+    async def test_an_explicit_custom_reply_is_posted_without_touching_the_deck(self) -> None:
+        self.config.processor.custom_replies = ["Explicit text"]  # as run_search_cli does for --custom-reply
+
+        async def success(text):
+            return SubmissionResult(success=True, remote_id="rem", duration_seconds=0.05)
+
+        messages: list[str] = []
+        sink = logger.add(lambda m: messages.append(str(m)), level="WARNING")
+        try:
+            posted_all: list[str] = []
+            for vid in ("vid_expl0001", "vid_expl0002"):
+                orchestrator, posted = await self.build(success, dry_run=False, vid=vid, custom_reply="Explicit text")
+                orchestrator._deck.draw = AsyncMock(side_effect=AssertionError("an explicit reply must not use the deck"))
+                await orchestrator.execute_video_pool(max_comments_per_video=1)
+                posted_all += posted
+        finally:
+            logger.remove(sink)
+        self.assertEqual(posted_all, ["Explicit text", "Explicit text"])
+        self.assertEqual(await self.db.deck_snapshot("acc_1"), ([], None))
+        self.assertFalse([m for m in messages if "только один" in m])
+
+    async def test_parallel_workers_of_one_account_are_not_serialized_by_an_explicit_reply(self) -> None:
+        # two videos at once, one account, ONE template in the list: through the deck the second worker would wait
+        # for the first one's post; with an explicit reply neither of them waits for a card
+        self.config.processor.custom_replies = ["Explicit text"]
+
+        async def success(text):
+            await asyncio.sleep(0.05)
+            return SubmissionResult(success=True, remote_id="rem", duration_seconds=0.05)
+
+        orchestrator, posted = await self.build(success, dry_run=False, vid="vid_par00001", custom_reply="Explicit text")
+        orchestrator._concurrency = 2
+        orchestrator._semaphore = asyncio.Semaphore(2)
+        draws = AsyncMock(side_effect=AssertionError("the deck must not be asked"))
+        orchestrator._deck.draw = draws
+        await self.db.add_video_to_pool("https://www.youtube.com/watch?v=vid_par00002", comments_target=1)
+
+        async def fetch(video_url, limit=4, target_mode="first_reply"):
+            vid = video_url.split("v=")[-1]
+            return [CollectedItem(endpoint=f"youtube:{vid}", external_id=f"{vid}#root#c", text="Cool video",
+                                  language="en", confidence=0.95, source_url=video_url, author="viewer",
+                                  video_id=vid, like_count=3)]
+
+        orchestrator._collector.fetch_popular_comments = AsyncMock(side_effect=fetch)
+        await orchestrator.execute_video_pool(max_comments_per_video=1)
+        self.assertEqual(sorted(posted), ["Explicit text"] * 2)
+        draws.assert_not_called()
+
+
 class TestDeckInYoutubeBot(unittest.IsolatedAsyncioTestCase):
     """run_reply_bot / run_multi_video_pipeline: a template leaves the deck only after a post that really happened."""
 
@@ -576,6 +627,7 @@ class TestDeckInYoutubeBot(unittest.IsolatedAsyncioTestCase):
         data["custom_replies"] = data["processor"]["custom_replies"] = ["First template", "Second template"]
         data["processor"]["paraphrase_custom"] = False
         data["processor"]["latin_mix_probability"] = 0.0
+        data["browser"]["accounts"] = []  # the search run must pick the account made by the --video run, nobody else
         self.config_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
         self.runs = 0
 
@@ -591,7 +643,7 @@ class TestDeckInYoutubeBot(unittest.IsolatedAsyncioTestCase):
         finally:
             await db.close()
 
-    async def run_bot(self, which: str, outcome, *, dry_run: bool = False) -> list[str]:
+    async def run_bot(self, which: str, outcome, *, dry_run: bool = False, account_name: str | None = None) -> list[str]:
         """Run one reply with the runner answering `outcome` (a result, or an exception to raise); returns the texts."""
         from contextlib import ExitStack
 
@@ -629,7 +681,7 @@ class TestDeckInYoutubeBot(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(p)
             if which == "single":
                 await run_reply_bot("https://www.youtube.com/watch?v=dQw4w9WgXcQ", config_path=str(self.config_path),
-                                    target_mode="raw", limit=1, dry_run=dry_run)
+                                    target_mode="raw", limit=1, dry_run=dry_run, account_name=account_name)
             else:
                 await run_multi_video_pipeline("python", config_path=str(self.config_path), max_videos=1,
                                                comments_per_video=1, dry_run=dry_run)
@@ -658,6 +710,62 @@ class TestDeckInYoutubeBot(unittest.IsolatedAsyncioTestCase):
 
     async def test_multi_video_paths(self) -> None:
         await self.check_paths("multi")
+
+    async def run_search(self, *, custom_reply: str | None = None) -> list[str]:
+        """`--search` through the accounts (run_search_cli) with a runner that always posts; returns the texts."""
+        from youtube_bot import run_search_cli
+
+        self.runs += 1
+        vid = f"srch{self.runs:07d}"
+        item = CollectedItem(
+            endpoint=f"youtube:{vid}", external_id=f"{vid}#c1", text="Great breakdown!", language="en",
+            confidence=0.99, author="@fan", is_reply=False,
+        )
+        sent: list[str] = []
+
+        async def fake_run(self_runner, text, **kwargs):
+            sent.append(text)
+            return SubmissionResult(success=True, remote_id=f"rem{self.runs}", duration_seconds=0.1)
+
+        found = [{"video_id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "title": "Topic", "view_count": 5000}]
+        with patch("modules.youtube_runner.YouTubeRunner.run", fake_run), \
+             patch("asyncio.sleep", new_callable=AsyncMock), \
+             patch("modules.youtube_collector.YouTubeCollector.search_videos", new_callable=AsyncMock, return_value=found), \
+             patch("modules.youtube_collector.YouTubeCollector.fetch_popular_comments",
+                   new_callable=AsyncMock, return_value=[item]):
+            await run_search_cli("topic", str(self.config_path), min_views=0, max_views=None, max_age_hours=None,
+                                 max_videos=1, comments_per_video=1, dry_run=False, custom_reply=custom_reply)
+        return sent
+
+    async def all_deck_rows(self) -> list[tuple]:
+        db = Database(self.db_path)
+        await db.connect()
+        try:
+            return [tuple(r) for r in await db._fetch_all("SELECT account, scope, template, used FROM reply_deck")]
+        finally:
+            await db.close()
+
+    async def test_search_and_video_runs_share_one_deck_per_account(self) -> None:
+        first = await self.run_bot("single", SubmissionResult(success=True, remote_id="v1", duration_seconds=0.1),
+                                   account_name="acc_1")
+        second = await self.run_search()  # the other entry point, the same account and the same template list
+        self.assertEqual(len(first) + len(second), 2)
+        rows = await self.all_deck_rows()
+        self.assertEqual({r[1] for r in rows}, {"p1"}, rows)  # one scope for both entry points
+        self.assertEqual({r[0] for r in rows}, {"acc_1"})
+        self.assertEqual(sorted(r[2] for r in rows if r[3]), ["First template", "Second template"])
+        self.assertEqual(len(set(first + second)), 2)  # the search run took the card the --video run had left
+
+    async def test_an_explicit_custom_reply_bypasses_the_deck(self) -> None:
+        messages: list[str] = []
+        sink = logger.add(lambda m: messages.append(str(m)), level="WARNING")
+        try:
+            sent = await self.run_search(custom_reply="Explicit text")
+        finally:
+            logger.remove(sink)
+        self.assertEqual(sent, ["Explicit text"])
+        self.assertEqual(await self.all_deck_rows(), [])  # no deck rows at all
+        self.assertFalse([m for m in messages if "только один" in m])  # and no single-template warning
 
     async def test_dry_run_never_burns(self) -> None:
         for which in ("single", "multi"):

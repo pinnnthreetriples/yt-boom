@@ -90,11 +90,15 @@ class MultiAccountOrchestrator:
         project: ProjectRecord | None = None,
         claimed: set[str] | None = None,
         warmups: WarmupLedger | None = None,
+        custom_reply: str | None = None,
+        deck_project_id: int | None = None,
     ) -> None:
         """`project`: run only its members, its video pool and its target / replies (`project_config`); None keeps
         the run without projects (every active account, every pool). `claimed`: the comments taken earlier in the
         same launch (shared by the projects run one after another: one comment gets one reply from the whole bot).
-        `warmups`: the warm-ups of that launch (shared the same way)."""
+        `warmups`: the warm-ups of that launch (shared the same way). `custom_reply`: one explicit text sent as it is
+        (`--custom-reply`): it bypasses the template deck. `deck_project_id`: the project whose templates a run
+        without `project` uses (`--search`), so its template decks are the ones the other entry points use."""
         base = config_or_path if isinstance(config_or_path, AppConfig) else load_config(config_or_path)
         self._project = project
         self._cfg = project_config(base, project) if project is not None else base
@@ -108,7 +112,8 @@ class MultiAccountOrchestrator:
         self._dry_run = dry_run
         self._account_mode = account_mode or self._cfg.limits.account_mode
         self._rng = rng or random.Random()
-        self._deck = ReplyDeck(self._db, self._rng, project_id=self._project_id)
+        self._custom_reply = (custom_reply or "").strip() or None
+        self._deck = ReplyDeck(self._db, self._rng, project_id=self._project_id or deck_project_id)
         # the search proxy lives in the database: `ensure_db` sets it on the collector made here
         self._own_collector = collector is None
         self._collector = collector or YouTubeCollector(self._cfg.collector, None)
@@ -568,6 +573,7 @@ class MultiAccountOrchestrator:
                                 account=acc.name,
                                 text_settings=self._cfg.processor,
                                 processor=self._processor,
+                                custom_reply=self._custom_reply,
                                 custom_replies=getattr(self._cfg.processor, "custom_replies", None),
                                 dry_run=self._dry_run,
                                 rng=self._rng,
