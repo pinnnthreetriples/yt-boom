@@ -23,7 +23,8 @@ from modules.interaction_simulator import InteractionConfig, InteractionSimulato
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.profile_manager import ProfileEditor
-from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
+from modules.processor import DeepSeekProcessor, should_paraphrase
+from modules.reply_deck import ReplyDeck, prepare_reply
 from modules.session_heartbeat import check_account_heartbeat, check_session_offline, HeartbeatStatus
 from modules.youtube_collector import YouTubeCollector, extract_video_id
 from modules.youtube_runner import YouTubeRunner
@@ -856,6 +857,7 @@ async def run_reply_bot(
         if effective_mode == "ai" or should_paraphrase(cfg.deepseek, cfg.processor)
         else None
     )
+    deck = ReplyDeck(db, rng)
     simulator = InteractionSimulator(rng=rng)
 
     session_dir: str | Path | None = None
@@ -965,16 +967,21 @@ async def run_reply_bot(
                 logger.info("   ↳ в ответ на {}: {!r}", p_auth, item.parent_text[:60])
 
             # Generate response via DeepSeek or resolve custom text
+            deck_card = None  # the custom template taken from this account's deck; burned only after a real post
             try:
                 if effective_mode == "custom":
-                    reply_text = resolve_reply_text(
+                    prepared = await prepare_reply(
                         item,
+                        deck=deck,
+                        account=resolved_acc_name,
+                        text_settings=cfg.processor,
+                        processor=processor,
                         custom_reply=custom_reply,
                         custom_replies=getattr(cfg.processor, "custom_replies", None),
+                        dry_run=dry_run,
                         rng=rng,
                     )
-                    if processor is not None:
-                        reply_text = await processor.paraphrase(reply_text)
+                    reply_text, deck_card = prepared.text, prepared.card
                     logger.success("💬 НАШ ОТВЕТ: «{}»", reply_text)
                 else:
                     reply_text = await processor.generate(item)
@@ -1011,6 +1018,7 @@ async def run_reply_bot(
                     payload_id=None,
                     dry_run=True,
                 )
+                await deck.settle(deck_card, posted=False)  # a dry run never burns a template
                 status = "simulated" if sub_res.success else "failed"
                 await db.log_activity(
                     ActivityLogCreate(
@@ -1043,6 +1051,7 @@ async def run_reply_bot(
                         dry_run=False,
                     )
                 except Exception as exc:
+                    await deck.settle(deck_card, posted=False)
                     await db.mark_payload_failed(payload.id, f"Execution failed: {exc}")
                     await db.log_activity(
                         ActivityLogCreate(
@@ -1064,6 +1073,7 @@ async def run_reply_bot(
                     continue
 
                 if sub_res.success:
+                    await deck.settle(deck_card, posted=True)  # really posted: the template leaves the deck
                     if acc_record is not None:
                         await db.increment_account_stats(acc_record.id, replies=1)
                     await db.mark_payload_submitted(payload.id, sub_res.remote_id)
@@ -1086,6 +1096,7 @@ async def run_reply_bot(
                     logger.success("Ответ успешно опубликован и сохранен в базе (ID={})", sub_res.remote_id)
                     processed += 1
                 else:
+                    await deck.settle(deck_card, posted=False)
                     await db.mark_payload_failed(payload.id, sub_res.error or "submission failed")
                     await db.log_activity(
                         ActivityLogCreate(
@@ -1181,6 +1192,7 @@ async def run_multi_video_pipeline(
         if effective_mode == "ai" or should_paraphrase(cfg.deepseek, cfg.processor)
         else None
     )
+    deck = ReplyDeck(db, rng)
     simulator = InteractionSimulator(rng=rng)
 
     session_dir: str | Path | None = None
@@ -1331,16 +1343,21 @@ async def run_multi_video_pipeline(
                     p_auth = format_author(item.parent_author) if item.parent_author else "unknown"
                     logger.info("   ↳ в ответ на {}: {!r}", p_auth, item.parent_text[:60])
 
+                deck_card = None  # the custom template taken from this account's deck; burned only after a real post
                 try:
                     if effective_mode == "custom":
-                        reply_text = resolve_reply_text(
+                        prepared = await prepare_reply(
                             item,
+                            deck=deck,
+                            account=resolved_acc_name,
+                            text_settings=cfg.processor,
+                            processor=processor,
                             custom_reply=custom_reply,
                             custom_replies=getattr(cfg.processor, "custom_replies", None),
+                            dry_run=dry_run,
                             rng=rng,
                         )
-                        if processor is not None:
-                            reply_text = await processor.paraphrase(reply_text)
+                        reply_text, deck_card = prepared.text, prepared.card
                         logger.success("💬 НАШ ОТВЕТ: «{}»", reply_text)
                     else:
                         reply_text = await processor.generate(item)
@@ -1376,6 +1393,7 @@ async def run_multi_video_pipeline(
                         payload_id=None,
                         dry_run=True,
                     )
+                    await deck.settle(deck_card, posted=False)  # a dry run never burns a template
                     status = "simulated" if sub_res.success else "failed"
                     await db.log_activity(
                         ActivityLogCreate(
@@ -1409,6 +1427,7 @@ async def run_multi_video_pipeline(
                             dry_run=False,
                         )
                     except Exception as exc:
+                        await deck.settle(deck_card, posted=False)
                         await db.mark_payload_failed(payload.id, f"Execution failed: {exc}")
                         await db.log_activity(
                             ActivityLogCreate(
@@ -1430,6 +1449,7 @@ async def run_multi_video_pipeline(
                         continue
 
                     if sub_res.success:
+                        await deck.settle(deck_card, posted=True)  # really posted: the template leaves the deck
                         if acc_record is not None:
                             await db.increment_account_stats(acc_record.id, replies=1)
                         await db.mark_payload_submitted(payload.id, sub_res.remote_id)
@@ -1453,6 +1473,7 @@ async def run_multi_video_pipeline(
                         processed_for_video += 1
                         total_replies += 1
                     else:
+                        await deck.settle(deck_card, posted=False)
                         await db.mark_payload_failed(payload.id, sub_res.error or "submission failed")
                         await db.log_activity(
                             ActivityLogCreate(

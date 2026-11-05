@@ -24,6 +24,7 @@ from modules.interaction_simulator import InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine
 from modules.pool_manager import PoolManager
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
+from modules.reply_deck import ReplyDeck, prepare_reply
 from modules.ui_test_runner import SubmissionResult
 from modules.youtube_collector import YouTubeCollector, extract_video_id
 from modules.youtube_runner import YouTubeRunner
@@ -66,6 +67,7 @@ class MultiAccountOrchestrator:
         self._dry_run = dry_run
         self._account_mode = account_mode or self._cfg.limits.account_mode
         self._rng = rng or random.Random()
+        self._deck = ReplyDeck(self._db, self._rng)
         self._collector = collector or YouTubeCollector(self._cfg.collector, self._cfg.browser.proxy)
         self._processor = processor or (
             DeepSeekProcessor(self._cfg.deepseek, self._cfg.processor, rng=self._rng)
@@ -432,6 +434,7 @@ class MultiAccountOrchestrator:
 
                 self._in_flight[acc.id] += 1
                 posted = False
+                deck_card = None  # custom template drawn from this account's deck; burned only after a real post
                 try:
                     logger.info(
                         "🎯 Цель: {} — {!r} (аккаунт: {!r})",
@@ -444,19 +447,22 @@ class MultiAccountOrchestrator:
                     effective_mode = getattr(self._cfg.processor, "reply_mode", "ai")
                     try:
                         if effective_mode == "custom":
-                            reply_text = resolve_reply_text(
+                            # the template comes from this account's deck; it is burned only after a real post
+                            prepared = await prepare_reply(
                                 it,
-                                custom_reply=None,
+                                deck=self._deck,
+                                account=acc.name,
+                                text_settings=self._cfg.processor,
+                                processor=self._processor,
                                 custom_replies=getattr(self._cfg.processor, "custom_replies", None),
+                                dry_run=self._dry_run,
                                 rng=self._rng,
                             )
-                            if self._processor is not None:
-                                reply_text = await self._processor.paraphrase(reply_text)
+                            reply_text, deck_card = prepared.text, prepared.card
+                        elif self._processor is not None:
+                            reply_text = await self._processor.generate(it)
                         else:
-                            if self._processor is not None:
-                                reply_text = await self._processor.generate(it)
-                            else:
-                                reply_text = resolve_reply_text(it, rng=self._rng)
+                            reply_text = resolve_reply_text(it, rng=self._rng)
                         logger.info("💬 НАШ ОТВЕТ ({!r}): «{}»", acc.name, reply_text)
                     except Exception as exc:
                         logger.error("ОШИБКА | Сбой подготовки ответа: {}", exc)
@@ -515,6 +521,7 @@ class MultiAccountOrchestrator:
                         if not self._dry_run:  # inside the lock: the next worker of this account sees it
                             if sub_res.success:
                                 await self._db.record_account_comment_success(acc.id)
+                                await self._deck.settle(deck_card, posted=True)
                             else:
                                 await self._record_error(acc)
 
@@ -586,6 +593,7 @@ class MultiAccountOrchestrator:
                             sub_res.error,
                         )
                 finally:
+                    await self._deck.settle(deck_card, posted=False)  # no-op once burned; frees the card otherwise
                     self._in_flight[acc.id] -= 1
                     if not posted:  # a failed comment stays free for another account
                         self._claimed.discard(it.external_id)

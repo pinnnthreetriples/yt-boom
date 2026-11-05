@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
+import random
 import re
 import time
 from collections.abc import AsyncIterator
@@ -129,6 +130,23 @@ CREATE TABLE IF NOT EXISTS video_pool (
 CREATE INDEX IF NOT EXISTS idx_accounts_name ON accounts(name);
 CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active);
 CREATE INDEX IF NOT EXISTS idx_video_pool_status ON video_pool(status, id);
+"""
+
+# Per-account "deck" of custom reply templates: `reply_deck` holds the current shuffled round (pos = order of the cards
+# still unused, used = 1 once the template was really posted), `reply_deck_state` the last template the account posted.
+_REPLY_DECK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS reply_deck (
+    account  TEXT    NOT NULL,
+    template TEXT    NOT NULL,
+    pos      INTEGER NOT NULL DEFAULT 0,
+    used     INTEGER NOT NULL DEFAULT 0 CHECK (used IN (0, 1)),
+    PRIMARY KEY (account, template)
+);
+
+CREATE TABLE IF NOT EXISTS reply_deck_state (
+    account       TEXT PRIMARY KEY,
+    last_template TEXT
+);
 """
 
 _ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -488,6 +506,7 @@ class Database:
                 await conn.execute("PRAGMA user_version = 2")
                 await conn.commit()
             await conn.executescript(_MULTI_ACCOUNT_SCHEMA)
+            await conn.executescript(_REPLY_DECK_SCHEMA)
             await self._ensure_account_columns(conn)
             await conn.commit()
         logger.debug("Database schema ensured at {}", self._path)
@@ -1385,10 +1404,82 @@ class Database:
                 if taken:
                     raise ValueError(f"account {new_name!r} already exists")
                 await conn.execute("UPDATE accounts SET name = ? WHERE id = ?", (new_name, row["id"]))
+                # the template deck follows the account (a leftover deck of the new name belongs to a deleted account)
+                await conn.execute("DELETE FROM reply_deck WHERE account = ?", (new_name,))
+                await conn.execute("DELETE FROM reply_deck_state WHERE account = ?", (new_name,))
+                await conn.execute("UPDATE reply_deck SET account = ? WHERE account = ?", (new_name, old_name))
+                await conn.execute("UPDATE reply_deck_state SET account = ? WHERE account = ?", (new_name, old_name))
                 row = await (await conn.execute("SELECT * FROM accounts WHERE id = ?", (row["id"],))).fetchone()
         account = self._account_from_row(row)
         logger.debug("Renamed account {!r} -> {!r} (id={})", old_name, account.name, account.id)
         return account
+
+    # ------------------------------------------------------------- reply deck
+
+    async def deck_load(
+        self,
+        account: str,
+        templates: list[str],
+        rng: random.Random,
+    ) -> tuple[list[str], bool]:
+        """Bring the account's deck in line with `templates` and return (unused cards in draw order, reshuffled).
+
+        Removed templates drop out, new ones join the unused part at a random place. When no card is left a new
+        deck is shuffled from all templates; its first card differs from the account's last posted template
+        whenever there is more than one template. Nothing is burned here: see `deck_burn`.
+        """
+        if not templates:
+            return [], False
+        wanted = list(dict.fromkeys(templates))
+        reshuffled = False
+        async with self._transaction() as conn:
+            rows = await (
+                await conn.execute("SELECT template, used FROM reply_deck WHERE account = ? ORDER BY pos ASC", (account,))
+            ).fetchall()
+            current = {str(r["template"]): bool(r["used"]) for r in rows}
+            for gone in set(current) - set(wanted):
+                await conn.execute("DELETE FROM reply_deck WHERE account = ? AND template = ?", (account, gone))
+            unused = [str(r["template"]) for r in rows if not r["used"] and str(r["template"]) in wanted]
+            for fresh in (t for t in wanted if t not in current):
+                unused.insert(rng.randint(0, len(unused)), fresh)
+            if not unused:
+                state = await (
+                    await conn.execute("SELECT last_template FROM reply_deck_state WHERE account = ?", (account,))
+                ).fetchone()
+                last = state["last_template"] if state else None
+                unused = list(wanted)
+                rng.shuffle(unused)
+                if len(unused) > 1 and unused[0] == last:
+                    swap = rng.randint(1, len(unused) - 1)
+                    unused[0], unused[swap] = unused[swap], unused[0]
+                reshuffled = True
+            for pos, template in enumerate(unused):
+                await conn.execute(
+                    "INSERT INTO reply_deck (account, template, pos, used) VALUES (?, ?, ?, 0) "
+                    "ON CONFLICT(account, template) DO UPDATE SET pos = excluded.pos, used = 0",
+                    (account, template, pos),
+                )
+        return unused, reshuffled
+
+    async def deck_burn(self, account: str, template: str) -> None:
+        """The template was really posted by `account`: it leaves the deck until the next shuffle."""
+        async with self._transaction() as conn:
+            await conn.execute(
+                "UPDATE reply_deck SET used = 1 WHERE account = ? AND template = ?", (account, template)
+            )
+            await conn.execute(
+                "INSERT INTO reply_deck_state (account, last_template) VALUES (?, ?) "
+                "ON CONFLICT(account) DO UPDATE SET last_template = excluded.last_template",
+                (account, template),
+            )
+
+    async def deck_snapshot(self, account: str) -> tuple[list[tuple[str, bool]], str | None]:
+        """Read-only view: ([(template, used)] in draw order, last posted template)."""
+        rows = await self._fetch_all(
+            "SELECT template, used FROM reply_deck WHERE account = ? ORDER BY used ASC, pos ASC", (account,)
+        )
+        state = await self._fetch_one("SELECT last_template FROM reply_deck_state WHERE account = ?", (account,))
+        return [(str(r["template"]), bool(r["used"])) for r in rows], (state["last_template"] if state else None)
 
     async def get_account(self, account_id_or_name: int | str) -> AccountRecord | None:
         if isinstance(account_id_or_name, int):
