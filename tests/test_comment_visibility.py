@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from curl_cffi.requests.exceptions import RequestException
 
-from modules.comment_visibility import CommentVisibilityChecker, make_visibility_checker
+from modules.comment_visibility import CommentVisibilityChecker, make_visibility_checker, visibility_wait_limit
 
 HTML = '"INNERTUBE_API_KEY":"key123" "INNERTUBE_CLIENT_VERSION":"2.20261101.00.00" lc=Ugx.reply'
 
@@ -123,6 +123,14 @@ class TestCommentVisibilityChecker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((checker._delay, checker._retry_delays), (30.0, (60.0, 90.0)))
         limits.visibility_check_enabled = False
         self.assertIsNone(make_visibility_checker(SimpleNamespace(limits=limits), _collector("{}")))
+
+    def test_wait_limit_covers_every_retry_pause_and_tolerates_stand_ins(self) -> None:
+        checker = CommentVisibilityChecker(_collector("{}"), delay_seconds=45, retry_delays=(120, 300))
+        self.assertEqual(visibility_wait_limit(checker), 45 + 120 + 300 + 60)
+        self.assertEqual(visibility_wait_limit(CommentVisibilityChecker(_collector("{}"), delay_seconds=7)), 67)
+        self.assertEqual(visibility_wait_limit(SimpleNamespace(_delay=0.0)), 60.0)  # no retry list
+        self.assertEqual(visibility_wait_limit(None), 60.0)
+        self.assertEqual(visibility_wait_limit(MagicMock()), 60.0)  # attributes that are not numbers count as 0
 
     async def test_unexpected_errors_never_escape_the_background_task(self) -> None:
         collector = _collector("{}")

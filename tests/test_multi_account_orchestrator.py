@@ -787,6 +787,29 @@ class TestVisibilityHook(TestLifecyclePacing):
         self.assertEqual(checker.watch.await_args_list[0].args, ("lifevid1111", "Ugx.r1", "manual_acc"))
         self.assertEqual((await self.db.get_account(account.id)).consecutive_errors, 0)  # a miss is not an error
 
+    async def test_finishing_the_checks_is_bounded_and_cancels_what_does_not_fit(self) -> None:
+        account = await self._account("manual_acc", None)
+        checker = self._checker(asyncio.Event(), seen=False)  # never released
+        checker._delay, checker._retry_delays = 45.0, (120.0, 300.0)
+        orchestrator = self._watched(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="Ugx.r1", duration_seconds=0.1), checker
+        )
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            await orchestrator._process_video(self.video, 1, account)
+        tasks = list(orchestrator._visibility_tasks)
+        self.assertEqual(len(tasks), 1)
+        real_wait_for = asyncio.wait_for
+        limits: list[float] = []
+
+        async def short(awaitable, timeout):
+            limits.append(timeout)
+            return await real_wait_for(awaitable, 0.05)
+
+        with patch("modules.multi_account_orchestrator.asyncio.wait_for", short):
+            await orchestrator._finish_visibility_checks()
+        self.assertEqual(limits, [45 + 120 + 300 + 60.0])  # delay + every retry pause + a minute of slack
+        self.assertTrue(tasks[0].cancelled())
+
     async def test_the_result_is_written_to_the_journal_record_of_that_reply(self) -> None:
         account = await self._account("manual_acc", None)
         results = iter([True, False, None])

@@ -171,6 +171,19 @@ async def watch_and_record(
         return None
 
 
+def visibility_wait_limit(checker: Any) -> float:
+    """The longest a run may wait for `checker`'s background look: its delay, every retry pause and a minute of slack.
+
+    Reads the numbers defensively: a stand-in checker without them counts as 0 seconds.
+    """
+    delay = getattr(checker, "_delay", 0.0)
+    retries = getattr(checker, "_retry_delays", ())
+    total = float(delay) if isinstance(delay, (int, float)) else 0.0
+    if isinstance(retries, (tuple, list)):
+        total += sum(float(pause) for pause in retries if isinstance(pause, (int, float)))
+    return total + 60.0
+
+
 class VisibilityWatcher:
     """Background checks of one run: schedules `watch_and_record`, waits for them (bounded) or cancels them.
 
@@ -216,7 +229,7 @@ class VisibilityWatcher:
         if not tasks:
             return
         logger.info("[ВИДИМОСТЬ] Ожидание проверки видимости ответов: {}", len(tasks))
-        limit = (self._checker._delay if self._checker is not None else 0.0) + 60.0
+        limit = visibility_wait_limit(self._checker)
         try:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=limit)
         except asyncio.TimeoutError:
@@ -236,5 +249,6 @@ __all__ = [
     "VisibilityWatcher",
     "make_visibility_checker",
     "visibility_enabled",
+    "visibility_wait_limit",
     "watch_and_record",
 ]

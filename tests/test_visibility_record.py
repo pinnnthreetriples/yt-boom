@@ -252,6 +252,24 @@ class TestVisibilityWatcher(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(limits, [60.0])  # delay (0) + 60 s
         self.assertTrue(task.cancelled())
 
+    async def test_finish_gives_the_retries_time_but_still_has_a_bound(self) -> None:
+        db = SimpleNamespace(set_activity_visibility=AsyncMock())
+        checker = self._checker(gate=asyncio.Event())
+        checker._delay, checker._retry_delays = 45.0, (120.0, 300.0)
+        watcher = VisibilityWatcher(checker, db)
+        task = watcher.schedule(5, "vid", "Ugx.r", "acc")
+        real_wait_for = asyncio.wait_for
+        limits: list[float] = []
+
+        async def short(awaitable, timeout):
+            limits.append(timeout)
+            return await real_wait_for(awaitable, 0.05)
+
+        with patch("modules.comment_visibility.asyncio.wait_for", short):
+            await watcher.finish()
+        self.assertEqual(limits, [45 + 120 + 300 + 60.0])
+        self.assertTrue(task.cancelled())
+
 
 class LoopCase(unittest.IsolatedAsyncioTestCase):
     """The two CLI loops of youtube_bot.py with a fake checker (no network, no waiting)."""

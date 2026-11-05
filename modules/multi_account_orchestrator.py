@@ -20,7 +20,12 @@ from database import (
     VideoPoolItem,
 )
 from modules.account_warmer import AccountWarmer
-from modules.comment_visibility import CommentVisibilityChecker, make_visibility_checker, watch_and_record
+from modules.comment_visibility import (
+    CommentVisibilityChecker,
+    make_visibility_checker,
+    visibility_wait_limit,
+    watch_and_record,
+)
 from modules.geo_guard import warn_if_exit_mismatch
 from modules.interaction_simulator import InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine, explain_block
@@ -383,9 +388,15 @@ class MultiAccountOrchestrator:
 
     async def _finish_visibility_checks(self) -> None:
         tasks = list(self._visibility_tasks)
-        if tasks:
-            logger.info("[ВИДИМОСТЬ] Ожидание проверки видимости ответов: {}", len(tasks))
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if not tasks:
+            return
+        limit = visibility_wait_limit(self._visibility)
+        logger.info("[ВИДИМОСТЬ] Ожидание проверки видимости ответов: {} (не дольше {:.0f}с)", len(tasks), limit)
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=limit)
+        except asyncio.TimeoutError:
+            logger.warning("[ВИДИМОСТЬ] Проверка не уложилась в {:.0f}с и отменена", limit)
+            await self._cancel_visibility_checks()
 
     async def _cancel_visibility_checks(self) -> None:
         tasks = list(self._visibility_tasks)
