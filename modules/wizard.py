@@ -422,6 +422,23 @@ def _reply_language_label(code: str) -> str:
     return dict(_REPLY_LANGUAGES).get(code, code)
 
 
+# Share of replies where one Russian word gets a few letters in Latin. Applied by code to the finished reply
+# (DeepSeek is never asked to mix alphabets); works for AI replies and for custom templates alike.
+_LATIN_MIX_LEVELS = [
+    (0.0, "Выкл", "слова пишутся как есть"),
+    (0.1, "Редко (10%)", "примерно в каждом десятом ответе"),
+    (0.3, "Иногда (30%)", "примерно в каждом третьем ответе"),
+    (0.6, "Часто (60%)", "в большинстве ответов"),
+]
+
+
+def _latin_mix_label(probability: float) -> str:
+    for value, label, _ in _LATIN_MIX_LEVELS:
+        if abs(value - probability) < 1e-9:
+            return label
+    return f"{probability:.0%}"
+
+
 def _setup_screen(step: int, title: str, hint: str, status: list[Any], notice: tuple[str, str] | None = None) -> None:
     """Clear and draw a setup screen: header, status table, last action result."""
     clear_terminal()
@@ -1289,6 +1306,7 @@ def step_reply_mode(config_path: Path) -> tuple[str, list[str]]:
         ai = current_mode == "ai"
         paraphrase = bool(getattr(cfg.processor, "paraphrase_custom", True))
         reply_lang = getattr(cfg.processor, "reply_language", "auto")
+        latin_mix = float(getattr(cfg.processor, "latin_mix_probability", 0.0))
 
         status: list[Any] = [
             ("Режим", "ИИ DeepSeek" if ai else "свой текст"),
@@ -1297,6 +1315,7 @@ def step_reply_mode(config_path: Path) -> tuple[str, list[str]]:
         if not ai:
             status.append(("Рандомизация", "вкл: ИИ меняет слова каждый раз" if paraphrase else "выкл: шаблон уходит как есть"))
         status.append(("Язык ответов", _reply_language_label(reply_lang)))
+        status.append(("Смешивание букв", _latin_mix_label(latin_mix)))
         status += [(f"  {i}.", r) for i, r in enumerate(current_replies[:5], 1)]
         if len(current_replies) > 5:
             status.append(("", f"… ещё {len(current_replies) - 5}", "dim"))
@@ -1310,6 +1329,7 @@ def step_reply_mode(config_path: Path) -> tuple[str, list[str]]:
             ("4", "Удалить шаблон", "", ""),
             ("P", "Рандомизация текста", "● вкл: ИИ меняет слова каждый раз" if paraphrase else "выкл: шаблон уходит как есть", CLR_DIM),
             ("L", "Язык ответов", _reply_language_label(reply_lang), CLR_DIM),
+            ("M", "Смешивание букв", _latin_mix_label(latin_mix), CLR_DIM),
             None,
             ("0", "← Назад", "", ""),
         ]
@@ -1361,6 +1381,18 @@ def step_reply_mode(config_path: Path) -> tuple[str, list[str]]:
             notice = ("ok", f"Язык ответов: {_reply_language_label(code)}")
             if code != "auto" and not ai and not (paraphrase and getattr(cfg.deepseek, "api_key", "")):
                 notice = ("warn", "Для перевода шаблонов нужна включённая рандомизация и ключ DeepSeek - иначе шаблон уйдёт как есть")
+        elif choice == "M":
+            mix_picks: list[MenuRow | None] = [
+                (str(i), label, ("● выбран" if abs(value - latin_mix) < 1e-9 else hint), CLR_DIM)
+                for i, (value, label, hint) in enumerate(_LATIN_MIX_LEVELS, 1)
+            ]
+            start = next((i for i, (value, _, _) in enumerate(_LATIN_MIX_LEVELS) if abs(value - latin_mix) < 1e-9), 0)
+            pick, _ = arrow_menu(lambda: mix_picks, [" Смешивание букв"], start, esc_key="0")
+            if not pick.isdigit() or not 1 <= int(pick) <= len(_LATIN_MIX_LEVELS):
+                continue
+            value, label, _ = _LATIN_MIX_LEVELS[int(pick) - 1]
+            update_config_file(config_path, {"processor.latin_mix_probability": value})
+            notice = ("info", "Смешивание букв выключено") if value == 0 else ("ok", f"Смешивание букв: {label}")
         elif choice == "3":
             if text := ask_text("Текст шаблона"):
                 save_replies(current_replies + [text])

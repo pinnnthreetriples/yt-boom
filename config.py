@@ -141,6 +141,8 @@ class ProcessorSettings(BaseModel):
     # Language of the posted replies: "auto" follows the comment (AI) / the template (custom); an ISO 639-1 code
     # (ru, en, ...) forces it, translating a template of another language when paraphrase_custom is on.
     reply_language: str = "auto"
+    # Share of messages in which one Russian word gets a few letters written in Latin ("prивет"); 0 = off.
+    latin_mix_probability: float = Field(default=0.0, ge=0, le=1)
 
     @field_validator("reply_language")
     @classmethod

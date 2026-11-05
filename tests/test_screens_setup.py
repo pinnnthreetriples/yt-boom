@@ -302,6 +302,26 @@ class TestDeepseekAndReplyMode(SetupScreenCase):
         self.run_keys(lambda: step_reply_mode(self.config_path), DOWN, DOWN, DOWN, DOWN, ENTER, DOWN, ENTER, ESC)
         self.assertIs(self.raw()["processor"]["paraphrase_custom"], False)
 
+    def test_latin_mix_level_is_picked_in_both_modes(self):
+        from modules.wizard import update_config_file
+        for mode in ("ai", "custom"):
+            update_config_file(self.config_path, {"processor.reply_mode": mode, "reply_mode": mode})
+            update_config_file(self.config_path, {"processor.latin_mix_probability": 0.0})
+            # the cursor starts on the active mode row (ai: 0, custom: 1); ↓ to «Смешивание букв» (row 6):
+            # the picker opens on «Выкл», ↓↓ «Иногда (30%)»
+            downs = [DOWN] * (6 if mode == "ai" else 5)
+            _, output = self.run_keys(
+                lambda: step_reply_mode(self.config_path), *downs, ENTER, DOWN, DOWN, ENTER, ESC,
+            )
+            self.assertEqual(self.raw()["processor"]["latin_mix_probability"], 0.3)
+            self.assertIn("Смешивание букв: Иногда (30%)", output)
+            # the status block shows the saved level when the screen is opened again
+            _, output = self.run_keys(lambda: step_reply_mode(self.config_path), ESC)
+            self.assertRegex(output, r"Смешивание букв\s+Иногда \(30%\)")
+            # the picker opens on the current level; ↑↑ → «Выкл»
+            self.run_keys(lambda: step_reply_mode(self.config_path), *downs, ENTER, UP, UP, ENTER, ESC)
+            self.assertEqual(self.raw()["processor"]["latin_mix_probability"], 0.0)
+
     def test_reply_language_is_picked_from_the_list(self):
         # ↓×5 «Язык ответов» → picker opens on «Авто»: ↓ «Русский»
         _, output = self.run_keys(

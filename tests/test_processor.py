@@ -153,6 +153,20 @@ class TestProcessor(unittest.TestCase):
             asyncio.run(proc.paraphrase("Nice template for you"))
             self.assertIn("translate it into Russian", create.call_args.kwargs["messages"][0]["content"])
 
+    def test_mix_latin_transliterates_part_of_a_russian_word(self):
+        import random
+
+        from modules.processor import mix_latin
+
+        text = "Привет, приходи завтра на стрим"
+        self.assertEqual(mix_latin(text, 0.0, random.Random(1)), text)
+        mixed = [mix_latin(text, 1.0, random.Random(seed)) for seed in range(20)]
+        self.assertTrue(all(m != text for m in mixed))
+        self.assertTrue(all(any("a" <= c.lower() <= "z" for c in m) for m in mixed))
+        self.assertEqual(mix_latin("@Вася, Great video", 1.0, random.Random(1)), "@Вася, Great video")  # nothing eligible
+        with self.assertRaises(ValueError):
+            ProcessorSettings(system_prompt="s", user_prompt_template="{text}", latin_mix_probability=1.5)
+
     def test_processor_empty_input_raises(self):
         import asyncio
 
