@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from loguru import logger
@@ -16,11 +17,18 @@ class CommentVisibilityChecker:
 
     Observability only: a miss is logged as a warning and never counts as an error of the account. The check
     can be wrong (propagation delay, YouTube changing the response), so it only ever says "not seen".
+    A "seen" is only as good as the id it is given: it must be the new reply's own id, never its parent's.
     """
 
-    def __init__(self, collector: Any, delay_seconds: float = 45.0) -> None:
+    def __init__(
+        self,
+        collector: Any,
+        delay_seconds: float = 45.0,
+        retry_delays: Sequence[float] = (),
+    ) -> None:
         self._collector = collector  # the orchestrator's YouTubeCollector: its curl_cffi session is reused
         self._delay = max(0.0, delay_seconds)
+        self._retry_delays = tuple(max(0.0, delay) for delay in retry_delays)
 
     async def is_visible(self, video_id: str, comment_id: str) -> bool | None:
         """True / False: the reply is / is not in the anonymous thread view. None: could not be checked."""
@@ -30,11 +38,13 @@ class CommentVisibilityChecker:
             # `lc=<id>` makes YouTube pin the linked reply (with its thread open) in the first comments page
             resp = await session.get(f"https://www.youtube.com/watch?v={video_id}&lc={comment_id}")
             if resp.status_code != 200:
+                logger.debug("Видимость {}: страница видео ответила HTTP {}", comment_id, resp.status_code)
                 return None
             html = resp.text
             api_key = _API_KEY_RE.search(html)
             token = self._collector._extract_comments_token(html)
             if api_key is None or not token:
+                logger.debug("Видимость {}: на странице нет ключа API или токена комментариев", comment_id)
                 return None
             version = _CLIENT_VERSION_RE.search(html)
             payload = {
@@ -52,10 +62,12 @@ class CommentVisibilityChecker:
                 headers={"Content-Type": "application/json"},
             )
             if resp.status_code != 200:
+                logger.debug("Видимость {}: /next ответил HTTP {}", comment_id, resp.status_code)
                 return None
             # A real answer is JSON with `onResponseReceivedEndpoints` and (live, 2026-11) carries 20+ commentId keys
             # (`commentEntityPayload.properties.commentId`, `commentViewModel.commentId`); anything else is "unknown".
             if not isinstance(resp.json(), dict) or not _ANY_COMMENT_ID_RE.search(resp.text):
+                logger.debug("Видимость {}: /next не отдал список комментариев", comment_id)
                 return None
             # only the /next answer counts: the watch page HTML repeats `lc=` whatever the comment's state
             return re.search(r'"commentId"\s*:\s*"' + re.escape(comment_id) + '"', resp.text) is not None
@@ -63,37 +75,59 @@ class CommentVisibilityChecker:
             logger.debug("Проверка видимости комментария {} не выполнена: {}", comment_id, exc)
             return None
 
-    async def watch(self, video_id: str, comment_id: str, account_name: str) -> bool | None:
-        """Wait, check once and log the outcome; the caller runs it in the background."""
-        await asyncio.sleep(self._delay)
+    async def _look(self, video_id: str, comment_id: str) -> bool | None:
         try:
-            seen = await self.is_visible(video_id, comment_id)
+            return await self.is_visible(video_id, comment_id)
         except Exception as exc:  # a background task: nothing may escape as "exception was never retrieved"
             logger.debug("Проверка видимости комментария {} прервана: {}", comment_id, exc)
-            seen = None
+            return None
+
+    async def watch(self, video_id: str, comment_id: str, account_name: str) -> bool | None:
+        """Wait, look for the reply (again after each retry delay while it is not seen) and log the outcome.
+
+        The first sighting ends the series. A miss ("False") is only reported after the last look, an unverifiable
+        answer ("None") is retried like a miss. Every outcome is logged, so the log tells "confirmed" from
+        "not found" from "could not be checked". The caller runs it in the background.
+        """
+        waited = self._delay
+        await asyncio.sleep(self._delay)
+        seen = await self._look(video_id, comment_id)
+        looks = 1
+        for pause in self._retry_delays:
+            if seen:
+                break
+            await asyncio.sleep(pause)
+            waited += pause
+            seen = await self._look(video_id, comment_id)
+            looks += 1
+
         if seen is True:
             logger.success(
-                "[ВИДИМОСТЬ] Ответ {} аккаунта {!r} под видео {} виден всем зрителям",
+                "[ВИДИМОСТЬ] Ответ {} аккаунта {!r} под видео {} виден всем зрителям (проверка {} через {:.0f}с)",
                 comment_id,
                 account_name,
                 video_id,
+                looks,
+                waited,
             )
         elif seen is False:
             logger.warning(
-                "[ВИДИМОСТЬ] Ответ {} аккаунта {!r} под видео {} не найден в анонимной выдаче через {:.0f}с "
-                "(не обязательно скрыт: возможна задержка или ошибка проверки)",
+                "[ВИДИМОСТЬ] Ответ {} аккаунта {!r} под видео {} не найден в анонимной выдаче: проверок {}, "
+                "последняя через {:.0f}с (не обязательно скрыт: возможна задержка или ошибка проверки)",
                 comment_id,
                 account_name,
                 video_id,
-                self._delay,
+                looks,
+                waited,
             )
         else:
             logger.warning(
-                "[ВИДИМОСТЬ] Ответ {} аккаунта {!r} под видео {}: не удалось проверить (YouTube не отдал список "
-                "комментариев или сеть недоступна)",
+                "[ВИДИМОСТЬ] Ответ {} аккаунта {!r} под видео {}: не удалось проверить за {} проверок(ки) "
+                "(YouTube не отдал список комментариев или сеть недоступна)",
                 comment_id,
                 account_name,
                 video_id,
+                looks,
             )
         return seen
 
@@ -111,7 +145,9 @@ def make_visibility_checker(cfg: Any, collector: Any) -> CommentVisibilityChecke
     """A checker for `collector` when the config enables the check, else None; the one place with the condition."""
     if not visibility_enabled(cfg):
         return None
-    return CommentVisibilityChecker(collector, cfg.limits.visibility_check_delay_seconds)
+    return CommentVisibilityChecker(
+        collector, cfg.limits.visibility_check_delay_seconds, tuple(cfg.limits.visibility_retry_delays_seconds)
+    )
 
 
 async def watch_and_record(
@@ -133,6 +169,19 @@ async def watch_and_record(
     except Exception as exc:  # a background task: nothing may escape as "exception was never retrieved"
         logger.debug("Результат проверки видимости {} не записан: {}", remote_id, exc)
         return None
+
+
+def visibility_wait_limit(checker: Any) -> float:
+    """The longest a run may wait for `checker`'s background look: its delay, every retry pause and a minute of slack.
+
+    Reads the numbers defensively: a stand-in checker without them counts as 0 seconds.
+    """
+    delay = getattr(checker, "_delay", 0.0)
+    retries = getattr(checker, "_retry_delays", ())
+    total = float(delay) if isinstance(delay, (int, float)) else 0.0
+    if isinstance(retries, (tuple, list)):
+        total += sum(float(pause) for pause in retries if isinstance(pause, (int, float)))
+    return total + 60.0
 
 
 class VisibilityWatcher:
@@ -180,7 +229,7 @@ class VisibilityWatcher:
         if not tasks:
             return
         logger.info("[ВИДИМОСТЬ] Ожидание проверки видимости ответов: {}", len(tasks))
-        limit = (self._checker._delay if self._checker is not None else 0.0) + 60.0
+        limit = visibility_wait_limit(self._checker)
         try:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=limit)
         except asyncio.TimeoutError:
@@ -200,5 +249,6 @@ __all__ = [
     "VisibilityWatcher",
     "make_visibility_checker",
     "visibility_enabled",
+    "visibility_wait_limit",
     "watch_and_record",
 ]

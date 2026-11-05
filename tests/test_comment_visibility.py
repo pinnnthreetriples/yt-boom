@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from curl_cffi.requests.exceptions import RequestException
 
-from modules.comment_visibility import CommentVisibilityChecker
+from modules.comment_visibility import CommentVisibilityChecker, make_visibility_checker, visibility_wait_limit
 
 HTML = '"INNERTUBE_API_KEY":"key123" "INNERTUBE_CLIENT_VERSION":"2.20261101.00.00" lc=Ugx.reply'
 
@@ -71,6 +71,66 @@ class TestCommentVisibilityChecker(unittest.IsolatedAsyncioTestCase):
             else:
                 log.success.assert_not_called()
                 self.assertIn("не удалось проверить", log.warning.call_args.args[0])
+
+    async def test_retries_stop_at_the_first_sighting(self) -> None:
+        checker = CommentVisibilityChecker(_collector("{}"), delay_seconds=45, retry_delays=(120, 300))
+        checker.is_visible = AsyncMock(side_effect=[False, True])
+        sleep = AsyncMock()
+        with patch("modules.comment_visibility.asyncio.sleep", sleep), patch(
+            "modules.comment_visibility.logger"
+        ) as log:
+            self.assertIs(await checker.watch("vid", "Ugx.reply", "acc"), True)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [45, 120])  # no third look after a hit
+        self.assertEqual(checker.is_visible.await_count, 2)
+        log.warning.assert_not_called()
+        log.success.assert_called_once()
+        self.assertEqual(log.success.call_args.args[4], 2)  # the sighting came on the second look
+
+    async def test_a_miss_is_reported_only_after_the_last_look(self) -> None:
+        checker = CommentVisibilityChecker(_collector("{}"), delay_seconds=45, retry_delays=(120, 300))
+        checker.is_visible = AsyncMock(return_value=False)
+        sleep = AsyncMock()
+        with patch("modules.comment_visibility.asyncio.sleep", sleep), patch(
+            "modules.comment_visibility.logger"
+        ) as log:
+            self.assertIs(await checker.watch("vid", "Ugx.reply", "acc"), False)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [45, 120, 300])
+        self.assertEqual(checker.is_visible.await_count, 3)
+        log.warning.assert_called_once()
+        self.assertEqual(log.warning.call_args.args[4], 3)  # looks made
+        self.assertEqual(log.warning.call_args.args[5], 465)  # seconds after the reply of the last look
+
+    async def test_unverifiable_answers_are_retried_and_reported_when_they_persist(self) -> None:
+        checker = CommentVisibilityChecker(_collector("{}"), delay_seconds=45, retry_delays=(120,))
+        checker.is_visible = AsyncMock(side_effect=[None, False])
+        with patch("modules.comment_visibility.asyncio.sleep", AsyncMock()), patch(
+            "modules.comment_visibility.logger"
+        ):
+            self.assertIs(await checker.watch("vid", "Ugx.reply", "acc"), False)  # the retry turned unknown into a verdict
+        checker.is_visible = AsyncMock(return_value=None)
+        with patch("modules.comment_visibility.asyncio.sleep", AsyncMock()), patch(
+            "modules.comment_visibility.logger"
+        ) as log:
+            self.assertIsNone(await checker.watch("vid", "Ugx.reply", "acc"))
+        log.success.assert_not_called()
+        self.assertIn("не удалось проверить", log.warning.call_args.args[0])  # unknown is never silent
+
+    def test_factory_hands_the_retry_delays_to_the_checker(self) -> None:
+        limits = SimpleNamespace(
+            visibility_check_enabled=True, visibility_check_delay_seconds=30.0, visibility_retry_delays_seconds=[60.0, 90.0]
+        )
+        checker = make_visibility_checker(SimpleNamespace(limits=limits), _collector("{}"))
+        self.assertEqual((checker._delay, checker._retry_delays), (30.0, (60.0, 90.0)))
+        limits.visibility_check_enabled = False
+        self.assertIsNone(make_visibility_checker(SimpleNamespace(limits=limits), _collector("{}")))
+
+    def test_wait_limit_covers_every_retry_pause_and_tolerates_stand_ins(self) -> None:
+        checker = CommentVisibilityChecker(_collector("{}"), delay_seconds=45, retry_delays=(120, 300))
+        self.assertEqual(visibility_wait_limit(checker), 45 + 120 + 300 + 60)
+        self.assertEqual(visibility_wait_limit(CommentVisibilityChecker(_collector("{}"), delay_seconds=7)), 67)
+        self.assertEqual(visibility_wait_limit(SimpleNamespace(_delay=0.0)), 60.0)  # no retry list
+        self.assertEqual(visibility_wait_limit(None), 60.0)
+        self.assertEqual(visibility_wait_limit(MagicMock()), 60.0)  # attributes that are not numbers count as 0
 
     async def test_unexpected_errors_never_escape_the_background_task(self) -> None:
         collector = _collector("{}")

@@ -4,6 +4,7 @@ import asyncio
 import random
 import re
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -583,21 +584,39 @@ class YouTubeRunner:
             raise SubmissionError(f"YouTube rejected the reply: HTTP {response.status}")
         await self._simulator.human_pause(1.5, 3.0)
 
-        remote_id = await self._extract_remote_id(response)
+        remote_id = await self._extract_remote_id(response, exclude=(comment_id or "",))
         if remote_id is None:
-            logger.warning("В ответе create_comment не найден серверный commentId")
+            logger.warning(
+                "В ответе create_comment не найден id нового ответа: проверка видимости для него невозможна"
+            )
         return remote_id
 
     @staticmethod
-    async def _extract_remote_id(response: Any) -> str | None:
-        """Server-side commentId (Ugw.../Ugx.../Ugy.../Ugz...) from the create_comment response body."""
+    async def _extract_remote_id(response: Any, *, exclude: Iterable[str] = ()) -> str | None:
+        """Server-side id of the NEW reply (`Parent.Reply`, Ugw/Ugx/Ugy/Ugz...) from the create_comment body.
+
+        The body may also name the thread's parent, the comment we answered or its siblings; an id of any of them is
+        public whatever happened to our reply, so taking one would give the visibility check a false "visible".
+        Only a reply-shaped id (it holds a dot, a parent's never does) that is not in `exclude` and sits in the
+        answered comment's thread qualifies, and only when exactly one such id is left; otherwise None ("unknown").
+        """
         try:
             body = await response.text()
         except Exception as exc:
             logger.debug("Не удалось прочитать тело ответа create_comment: {}", exc)
             return None
-        match = _COMMENT_ID_RE.search(body or "")
-        return match.group(1) if match else None
+        skipped = {item for item in exclude if item}
+        threads = {item.split(".", 1)[0] for item in skipped}
+        found = dict.fromkeys(match.group(1) for match in _COMMENT_ID_RE.finditer(body or ""))
+        candidates = [
+            item
+            for item in found
+            if "." in item and item not in skipped and (not threads or item.split(".", 1)[0] in threads)
+        ]
+        if len(candidates) > 1:
+            logger.debug("В ответе create_comment несколько кандидатов на id нового ответа: {}", candidates)
+            return None
+        return candidates[0] if candidates else None
 
     async def _wait_reply_input(self, page: Any, timeout_seconds: float = 6.0) -> Any | None:
         deadline = time.monotonic() + timeout_seconds
