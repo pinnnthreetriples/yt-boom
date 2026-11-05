@@ -418,7 +418,7 @@ grounds_to:
 -->
 ## Multi-Account Parallel Execution Modes
 
-MultiAccountOrchestrator manages parallel execution across active Google accounts bounded by max_concurrent_sessions, supporting each mode where every account processes all target videos and share mode where target videos are divided among accounts.
+MultiAccountOrchestrator manages parallel execution across active Google accounts bounded by max_concurrent_sessions, supporting each mode where every account processes all target videos and share mode where the videos are dealt out round-robin (by account id, the start saved in `app_settings.share_offset[:project_id]`), each video to exactly one account that writes up to its target; an account stopped by its limits hands its unfinished videos to the others, else they stay pending.
 
 <!-- mex:entity
 id: mx_01M69V83JTY6Z0M6ZMKNHGT9YS
