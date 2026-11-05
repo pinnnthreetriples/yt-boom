@@ -34,6 +34,7 @@ _ICONS: dict[str, tuple[str, str]] = {
     "mature": ("🌳", "▇"),
     "unlimited": ("⚡", "∞"),
     "warmup": ("🔥", "~"),
+    "cookie": ("🍪", "o"),
     # proxies
     "own_ip": ("🏠", "⌂"),
     "online": ("🟢", "●"),

@@ -189,11 +189,117 @@ class TestAddAndBulk(AccountsTabCase):
         self.assertIn("Режим для новых", self.screen(c))
         c.press("right")  # уже прогрет
         c.press("enter")
+        self.assertIn("куки-робот", self.screen(c))
+        c.press("enter")  # «Нет»
         self.assertIn("Войти и прогреть", self.screen(c))
         c.press("enter")  # «Позже»
         self.assertIn("Добавлено 1", self.screen(c))
         self.assertEqual(self.account("new1@x.com").lifecycle_mode, "mature")
         self.assertIsNone(c.pending_run)
+
+    def add_one(self) -> Controller:
+        c = self.shell()
+        c.press("+")
+        c.press("paste:new1@x.com pass111\n")
+        c.press("enter")
+        c.press("right")
+        c.press("enter")
+        self.assertIn("Нагулять профиль перед входом", self.screen(c))
+        return c
+
+    def test_cookie_robot_question_yes_runs_the_robot_then_asks_to_sign_in(self):
+        from modules.cookie_robot import CookieRobotResult
+        from modules.ui.shell import Confirm
+
+        c = self.add_one()
+        c.press("right")  # «Да»
+        c.press("enter")
+        run = c.pending_run
+        self.assertIsNotNone(run)
+        self.assertIn("Куки-робот", run.title)
+        seen = []
+
+        async def fake_robot(config_path, names, on_progress=None, headless=None, report=print):
+            on_progress(names[0], 1, 4, "google.com")
+            on_progress(names[0], 4, 4, "wikipedia.org")
+            seen.append(list(names))
+            return [CookieRobotResult(names[0], True, ("google.com",), (), 1.0, "4 из 4 сайтов")]
+
+        with patch("youtube_bot.run_cookie_robot", fake_robot), patch("modules.wizard.safe_print") as printed:
+            step = run.work()
+        self.assertEqual(seen, [["new1@x.com"]])
+        self.assertIsInstance(step, Confirm)  # the usual «Войти и прогреть сейчас?» follows
+        self.assertIn("Войти и прогреть", step.question[0].text)
+        drawn = "".join(str(call.args[0]) for call in printed.call_args_list if call.args)
+        self.assertIn("[=>        ] 1/4 google.com", drawn)
+        self.assertIn("[=========>] 4/4 wikipedia.org", drawn)
+
+    def test_robot_outcome_is_in_the_sign_in_question(self):
+        from modules.cookie_robot import CookieRobotResult
+
+        c = self.add_one()
+        c.press("right")
+        c.press("enter")
+
+        async def failing(config_path, names, on_progress=None, headless=None, report=print):
+            return [CookieRobotResult(names[0], False, (), ("google.com",), 1.0, "0 из 4 сайтов")]
+
+        with patch("youtube_bot.run_cookie_robot", failing), patch("modules.wizard.safe_print"):
+            step = c.pending_run.work()
+        self.assertIn("0 из 4 сайтов", step.question[0].text)
+        self.assertIn("Войти и прогреть", step.question[0].text)
+
+    def test_accounts_without_a_proxy_get_a_warning(self):
+        c = self.add_one()  # a new account has no proxy: the cookies would carry the home IP
+        self.assertIn("с вашего IP", self.screen(c))
+
+    def test_manual_menu_warns_about_the_own_ip(self):
+        from modules.ui.tab_accounts import cookie_robot_menu
+
+        account_id = self.add("work")
+        confirm = cookie_robot_menu(self.ctx, account_id)
+        self.assertIn("с вашего IP", confirm.question[0].text)
+
+    def test_cookie_robot_failure_still_asks_to_sign_in(self):
+        from modules.ui.shell import Confirm
+
+        c = self.add_one()
+        c.press("right")
+        c.press("enter")
+
+        async def broken(*_a, **_k):
+            raise RuntimeError("boom")
+
+        with patch("youtube_bot.run_cookie_robot", broken), patch("modules.wizard.safe_print"):
+            step = c.pending_run.work()
+        self.assertIsInstance(step, Confirm)
+
+    def test_manual_cookie_robot_from_the_login_menu(self):
+        from modules.cookie_robot import CookieRobotResult
+        from modules.ui.shell import Notice
+        from modules.ui.tab_accounts import login_menu
+
+        account_id = self.add("work")
+        menu = login_menu(self.ctx, account_id)
+        ids = [row.id for row in menu.rows]
+        self.assertLess(ids.index("l-manual"), ids.index("l-cookies"))
+        self.assertLess(ids.index("l-cookies"), ids.index("l-check"))
+        self.assertIn("l-auto", ids)
+
+        confirm = menu.rows[ids.index("l-cookies")].enter()
+        self.assertEqual(confirm.choices, ["Нет", "Нагулять"])
+        self.assertIsNone(confirm.pick(0))
+        run = confirm.pick(1)
+        self.assertIn("Куки-робот · work", run.title)
+
+        async def fake_robot(config_path, names, on_progress=None, headless=None, report=print):
+            return [CookieRobotResult(names[0], True, ("google.com",), ("reddit.com",), 1.0, "3 из 4 сайтов (не открылись: reddit.com)")]
+
+        with patch("youtube_bot.run_cookie_robot", fake_robot), patch("modules.wizard.safe_print"):
+            notice = run.work()
+        self.assertIsInstance(notice, Notice)
+        self.assertEqual(notice.kind, "ok")
+        self.assertIn("3 из 4", notice.text)
 
     def test_bulk_mode(self):
         self.add("a")
