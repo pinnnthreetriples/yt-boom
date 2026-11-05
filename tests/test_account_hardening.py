@@ -860,6 +860,20 @@ class TestCommentIds(unittest.IsolatedAsyncioTestCase):
             response = MagicMock(text=AsyncMock(return_value=body))
             self.assertEqual(await YouTubeRunner._extract_remote_id(response), f"{prefix}Q1w.AbC-9_x")
 
+    async def test_remote_id_is_the_new_reply_never_the_parent_or_the_answered_comment(self):
+        parent, answered, new = "UgxParent4AaABAg", "UgxParent4AaABAg.9AAAA", "UgxParent4AaABAg.9BBBB"
+        body = (
+            '{"parent":{"commentId":"%s"},"target":{"commentId":"%s"},"created":{"commentId":"%s"}}'
+            % (parent, answered, new)
+        )
+        response = MagicMock(text=AsyncMock(return_value=body))
+        self.assertEqual(await YouTubeRunner._extract_remote_id(response, exclude=(answered,)), new)
+        # without anything that tells the new reply apart there is no id: "unknown" beats a wrong "visible"
+        only_known = MagicMock(text=AsyncMock(return_value='{"a":{"commentId":"%s"},"b":{"commentId":"%s"}}' % (parent, answered)))
+        self.assertIsNone(await YouTubeRunner._extract_remote_id(only_known, exclude=(answered,)))
+        only_parent = MagicMock(text=AsyncMock(return_value='{"commentId":"%s"}' % parent))
+        self.assertIsNone(await YouTubeRunner._extract_remote_id(only_parent))
+
     def test_validator_treats_every_youtube_comment_id_as_a_comment(self):
         base = dict(
             id=1, node_id=1, source_ref="vid12345678#p", source_text=None, text="t", language="en", status="submitted",

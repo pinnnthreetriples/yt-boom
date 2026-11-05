@@ -110,7 +110,11 @@ class MultiAccountOrchestrator:
         # An injected runner_factory means no real YouTube behind the runners (tests): nothing to look for then.
         delay = self._cfg.limits.visibility_check_delay_seconds
         self._visibility = visibility_checker or (
-            CommentVisibilityChecker(self._collector, delay) if runner_factory is None and delay > 0 else None
+            CommentVisibilityChecker(
+                self._collector, delay, tuple(self._cfg.limits.visibility_retry_delays_seconds)
+            )
+            if runner_factory is None and delay > 0
+            else None
         )
         self._visibility_tasks: set[asyncio.Task[Any]] = set()
 

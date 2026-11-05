@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from loguru import logger
@@ -16,11 +17,18 @@ class CommentVisibilityChecker:
 
     Observability only: a miss is logged as a warning and never counts as an error of the account. The check
     can be wrong (propagation delay, YouTube changing the response), so it only ever says "not seen".
+    A "seen" is only as good as the id it is given: it must be the new reply's own id, never its parent's.
     """
 
-    def __init__(self, collector: Any, delay_seconds: float = 45.0) -> None:
+    def __init__(
+        self,
+        collector: Any,
+        delay_seconds: float = 45.0,
+        retry_delays: Sequence[float] = (),
+    ) -> None:
         self._collector = collector  # the orchestrator's YouTubeCollector: its curl_cffi session is reused
         self._delay = max(0.0, delay_seconds)
+        self._retry_delays = tuple(max(0.0, delay) for delay in retry_delays)
 
     async def is_visible(self, video_id: str, comment_id: str) -> bool | None:
         """True / False: the reply is / is not in the anonymous thread view. None: could not be checked."""
@@ -63,25 +71,61 @@ class CommentVisibilityChecker:
             logger.debug("Проверка видимости комментария {} не выполнена: {}", comment_id, exc)
             return None
 
-    async def watch(self, video_id: str, comment_id: str, account_name: str) -> bool | None:
-        """Wait, check once and log a miss; the caller runs it in the background."""
-        await asyncio.sleep(self._delay)
+    async def _look(self, video_id: str, comment_id: str) -> bool | None:
         try:
-            seen = await self.is_visible(video_id, comment_id)
+            return await self.is_visible(video_id, comment_id)
         except Exception as exc:  # a background task: nothing may escape as "exception was never retrieved"
             logger.debug("Проверка видимости комментария {} прервана: {}", comment_id, exc)
             return None
+
+    async def watch(self, video_id: str, comment_id: str, account_name: str) -> bool | None:
+        """Wait, look for the reply (again after each retry delay while it is not seen) and log the verdict.
+
+        The first sighting ends the series. A miss ("False") is only reported after the last look, an unverifiable
+        answer ("None") is retried like a miss. Every outcome is logged at INFO or higher, so the log tells
+        "confirmed" from "not found" from "could not be checked". The caller runs it in the background.
+        """
+        waited = self._delay
+        await asyncio.sleep(self._delay)
+        seen = await self._look(video_id, comment_id)
+        looks = 1
+        for pause in self._retry_delays:
+            if seen:
+                break
+            await asyncio.sleep(pause)
+            waited += pause
+            seen = await self._look(video_id, comment_id)
+            looks += 1
+
         if seen is False:
             logger.warning(
-                "[ВИДИМОСТЬ] Комментарий {} аккаунта {!r} под видео {} не найден в анонимной выдаче через {:.0f}с "
-                "(не обязательно скрыт: возможна задержка или ошибка проверки)",
+                "[ВИДИМОСТЬ] Комментарий {} аккаунта {!r} под видео {} не найден в анонимной выдаче: "
+                "проверок {}, последняя через {:.0f}с (не обязательно скрыт: возможна задержка или ошибка проверки)",
                 comment_id,
                 account_name,
                 video_id,
-                self._delay,
+                looks,
+                waited,
             )
-        elif seen:
-            logger.debug("Комментарий {} виден в анонимной выдаче", comment_id)
+        elif seen is None:
+            logger.info(
+                "[ВИДИМОСТЬ] Комментарий {} аккаунта {!r} под видео {}: проверить не удалось "
+                "(проверок {}, видимость неизвестна)",
+                comment_id,
+                account_name,
+                video_id,
+                looks,
+            )
+        else:
+            logger.info(
+                "[ВИДИМОСТЬ] Комментарий {} аккаунта {!r} под видео {} виден в анонимной выдаче "
+                "(проверка {} через {:.0f}с)",
+                comment_id,
+                account_name,
+                video_id,
+                looks,
+                waited,
+            )
         return seen
 
 

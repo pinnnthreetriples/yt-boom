@@ -383,8 +383,18 @@ class LimitsSettings(BaseModel):
     pause_max_seconds: float = Field(default=20.0, ge=0)
     # Wait this long after a posted reply, then look for it as an anonymous visitor would (0 turns the check off).
     visibility_check_delay_seconds: float = Field(default=45.0, ge=0)
+    # Pauses before each further look when the reply was not seen (a miss can be propagation delay); the first
+    # sighting ends the series, so a normal reply costs no extra wait. An empty list means a single look.
+    visibility_retry_delays_seconds: list[float] = Field(default_factory=lambda: [120.0, 300.0])
     retry_backoff_seconds: float = Field(default=45.0, ge=1)
     max_queue_attempts: int = Field(default=3, ge=1, le=10)
+
+    @field_validator("visibility_retry_delays_seconds")
+    @classmethod
+    def _validate_visibility_retry_delays(cls, value: list[float]) -> list[float]:
+        if any(delay < 0 for delay in value):
+            raise ValueError("limits.visibility_retry_delays_seconds must not hold negative pauses")
+        return value
 
     @model_validator(mode="after")
     def _validate_pauses(self) -> "LimitsSettings":
