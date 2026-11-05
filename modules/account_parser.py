@@ -21,7 +21,8 @@ _PROXY_TAIL = re.compile(
     re.IGNORECASE,
 )
 _EMAIL_PREFIX = re.compile(r"^[^:@\s]+@[^:\s]+:")
-_GEO_TAIL = re.compile(r":(country|locale)=([^:\s]*)$", re.IGNORECASE)  # `...:country=PL:locale=pl-PL`, the very end of the line
+_GEO_TAIL = re.compile(r":(country|locale|mode)=([^:\s]*)$", re.IGNORECASE)  # `...:country=PL:locale=pl-PL:mode=mature`, the very end of the line
+_MODES = ("auto", "mature", "unlimited")
 
 
 class ParsedAccount(BaseModel):
@@ -34,6 +35,7 @@ class ParsedAccount(BaseModel):
     proxy: str | None = None
     expected_country: str | None = None
     locale: str | None = None
+    lifecycle_mode: str | None = None  # `mode=auto|mature|unlimited`; None: the line does not say
 
     @property
     def default_name(self) -> str:
@@ -81,10 +83,25 @@ def _geo_fields(country: str | None, locale: str | None) -> tuple[str | None, st
     return iso, tag
 
 
-def _free_form_to_colon_line(text: str) -> str:
+def _mode_field(mode: str | None) -> str | None:
+    """The account's lifecycle mode from `mode=...`; an unknown word is a ValueError."""
+    if mode is None:
+        return None
+    value = mode.strip().lower()
+    if value not in _MODES:
+        raise ValueError("mode: ожидается auto, mature или unlimited")
+    return value
+
+
+_PASSWORD_STAND_IN = "x"  # colon-free placeholder: the free-form password is put back after the colon form is parsed
+
+
+def _free_form_to_colon_line(text: str) -> tuple[str, str]:
     """`email password [totp] [recovery@mail] [proxy] [country=PL] [locale=pl-PL]` (spaces/tabs, any order after the
-    password) -> the colon form. Extra fields are told apart by shape: a proxy has `://` or `host:port`, the recovery
-    e-mail has '@', `country=` / `locale=` are keys, anything else is the TOTP secret (groups like `JBSW Y3DP` are joined).
+    password) -> (the colon form with `_PASSWORD_STAND_IN` as the password, the real password). Extra fields are told
+    apart by shape: a proxy has `://` or `host:port`, the recovery e-mail has '@', `country=` / `locale=` / `mode=`
+    are keys, anything else is the TOTP secret (groups like `JBSW Y3DP` are joined). The password is a whole token,
+    so it may hold colons, which the colon form would otherwise split into a "TOTP secret".
     """
     tokens = text.split()
     if len(tokens) < 2 or "@" not in tokens[0]:
@@ -95,7 +112,7 @@ def _free_form_to_colon_line(text: str) -> str:
     geo: list[str] = []
     for token in extras:
         proxy_match = _PROXY_TAIL.search(f":{token}")
-        if "=" in token and token.split("=", 1)[0].lower() in ("country", "locale"):
+        if "=" in token and token.split("=", 1)[0].lower() in ("country", "locale", "mode"):
             geo.append(token)
         elif proxy_match is not None and proxy_match.start() == 0:
             if proxy is not None:
@@ -107,12 +124,12 @@ def _free_form_to_colon_line(text: str) -> str:
             recovery_email = token
         else:
             secret_parts.append(token)
-    pieces = [email, password, "".join(secret_parts)]
+    pieces = [email, _PASSWORD_STAND_IN, "".join(secret_parts)]
     if recovery_email is not None or proxy is not None:
         pieces.append(recovery_email or "")
     if proxy is not None:
         pieces.append(proxy)
-    return ":".join([*pieces, *geo])
+    return ":".join([*pieces, *geo]), password
 
 
 def parse_account_line(
@@ -128,29 +145,33 @@ def parse_account_line(
     the password; see `_free_form_to_colon_line`.
     The proxy is `scheme://...`, `host:port`, `user:pass@host:port` or `host:port:user:pass` (IPv6 in brackets).
     `country` (the account's expected country: ISO code or name) and `locale` are the last `key=value` pieces of the
-    line; the `country` / `locale` arguments are the defaults when the line has none.
+    line, like `mode=auto|mature|unlimited` (the account's age mode); the `country` / `locale` arguments are the
+    defaults when the line has none.
     """
     text = line.strip()
     if not text:
         raise ValueError("пустая строка аккаунта")
+    free_form_password: str | None = None
     if not _EMAIL_PREFIX.match(text) and re.search(r"\s", text):
-        text = _free_form_to_colon_line(text)
+        text, free_form_password = _free_form_to_colon_line(text)
     email, separator, rest = text.partition(":")
     email = email.strip()
     if not separator or "@" not in email:
         raise ValueError("формат: email:password[:totp_secret][:recovery_email][:proxy]")
 
-    geo = {"country": country, "locale": locale}
+    geo: dict[str, str | None] = {"country": country, "locale": locale, "mode": None}
     while (geo_tail := _GEO_TAIL.search(rest)) is not None:
         geo[geo_tail.group(1).lower()] = geo_tail.group(2)
         rest = rest[: geo_tail.start()]
     expected_country, account_locale = _geo_fields(geo["country"], geo["locale"])
+    lifecycle_mode = _mode_field(geo["mode"])
 
     candidates: list[tuple[str, str | None]] = []
     tail = _PROXY_TAIL.search(rest)
     if tail:
         candidates.append((rest[: tail.start()], tail.group(1)))
-    candidates.append((rest, None))  # no proxy in the line (or the "proxy" was part of the password)
+    if not (tail and free_form_password is not None):  # free form: the proxy token was already told apart by shape
+        candidates.append((rest, None))  # no proxy in the line (or the "proxy" was part of the password)
 
     first_error: ValueError | None = None
     for body, line_proxy in candidates:
@@ -164,12 +185,13 @@ def parse_account_line(
             continue
         return ParsedAccount(
             email=email,
-            password=password,
+            password=free_form_password if free_form_password is not None else password,
             totp_secret=totp_secret,
             recovery_email=recovery_email,
             proxy=effective_proxy,
             expected_country=expected_country,
             locale=account_locale,
+            lifecycle_mode=lifecycle_mode,
         )
     assert first_error is not None
     raise first_error

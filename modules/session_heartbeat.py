@@ -12,7 +12,7 @@ from urllib.parse import quote
 from curl_cffi.requests import AsyncSession
 from loguru import logger
 
-from config import parse_proxy, resolve_account_proxy
+from config import ProxyUnavailableError, parse_proxy, resolve_account_proxy
 from database import AccountRecord
 from modules.fingerprint_manager import load_fingerprint
 
@@ -247,11 +247,14 @@ async def check_session_heartbeat(
 
 async def check_account_heartbeat(
     account: AccountRecord,
-    default_proxy: str | None = None,
     timeout: float = 15.0,
     locale: str = "en-US",
 ) -> HeartbeatStatus:
-    proxy = resolve_account_proxy(account.proxy_url, default_proxy)
+    """Online heartbeat through the account's own proxy (or direct); an unreadable proxy is reported, not bypassed."""
+    try:
+        proxy = resolve_account_proxy(account)
+    except ProxyUnavailableError as exc:
+        return HeartbeatStatus(account_name=account.name, is_alive=False, login_info_present=False, details=str(exc))
     return await check_session_heartbeat(
         session_dir=account.session_path,
         account_name=account.name,

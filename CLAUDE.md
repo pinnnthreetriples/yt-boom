@@ -16,11 +16,12 @@
 
 ## Quick Commands
 - Run all tests: `python run_tests.py`
-- Launch interactive wizard: `python youtube_bot.py --wizard`
+- Launch the console interface (tabs «Запуск», «Аккаунты», «Прокси», «Проекты», «Цель», «Ответы»): `python youtube_bot.py --wizard`
 - Authenticate single account: `python youtube_bot.py --auth-account <name>`
 - Batch import accounts: `python youtube_bot.py --import-accounts-file <path>`
 - List accounts: `python youtube_bot.py --list-accounts`
-- Multi-video search & reply: `python youtube_bot.py --search "<topic>" --min-views 10000 --max-views 500000 --dry-run`
+- Run / search & reply: `python youtube_bot.py --dry-run` runs the projects «в запуске» one after another, `--project NAME` only that one; `python youtube_bot.py --search "<topic>" --dry-run` without `--project` is the old global search (all active accounts, filters / `--max-videos` / `--comments-per-video` default to `collector.*`, `--max-views 0` / `--max-age-hours 0` turn a limit off, `--account NAME` = only that account); with `--project` the topic replaces the project's topics for this run only
+- Projects: `python youtube_bot.py --list-projects`, `--project-add NAME`, `--project-accounts NAME acc1,acc2`, `--project-remove-account NAME acc`; `--videos-file FILE` loads into `--project` (default «Основной»)
 - Check database status: `python youtube_bot.py --status`
 - MEX memory check: `mex doctor` and `mex check`
 

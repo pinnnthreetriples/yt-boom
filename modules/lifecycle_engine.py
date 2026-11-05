@@ -9,11 +9,19 @@ from loguru import logger
 
 from database import AccountRecord, Database
 
-LifecycleStageName = Literal["quarantine", "aging", "probation", "mature", "restricted"]
+LifecycleStageName = Literal["quarantine", "aging", "probation", "mature", "restricted", "unlimited"]
 SuggestedAction = Literal["comment", "warm_up", "wait", "restricted"]
 
 CIRCUIT_BREAKER_ERRORS = 3
 _HOUR = 3600.0
+
+# Per-account age mode: "auto" follows the hours since sign-in, "mature" skips the young stages (a bought or old
+# account that is already warmed up), "unlimited" has no stages, daily limit or interval (only the circuit breaker).
+MODE_AUTO = "auto"
+MODE_MATURE = "mature"
+MODE_UNLIMITED = "unlimited"
+LIFECYCLE_MODES = (MODE_AUTO, MODE_MATURE, MODE_UNLIMITED)
+MODE_LABELS = {MODE_AUTO: "По возрасту", MODE_MATURE: "Уже прогрет", MODE_UNLIMITED: "Без лимитов"}
 
 
 @dataclass(frozen=True)
@@ -44,7 +52,9 @@ class LifecycleView:
     age_hours: float | None = None
     quarantine_left: float | None = None
     quota_done: int | None = None
-    quota_limit: int | None = None
+    quota_limit: int | None = None  # None: no daily limit ("unlimited" mode, or not signed in)
+    mode: str = MODE_AUTO
+    age_stage: str | None = None  # the stage the real age alone would give, whatever the mode says
 
 
 def _parse_utc(value: str | None) -> datetime | None:
@@ -88,16 +98,35 @@ class AccountLifecycleEngine:
             return 0.0
         return max(0.0, (cls._now(now) - started).total_seconds() / _HOUR)
 
+    @staticmethod
+    def mode_of(account: AccountRecord) -> str:
+        """The account's age mode; an unknown stored value behaves as "auto"."""
+        mode = getattr(account, "lifecycle_mode", MODE_AUTO)
+        return mode if mode in LIFECYCLE_MODES else MODE_AUTO
+
     @classmethod
-    def calculate_stage(
-        cls, account: AccountRecord, now: datetime | None = None
-    ) -> tuple[LifecycleStageName, int]:
-        """(stage, daily comment limit) by the hours since the account signed in."""
+    def age_stage(cls, account: AccountRecord, now: datetime | None = None) -> tuple[LifecycleStageName, int]:
+        """(stage, daily limit) by the real hours since sign-in, ignoring the account's mode."""
         age = cls.age_hours(account, now)
         for name, rule in cls.STAGE_RULES.items():
             if rule.start_hour <= age < rule.end_hour:
                 return name, rule.daily_limit  # type: ignore[return-value]
         return "mature", cls.STAGE_RULES["mature"].daily_limit
+
+    @classmethod
+    def calculate_stage(
+        cls, account: AccountRecord, now: datetime | None = None
+    ) -> tuple[LifecycleStageName, int]:
+        """(stage, daily comment limit): by the hours since sign-in, or fixed by the account's mode.
+
+        "mature" mode is always the mature stage; "unlimited" mode is its own stage with limit 0 meaning "no limit".
+        """
+        mode = cls.mode_of(account)
+        if mode == MODE_UNLIMITED:
+            return "unlimited", 0
+        if mode == MODE_MATURE:
+            return "mature", cls.STAGE_RULES["mature"].daily_limit
+        return cls.age_stage(account, now)
 
     @classmethod
     def quarantine_hours_left(cls, account: AccountRecord, now: datetime | None = None) -> float:
@@ -123,7 +152,9 @@ class AccountLifecycleEngine:
             cls.age_hours(account, now),
             cls.quarantine_hours_left(account, now),
             cls.quota_today(account, now),
-            limit,
+            None if cls.mode_of(account) == MODE_UNLIMITED else limit,
+            cls.mode_of(account),
+            cls.age_stage(account, now)[0],
         )
 
     @classmethod
@@ -177,6 +208,9 @@ class AccountLifecycleEngine:
         if db is not None and updates:
             await db.update_account_lifecycle(account.id, **updates)  # type: ignore[arg-type]
 
+        if stage == "unlimited":  # no stages, daily limit or interval: only the circuit breaker above applies
+            return EligibilityResult(True, stage, "comment", "", 0, done)
+
         if stage in ("quarantine", "aging"):
             return EligibilityResult(
                 False, stage, "warm_up", f"Stage {stage}: commenting is forbidden, warm-up only", limit, done
@@ -198,9 +232,49 @@ class AccountLifecycleEngine:
         return EligibilityResult(True, stage, "comment", "", limit, done)
 
 
+async def release_restriction(db: Database, account: AccountRecord) -> None:
+    """«Снять ограничение»: the error streak restarts and the stage is derived again (mode and age)."""
+    stage, limit = AccountLifecycleEngine.calculate_stage(account)
+    await db.reset_account_restriction(account.id, stage, limit)
+
+
+_MODE_HINT = "Если аккаунт уже прогрет — меню аккаунта (этап «Аккаунты») → «Режим»."
+
+
+def explain_block(account: AccountRecord, verdict: EligibilityResult, now: datetime | None = None) -> str:
+    """Russian text for the log: why the lifecycle gate skipped `account` and how to change it."""
+    stage = verdict.stage
+    if stage == "restricted":
+        return (
+            f"ограничен после {CIRCUIT_BREAKER_ERRORS} ошибок подряд. "
+            "Если причина устранена — меню аккаунта → «Снять ограничение»."
+        )
+    if verdict.suggested_action == "warm_up":
+        age = AccountLifecycleEngine.age_hours(account, now)
+        text = f"молодой аккаунт ({stage}, {age:.0f} ч с первого входа): комментарии запрещены до 48 ч."
+        if not getattr(account, "auto_warmup", True):
+            text += " Автопрогрев выключен."
+        return f"{text} {_MODE_HINT}"
+    if verdict.reason == "Daily limit reached":
+        return f"дневной лимит {verdict.daily_comments_done}/{verdict.daily_limit} исчерпан. {_MODE_HINT}"
+    if verdict.reason == "Interval cooldown active":
+        minutes = int((verdict.retry_after_sec or 0) // 60) + 1
+        return f"пауза между комментариями, ещё ~{minutes} мин. {_MODE_HINT}"
+    if verdict.reason == "Account is not authenticated":
+        return "нет входа: выполните вход в меню аккаунта."
+    return verdict.reason
+
+
 __all__ = [
     "AccountLifecycleEngine",
     "CIRCUIT_BREAKER_ERRORS",
+    "LIFECYCLE_MODES",
+    "MODE_AUTO",
+    "MODE_LABELS",
+    "MODE_MATURE",
+    "MODE_UNLIMITED",
+    "explain_block",
+    "release_restriction",
     "EligibilityResult",
     "LifecycleStageName",
     "LifecycleView",

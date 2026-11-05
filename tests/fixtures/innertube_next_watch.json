@@ -1,0 +1,772 @@
+{
+ "contents": {
+  "twoColumnWatchNextResults": {
+   "results": {
+    "results": {
+     "contents": [
+      {
+       "videoPrimaryInfoRenderer": {
+        "title": {
+         "runs": [
+          {
+           "text": "Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)"
+          }
+         ]
+        }
+       }
+      }
+     ]
+    }
+   },
+   "secondaryResults": {
+    "secondaryResults": {
+     "results": [
+      {
+       "lockupViewModel": {
+        "contentId": "yPYZpwSpKmA",
+        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+        "metadata": {
+         "lockupMetadataViewModel": {
+          "title": {
+           "content": "Rick Astley - Together Forever (Official Video) [4K Remaster]"
+          },
+          "metadata": {
+           "contentMetadataViewModel": {
+            "metadataRows": [
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "Rick Astley",
+                 "styleRuns": [
+                  {
+                   "startIndex": 11,
+                   "styleRunExtensions": {
+                    "styleRunColorMapExtension": {
+                     "colorMap": [
+                      {
+                       "key": "USER_INTERFACE_THEME_DARK",
+                       "value": 4289374890
+                      },
+                      {
+                       "key": "USER_INTERFACE_THEME_LIGHT",
+                       "value": 4284506208
+                      }
+                     ]
+                    }
+                   }
+                  }
+                 ],
+                 "attachmentRuns": [
+                  {
+                   "startIndex": 11,
+                   "length": 0,
+                   "element": {
+                    "type": {
+                     "imageType": {
+                      "image": {
+                       "sources": [
+                        {
+                         "clientResource": {
+                          "imageName": "AUDIO_BADGE"
+                         },
+                         "width": 14,
+                         "height": 14
+                        }
+                       ]
+                      }
+                     }
+                    },
+                    "properties": {
+                     "layoutProperties": {
+                      "height": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "width": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "margin": {
+                       "left": {
+                        "value": 4,
+                        "unit": "DIMENSION_UNIT_POINT"
+                       }
+                      }
+                     }
+                    }
+                   },
+                   "alignment": "ALIGNMENT_VERTICAL_CENTER"
+                  }
+                 ]
+                }
+               }
+              ]
+             },
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "208M"
+                },
+                "accessibilityLabel": "208 million views",
+                "leadingIcon": {
+                 "name": "PLAY_ARROW_OUTLINED",
+                 "height": 12,
+                 "width": 12,
+                 "marginEndToken": {
+                  "spacing": 2
+                 }
+                }
+               },
+               {
+                "text": {
+                 "content": "17y ago"
+                },
+                "accessibilityLabel": "17 years ago"
+               }
+              ]
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "lockupViewModel": {
+        "contentId": "NWItxGY5NNk",
+        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+        "metadata": {
+         "lockupMetadataViewModel": {
+          "title": {
+           "content": "80'S MUSIC ON THE ROAD | 2 Hours of Classic '80s Hits"
+          },
+          "metadata": {
+           "contentMetadataViewModel": {
+            "metadataRows": [
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "every song is a scar"
+                }
+               }
+              ]
+             },
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "4.6M"
+                },
+                "accessibilityLabel": "4.6 million views",
+                "leadingIcon": {
+                 "name": "PLAY_ARROW_OUTLINED",
+                 "height": 12,
+                 "width": 12,
+                 "marginEndToken": {
+                  "spacing": 2
+                 }
+                }
+               },
+               {
+                "text": {
+                 "content": "5mo ago"
+                },
+                "accessibilityLabel": "5 months ago"
+               }
+              ]
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "lockupViewModel": {
+        "contentId": "Np7_mlvXFcA",
+        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+        "metadata": {
+         "lockupMetadataViewModel": {
+          "title": {
+           "content": "Midterms 2026: Last Week Tonight with John Oliver (HBO)"
+          },
+          "metadata": {
+           "contentMetadataViewModel": {
+            "metadataRows": [
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "LastWeekTonight",
+                 "styleRuns": [
+                  {
+                   "startIndex": 15,
+                   "styleRunExtensions": {
+                    "styleRunColorMapExtension": {
+                     "colorMap": [
+                      {
+                       "key": "USER_INTERFACE_THEME_LIGHT",
+                       "value": 4284506208
+                      },
+                      {
+                       "key": "USER_INTERFACE_THEME_DARK",
+                       "value": 4289374890
+                      }
+                     ]
+                    }
+                   }
+                  }
+                 ],
+                 "attachmentRuns": [
+                  {
+                   "startIndex": 15,
+                   "length": 0,
+                   "element": {
+                    "type": {
+                     "imageType": {
+                      "image": {
+                       "sources": [
+                        {
+                         "clientResource": {
+                          "imageName": "CHECK_CIRCLE_FILLED"
+                         },
+                         "width": 14,
+                         "height": 14
+                        }
+                       ]
+                      }
+                     }
+                    },
+                    "properties": {
+                     "layoutProperties": {
+                      "height": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "width": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "margin": {
+                       "left": {
+                        "value": 4,
+                        "unit": "DIMENSION_UNIT_POINT"
+                       }
+                      }
+                     }
+                    }
+                   },
+                   "alignment": "ALIGNMENT_VERTICAL_CENTER"
+                  }
+                 ]
+                }
+               }
+              ]
+             },
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "5.7M"
+                },
+                "accessibilityLabel": "5.7 million views",
+                "leadingIcon": {
+                 "name": "PLAY_ARROW_OUTLINED",
+                 "height": 12,
+                 "width": 12,
+                 "marginEndToken": {
+                  "spacing": 2
+                 }
+                }
+               },
+               {
+                "text": {
+                 "content": "2d ago"
+                },
+                "accessibilityLabel": "2 days ago"
+               }
+              ]
+             },
+             {
+              "badges": [
+               {
+                "badgeViewModel": {
+                 "badgeText": "New",
+                 "badgeStyle": "BADGE_DEFAULT",
+                 "trackingParams": "CL0BENTEDBgCIhMIx4n22unulwMVaSdXAR0rQghN"
+                }
+               }
+              ]
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "lockupViewModel": {
+        "contentId": "lFbT9hpIY0k",
+        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+        "metadata": {
+         "lockupMetadataViewModel": {
+          "title": {
+           "content": "Best of 80s Music Legends - Cyndi Lauper, Tears For Fears, Madonna, Modern Talking, Michael Jackson"
+          },
+          "metadata": {
+           "contentMetadataViewModel": {
+            "metadataRows": [
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "Pure 80s Retro"
+                }
+               }
+              ]
+             },
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "31K"
+                },
+                "accessibilityLabel": "31 thousand views",
+                "leadingIcon": {
+                 "name": "PLAY_ARROW_OUTLINED",
+                 "height": 12,
+                 "width": 12,
+                 "marginEndToken": {
+                  "spacing": 2
+                 }
+                }
+               },
+               {
+                "text": {
+                 "content": "Streamed 8h ago"
+                },
+                "accessibilityLabel": "Streamed 8 hours ago"
+               }
+              ]
+             },
+             {
+              "badges": [
+               {
+                "badgeViewModel": {
+                 "badgeText": "New",
+                 "badgeStyle": "BADGE_DEFAULT",
+                 "trackingParams": "CLgBENTEDBgDIhMIx4n22unulwMVaSdXAR0rQghN"
+                }
+               }
+              ]
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "lockupViewModel": {
+        "contentId": "XfIGAi4iphk",
+        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+        "metadata": {
+         "lockupMetadataViewModel": {
+          "title": {
+           "content": "LO MEJOR DE RICK ASTLEY - Las mejores canciones de Rick Astley"
+          },
+          "metadata": {
+           "contentMetadataViewModel": {
+            "metadataRows": [
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "ZABREMO."
+                }
+               }
+              ]
+             },
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "175K"
+                },
+                "accessibilityLabel": "175 thousand views",
+                "leadingIcon": {
+                 "name": "PLAY_ARROW_OUTLINED",
+                 "height": 12,
+                 "width": 12,
+                 "marginEndToken": {
+                  "spacing": 2
+                 }
+                }
+               },
+               {
+                "text": {
+                 "content": "8mo ago"
+                },
+                "accessibilityLabel": "8 months ago"
+               }
+              ]
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "lockupViewModel": {
+        "contentId": "8UVNT4wvIGY",
+        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+        "metadata": {
+         "lockupMetadataViewModel": {
+          "title": {
+           "content": "Gotye - Somebody That I Used To Know (feat. Kimbra) [Official Music Video]"
+          },
+          "metadata": {
+           "contentMetadataViewModel": {
+            "metadataRows": [
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "Gotye",
+                 "styleRuns": [
+                  {
+                   "startIndex": 5,
+                   "styleRunExtensions": {
+                    "styleRunColorMapExtension": {
+                     "colorMap": [
+                      {
+                       "key": "USER_INTERFACE_THEME_LIGHT",
+                       "value": 4284506208
+                      },
+                      {
+                       "key": "USER_INTERFACE_THEME_DARK",
+                       "value": 4289374890
+                      }
+                     ]
+                    }
+                   }
+                  }
+                 ],
+                 "attachmentRuns": [
+                  {
+                   "startIndex": 5,
+                   "length": 0,
+                   "element": {
+                    "type": {
+                     "imageType": {
+                      "image": {
+                       "sources": [
+                        {
+                         "clientResource": {
+                          "imageName": "AUDIO_BADGE"
+                         },
+                         "width": 14,
+                         "height": 14
+                        }
+                       ]
+                      }
+                     }
+                    },
+                    "properties": {
+                     "layoutProperties": {
+                      "height": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "width": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "margin": {
+                       "left": {
+                        "value": 4,
+                        "unit": "DIMENSION_UNIT_POINT"
+                       }
+                      }
+                     }
+                    }
+                   },
+                   "alignment": "ALIGNMENT_VERTICAL_CENTER"
+                  }
+                 ]
+                }
+               }
+              ]
+             },
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "2.7B"
+                },
+                "accessibilityLabel": "2.7 billion views",
+                "leadingIcon": {
+                 "name": "PLAY_ARROW_OUTLINED",
+                 "height": 12,
+                 "width": 12,
+                 "marginEndToken": {
+                  "spacing": 2
+                 }
+                }
+               },
+               {
+                "text": {
+                 "content": "15y ago"
+                },
+                "accessibilityLabel": "15 years ago"
+               }
+              ]
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "lockupViewModel": {
+        "contentId": "JYqfVE-fykk",
+        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+        "metadata": {
+         "lockupMetadataViewModel": {
+          "title": {
+           "content": "Washington's Dream - SNL"
+          },
+          "metadata": {
+           "contentMetadataViewModel": {
+            "metadataRows": [
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "Saturday Night Live",
+                 "styleRuns": [
+                  {
+                   "startIndex": 19,
+                   "styleRunExtensions": {
+                    "styleRunColorMapExtension": {
+                     "colorMap": [
+                      {
+                       "key": "USER_INTERFACE_THEME_DARK",
+                       "value": 4289374890
+                      },
+                      {
+                       "key": "USER_INTERFACE_THEME_LIGHT",
+                       "value": 4284506208
+                      }
+                     ]
+                    }
+                   }
+                  }
+                 ],
+                 "attachmentRuns": [
+                  {
+                   "startIndex": 19,
+                   "length": 0,
+                   "element": {
+                    "type": {
+                     "imageType": {
+                      "image": {
+                       "sources": [
+                        {
+                         "clientResource": {
+                          "imageName": "CHECK_CIRCLE_FILLED"
+                         },
+                         "width": 14,
+                         "height": 14
+                        }
+                       ]
+                      }
+                     }
+                    },
+                    "properties": {
+                     "layoutProperties": {
+                      "height": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "width": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "margin": {
+                       "left": {
+                        "value": 4,
+                        "unit": "DIMENSION_UNIT_POINT"
+                       }
+                      }
+                     }
+                    }
+                   },
+                   "alignment": "ALIGNMENT_VERTICAL_CENTER"
+                  }
+                 ]
+                }
+               }
+              ]
+             },
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "33M"
+                },
+                "accessibilityLabel": "33 million views",
+                "leadingIcon": {
+                 "name": "PLAY_ARROW_OUTLINED",
+                 "height": 12,
+                 "width": 12,
+                 "marginEndToken": {
+                  "spacing": 2
+                 }
+                }
+               },
+               {
+                "text": {
+                 "content": "3y ago"
+                },
+                "accessibilityLabel": "3 years ago"
+               }
+              ]
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "lockupViewModel": {
+        "contentId": "4fndeDfaWCg",
+        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+        "metadata": {
+         "lockupMetadataViewModel": {
+          "title": {
+           "content": "Backstreet Boys - I Want It That Way (Official HD Video)"
+          },
+          "metadata": {
+           "contentMetadataViewModel": {
+            "metadataRows": [
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "Backstreet Boys",
+                 "styleRuns": [
+                  {
+                   "startIndex": 15,
+                   "styleRunExtensions": {
+                    "styleRunColorMapExtension": {
+                     "colorMap": [
+                      {
+                       "key": "USER_INTERFACE_THEME_DARK",
+                       "value": 4289374890
+                      },
+                      {
+                       "key": "USER_INTERFACE_THEME_LIGHT",
+                       "value": 4284506208
+                      }
+                     ]
+                    }
+                   }
+                  }
+                 ],
+                 "attachmentRuns": [
+                  {
+                   "startIndex": 15,
+                   "length": 0,
+                   "element": {
+                    "type": {
+                     "imageType": {
+                      "image": {
+                       "sources": [
+                        {
+                         "clientResource": {
+                          "imageName": "AUDIO_BADGE"
+                         },
+                         "width": 14,
+                         "height": 14
+                        }
+                       ]
+                      }
+                     }
+                    },
+                    "properties": {
+                     "layoutProperties": {
+                      "height": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "width": {
+                       "value": 14,
+                       "unit": "DIMENSION_UNIT_POINT"
+                      },
+                      "margin": {
+                       "left": {
+                        "value": 4,
+                        "unit": "DIMENSION_UNIT_POINT"
+                       }
+                      }
+                     }
+                    }
+                   },
+                   "alignment": "ALIGNMENT_VERTICAL_CENTER"
+                  }
+                 ]
+                }
+               }
+              ]
+             },
+             {
+              "metadataParts": [
+               {
+                "text": {
+                 "content": "1.8B"
+                },
+                "accessibilityLabel": "1.8 billion views",
+                "leadingIcon": {
+                 "name": "PLAY_ARROW_OUTLINED",
+                 "height": 12,
+                 "width": 12,
+                 "marginEndToken": {
+                  "spacing": 2
+                 }
+                }
+               },
+               {
+                "text": {
+                 "content": "17y ago"
+                },
+                "accessibilityLabel": "17 years ago"
+               }
+              ]
+             }
+            ]
+           }
+          }
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  }
+ }
+}

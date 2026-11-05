@@ -35,9 +35,7 @@ from modules.profile_manager import (
     import_avatar,
     validate_avatar,
 )
-from modules.wizard import _setup_accounts, _setup_profile, load_accounts
 from tests.test_account_menu import MenuCase
-from tests.tui_keys import DOWN, ENTER, ESC, SPACE
 
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -499,79 +497,6 @@ class TestProfileWizard(MenuCase):
             if signed_in:
                 self.set_stage(name, 100)
 
-    def card(self, *keys: str, inputs: list | None = None, pasted: list[str] | None = None):
-        accounts = _setup_accounts(self.config_path)
-        with patch("builtins.input", side_effect=pasted if pasted is not None else EOFError):
-            return self.run_keys(lambda: _setup_profile(self.config_path, accounts), *keys, inputs=inputs)
-
-    def test_menu_row_exists(self):
-        from modules.wizard import step_account
-
-        _, output = self.run_keys(lambda: step_account(self.config_path, self.root / "sessions"), ENTER)
-        self.assertIn("Профиль канала", output)
-
-    def test_nickname_is_saved_as_a_draft(self):
-        self.seed("solo")
-        notice, output = self.card("1", ESC, inputs=["  Bakyt   Dev "])
-        self.assertEqual(self.accounts()["solo"].profile_name, "Bakyt Dev")
-        self.assertEqual(notice[0], "ok")
-        self.assertIn("Добавить описание", output)
-        self.assertIn("Добавить аватарку", output)
-
-    def test_invalid_nickname_and_cancel_change_nothing(self):
-        self.seed("solo")
-        notice, _ = self.card("1", ESC, inputs=["a<b"])
-        self.assertIsNone(self.accounts()["solo"].profile_name)
-        self.assertIsNone(notice)
-        self.card("1", ESC, inputs=[""])
-        self.assertIsNone(self.accounts()["solo"].profile_name)
-
-    def test_description_lines_until_blank(self):
-        self.seed("solo")
-        self.card("2", ESC, pasted=["Пишу про Python", "и про боты", "", ""])
-        self.assertEqual(self.accounts()["solo"].profile_description, "Пишу про Python\nи про боты")
-        self.card("2", ESC, pasted=["-", "", ""])
-        self.assertEqual(self.accounts()["solo"].profile_description, "")
-
-    def test_description_keeps_paragraphs_and_a_first_blank_line_cancels(self):
-        self.seed("solo")
-        self.card("2", ESC, pasted=["Привет", "", "О канале", "", ""])
-        self.assertEqual(self.accounts()["solo"].profile_description, "Привет\n\nО канале")
-        self.card("2", ESC, pasted=[""])
-        self.assertEqual(self.accounts()["solo"].profile_description, "Привет\n\nО канале")
-
-    def test_avatar_is_validated_copied_and_the_old_copy_removed(self):
-        self.seed("solo")
-        store = self.root / "avatars"
-        first, second = self.root / "one.png", self.root / "two.jpg"
-        first.write_bytes(PNG)
-        second.write_bytes(JPEG)
-        with patch.object(profile_manager, "AVATARS_DIR", store):
-            self.card("3", ESC, inputs=[f'"{first}"'])
-            old = Path(self.accounts()["solo"].profile_avatar)
-            self.assertTrue(old.is_file())
-            self.card("3", ESC, inputs=[str(second)])
-            new = Path(self.accounts()["solo"].profile_avatar)
-            self.assertTrue(new.is_file())
-            self.assertFalse(old.exists())
-            _, output = self.card("3", ESC, inputs=[str(self.root / "missing.png")])
-            self.assertIn("Файл не найден", output)
-            self.assertEqual(Path(self.accounts()["solo"].profile_avatar), new)
-
-    def test_space_on_an_account_opens_its_card(self):
-        self.seed("first", "second")
-        # picker: ↓ to «second», Space opens the card, «1» edits the nickname, Esc → picker, Esc → leave
-        self.card(DOWN, SPACE, "1", ESC, ESC, inputs=["Second Nick"])
-        accounts = self.accounts()
-        self.assertEqual(accounts["second"].profile_name, "Second Nick")
-        self.assertIsNone(accounts["first"].profile_name)
-
-    def test_picker_shows_profile_state(self):
-        self.seed("first", "second")
-        asyncio.run(self._draft("second", name="Nick"))
-        _, output = self.card(ESC)
-        self.assertIn("○ не задан", output)
-        self.assertIn("● есть неприменённые правки", output)
 
     async def _draft(self, account_name: str, **fields) -> None:
         db = Database(self.db_path)
@@ -579,36 +504,6 @@ class TestProfileWizard(MenuCase):
         await db.init_schema()
         await db.set_account_profile_draft((await db.get_account(account_name)).id, **fields)
         await db.close()
-
-    def test_apply_runs_the_editor_and_shows_the_summary(self):
-        self.seed("solo")
-        asyncio.run(self._draft("solo", name="Nick"))
-        result = ProfileResult("solo", True, ("name",), "")
-        with patch.object(ProfileEditor, "apply", AsyncMock(return_value=result)) as apply:
-            notice, output = self.card("4", ESC, inputs=["y"])
-        apply.assert_awaited_once()
-        self.assertEqual(notice, ("ok", "Профиль «solo»: применено — никнейм"))
-        self.assertIn("● не применено", output)
-
-    def test_apply_declined_or_without_edits_or_without_sign_in_does_not_open_a_browser(self):
-        self.seed("solo")
-        with patch.object(ProfileEditor, "apply", AsyncMock()) as apply:
-            self.card("4", ESC)  # nothing to apply
-            asyncio.run(self._draft("solo", name="Nick"))
-            self.card("4", ESC, inputs=["n"])  # declined
-            self.set_stage("solo", 100, auth_status="pending")
-            _, output = self.card("4", ESC)  # not signed in
-        apply.assert_not_awaited()
-        self.assertIn("Сначала войдите", output)
-
-    def test_apply_failure_shows_only_the_error_class(self):
-        self.seed("solo")
-        asyncio.run(self._draft("solo", name="Nick"))
-        with patch.object(ProfileEditor, "apply", AsyncMock(side_effect=RuntimeError("secret-detail"))):
-            notice, _ = self.card("4", ESC, inputs=["y"])
-        self.assertEqual(notice[0], "err")
-        self.assertIn("RuntimeError", notice[1])
-        self.assertNotIn("secret-detail", notice[1])
 
 
 class TestApplyProfileCli(unittest.IsolatedAsyncioTestCase):

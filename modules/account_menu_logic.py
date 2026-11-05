@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Sequence
 
 from database import NAME_CHANGE_WINDOW_DAYS, NAME_CHANGES_PER_WINDOW, recent_name_changes
-from modules.lifecycle_engine import AccountLifecycleEngine
+from modules.lifecycle_engine import MODE_LABELS, MODE_MATURE, MODE_UNLIMITED, AccountLifecycleEngine
 
 _PICK_ALL = {"a", "all", "все", "всех", "в"}
 _PICK_NONE = {"", "n", "no", "none", "нет", "н", "0"}
@@ -23,10 +23,12 @@ STAGE_LABELS = {
     "probation": "probation",
     "mature": "mature",
     "restricted": "restricted",
+    "unlimited": "∞",
     "-": "—",
 }
 _STAGE_STYLES = {
-    "quarantine": "warn", "aging": "warn", "probation": "accent", "mature": "ok", "restricted": "err", "-": "dim",
+    "quarantine": "warn", "aging": "warn", "probation": "accent", "mature": "ok", "restricted": "err",
+    "unlimited": "accent", "-": "dim",
 }
 
 
@@ -124,6 +126,23 @@ class LifecycleRow:
     heartbeat_style: str
     pause: str
     pause_style: str
+    mode: str = MODE_LABELS["auto"]
+    in_work: str = "да"
+    in_work_style: str = ""
+    auto_warmup: str = "вкл"
+    auto_warmup_style: str = ""
+
+
+def _stage_label(view: Any) -> str:
+    """Stage column of the lifecycle table: «прогрет» when the mode (not the age) makes the account mature."""
+    if view.stage == "mature" and view.mode == MODE_MATURE:
+        return "прогрет"
+    return STAGE_LABELS.get(view.stage, view.stage)
+
+
+def _quota_text(view: Any) -> str:
+    """«2/5»; «2/∞» for an account without a daily limit."""
+    return f"{view.quota_done}/{'∞' if view.quota_limit is None else view.quota_limit}"
 
 
 def _pause_text(account: Any, stage: str, now: datetime) -> tuple[str, str]:
@@ -162,21 +181,133 @@ def lifecycle_rows(
         if view.age_hours is None:  # not signed in yet: no age, no quota
             quota, pause, pause_style = "—", "нужен вход", "warn"
         elif not acc.is_active:  # switched off: the orchestrator never picks it
-            quota, pause, pause_style = f"{view.quota_done}/{view.quota_limit}", "отключён", "dim"
+            quota, pause, pause_style = _quota_text(view), "отключён", "dim"
         else:
-            quota = f"{view.quota_done}/{view.quota_limit}"
+            quota = _quota_text(view)
             pause, pause_style = _pause_text(acc, view.stage, now)
         rows.append(LifecycleRow(
             name=acc.name,
-            stage=STAGE_LABELS.get(view.stage, view.stage),
+            stage=_stage_label(view),
             stage_style=_STAGE_STYLES.get(view.stage, ""),
             quota=quota,
             heartbeat=f"{'ok' if alive else 'нет'} · {last}",
             heartbeat_style="ok" if alive else "warn",
             pause=pause,
             pause_style=pause_style,
+            mode=MODE_LABELS[AccountLifecycleEngine.mode_of(acc)],
+            in_work="да" if acc.is_active else "нет",
+            in_work_style="" if acc.is_active else "warn",
+            auto_warmup="вкл" if acc.auto_warmup else "выкл",
+            auto_warmup_style="" if acc.auto_warmup else "dim",
         ))
     return rows
+
+
+# ----------------------------------------------------------------------------- account modes: row text and card
+
+_STAGE_TITLES = {
+    "quarantine": "карантин (молодой)",
+    "aging": "aging (молодой)",
+    "probation": "испытательный",
+    "mature": "взрослый",
+    "restricted": "ограничен",
+    "unlimited": "без лимитов",
+}
+_AGING_END_HOURS = 48.0  # the first hour at which a comment is allowed in "auto" mode
+
+
+def account_status_label(account: Any, now: datetime | None = None) -> tuple[str, str]:
+    """(text ≤ 15 chars, theme style) for the account row: stage / mode / switched off / restricted.
+
+    Single-width glyphs only, so the row keeps the menu width in every console font.
+    """
+    now = now or datetime.now(timezone.utc)
+    if not account.is_active:
+        return "– не в работе", "dim"
+    view = AccountLifecycleEngine.summarize(account, now)
+    if view.stage == "-":  # no lifecycle clock yet (not signed in by the bot); a chosen mode is still worth showing
+        mode = AccountLifecycleEngine.mode_of(account)
+        if mode == MODE_UNLIMITED:
+            return "∞ без лимитов", "accent"
+        return ("✓ прогрет", "ok") if mode == MODE_MATURE else ("· без возраста", "dim")
+    if view.stage == "restricted":
+        return "✗ ограничен", "err"
+    if view.stage == "unlimited":
+        return "∞ без лимитов", "accent"
+    quota = f"{view.quota_done}/{view.quota_limit}"
+    if view.stage == "quarantine":
+        return f"◐ карантин {view.quarantine_left:.0f}ч", "warn"
+    if view.stage == "aging":
+        return f"◐ aging {max(0.0, _AGING_END_HOURS - (view.age_hours or 0)):.0f}ч", "warn"
+    if view.stage == "probation":
+        return f"◑ новичок {quota}", "accent"
+    word = "прогрет" if view.mode == MODE_MATURE else "взрослый"
+    return f"✓ {word} {quota}", "ok"
+
+
+def next_comment_text(account: Any, now: datetime | None = None) -> tuple[str, str]:
+    """(when the next comment is possible, style): «сейчас» / «через 35м» / «после сброса лимита…» / why not."""
+    now = now or datetime.now(timezone.utc)
+    if not account.is_active:
+        return "аккаунт не в работе", "dim"
+    view = AccountLifecycleEngine.summarize(account, now)
+    if view.stage == "-":
+        return "нет отсчёта (вход не через бота)", "dim"
+    if view.stage == "restricted":
+        return "после «Снять ограничение»", "err"
+    if view.stage == "unlimited":
+        return "сразу, без пауз", "ok"
+    if view.stage in ("quarantine", "aging"):
+        left = _AGING_END_HOURS - (view.age_hours or 0)
+        return f"через {format_duration(left * 3600)} (комментарии с 48 ч)", "warn"
+    if view.quota_limit and (view.quota_done or 0) >= view.quota_limit:
+        reset = AccountLifecycleEngine.parse_utc(account.daily_limit_reset_at)
+        when = f" через {format_duration((reset - now).total_seconds())}" if reset and reset > now else ""
+        return f"после сброса лимита{when}", "warn"
+    last = AccountLifecycleEngine.parse_utc(account.last_comment_at)
+    cooldown = AccountLifecycleEngine.cooldown_sec(view.stage, account.last_comment_at)
+    if last is not None and cooldown:
+        left_sec = cooldown - (now - last).total_seconds()
+        if left_sec > 0:
+            return f"через {format_duration(left_sec)}", "warn"
+    return "сейчас", "ok"
+
+
+def account_card_rows(account: Any, now: datetime | None = None) -> list[tuple[str, str, str]]:
+    """Rows (label, value, style) of the card on top of an account's menu."""
+    now = now or datetime.now(timezone.utc)
+    view = AccountLifecycleEngine.summarize(account, now)
+    mode = AccountLifecycleEngine.mode_of(account)
+    if view.stage == "-":
+        stage, age, limit = "нет отсчёта (вход не через бота)", "—", "—"
+    else:
+        if mode == MODE_MATURE and view.stage == "mature":
+            stage = "прогрет (вручную)"
+        else:
+            stage = _STAGE_TITLES.get(view.stage, view.stage)
+        age = f"{view.age_hours:.0f} ч с первого входа"
+        if mode != "auto" and view.age_stage:
+            age += f" · по часам: {_STAGE_TITLES.get(view.age_stage, view.age_stage)}"
+        if view.quota_limit is None:
+            limit = f"без лимита (сегодня {view.quota_done})"
+        elif view.quota_limit == 0:
+            limit = "комментарии запрещены"
+        else:
+            limit = f"{view.quota_done}/{view.quota_limit} сегодня"
+    when, when_style = next_comment_text(account, now)
+    warm = format_ago(account.last_warmup_at, now)
+    if account.warmup_sessions_done:
+        warm += f" · всего {account.warmup_sessions_done}"
+    return [
+        ("Стадия", stage, _STAGE_STYLES.get(view.stage, "")),
+        ("Возраст", age, ""),
+        ("Лимит сегодня", limit, ""),
+        ("Следующий коммент", when, when_style),
+        ("Последний прогрев", warm, ""),
+        ("Режим", MODE_LABELS[mode], "accent" if mode != "auto" else ""),
+        ("В работе", "да" if account.is_active else "нет", "" if account.is_active else "warn"),
+        ("Автопрогрев", "вкл" if account.auto_warmup else "выкл", "" if account.auto_warmup else "dim"),
+    ]
 
 
 # ----------------------------------------------------------------------------- channel profile
@@ -345,6 +476,9 @@ def format_profile_summary(
 
 __all__ = [
     "DESCRIPTION_MAX",
+    "account_card_rows",
+    "account_status_label",
+    "next_comment_text",
     "LifecycleRow",
     "NICKNAME_MAX",
     "PROFILE_FIELDS",

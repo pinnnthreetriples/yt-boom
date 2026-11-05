@@ -15,6 +15,18 @@ SIGN_IN_LINK = 'ytd-masthead #buttons a[href*="ServiceLogin"]'
 # (en, pl, de, fr): each selector matches 2 buttons (two layouts, one display:none); a miss only means the banner stays.
 CONSENT_REJECT_SELECTORS = ('form[action*="consent"]:has(input[name="set_eom"][value="true"]) button',)
 CONSENT_ACCEPT_SELECTORS = ('form[action*="consent"]:has(input[name="set_eom"][value="false"]) button',)
+# Cookie banners of other sites (cookie robot): the "accept all" button of the common consent platforms, found by the
+# platform's own stable id / class, never by its (localized) label. A miss only means the banner stays.
+CMP_ACCEPT_SELECTORS = (
+    "#onetrust-accept-btn-handler",  # OneTrust
+    "#didomi-notice-agree-button",  # Didomi
+    "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",  # Cookiebot
+    "#truste-consent-button",  # TrustArc
+    ".qc-cmp2-summary-buttons button[mode='primary']",  # Quantcast Choice
+    "button#L2AGLb",  # consent interstitial of google.com
+    "#accept-choices",  # the consent of Yahoo / Verizon Media
+    "button.fc-cta-consent",  # Funding Choices
+)
 
 
 async def first_visible(
@@ -46,4 +58,4 @@ async def first_visible(
         await asyncio.sleep(poll_seconds)
 
 
-__all__ = ["CONSENT_ACCEPT_SELECTORS", "CONSENT_REJECT_SELECTORS", "SIGN_IN_LINK", "first_visible"]
+__all__ = ["CMP_ACCEPT_SELECTORS", "CONSENT_ACCEPT_SELECTORS", "CONSENT_REJECT_SELECTORS", "SIGN_IN_LINK", "first_visible"]

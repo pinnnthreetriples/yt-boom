@@ -16,7 +16,7 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `config.py` — Pydantic models and config validator
 - `database.py` — async SQLite CRUD (`test_nodes`, `payloads`, `execution_queue`, `activity_log` tables) + `has_replied_to` deduplication
 - `main.py` — async test orchestrator and rate/throttle manager
-- `youtube_bot.py` — standalone CLI entry point for YouTube comment-reply bot (`--video`, `--search`, `--min-views`, `--max-views`, `--max-age-hours`, `--comments-per-video`, `--target-mode`, `--limit`, `--dry-run`, `--login`, `--list-replies`, `--status`, `--history`)
+- `youtube_bot.py` — standalone CLI entry point for YouTube comment-reply bot (`--video`, `--search`, `--min-views`, `--max-views`, `--max-age-hours`, `--max-videos`, `--comments-per-video`, `--target-mode`, `--limit`, `--dry-run`, `--login`, `--list-replies`, `--status`, `--history`, `--project`, `--list-projects`, `--project-add`, `--project-accounts`, `--project-remove-account`)
 - `modules/collector.py` — public endpoint data fetcher (`curl_cffi`) + language validation filter
 - `modules/youtube_collector.py` — YouTube InnerTube topic video search with view count filter & popular/nested comments scraper
 - `modules/processor.py` — DeepSeek API text integration + `normalize_text()` typography formatter
@@ -24,9 +24,9 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/ui_test_runner.py` — Camoufox browser automation runner (with YouTube runner delegation)
 - `modules/youtube_runner.py` — specialized YouTube sub-comment runner (cookie dismissal, lazy-load comments, expand replies, contenteditable typing, submission)
 - `modules/multi_account_orchestrator.py` — replies under the video list with all active accounts: `limits.max_concurrent_sessions` accounts at a time; `limits.account_mode` `each` (every account passes the whole list) or `share` (replies under each video are split between accounts)
-- `modules/pool_manager.py` — video list (`video_pool` table): pasted / file links and reply progress
+- `modules/pool_manager.py` — video list (`video_pool` table): pasted / file links and reply progress; `video_pool.source` is `links` (own links) or `search` (topic search finds, re-queued on every run, never shown as own links)
 - `modules/validator.py` — read-only DOM/cache rendering verification module
-- `modules/wizard.py` — minimalist interactive CMD setup wizard & dashboard (5-step onboarding, search setup, and interactive Activity Audit Log)
+- `modules/ui/` — tabbed console interface: `app.py:run_app` (entry), `shell.py` (render and keys), `icons.py`, `tab_launch.py` / `tab_accounts.py` / `tab_proxies.py` / `tab_projects.py` / `tab_target.py` / `tab_replies.py`; `modules/projects.py` — a project's run config (`project_config`), plan and problems
 - `modules/google_authenticator.py` — automated Google sign-in state machine (TOTP 2FA, speedbump handling, in-situ channel creation)
 - `modules/totp_helper.py` — RFC 6238 TOTP engine with time window rollover protection
 - `modules/account_parser.py` — single account and batch account file parser (`email:pass:totp[:recovery][:proxy]`)
@@ -34,10 +34,13 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/fingerprint_manager.py` — stable hardware fingerprint manager per browser session directory
 - `modules/session_heartbeat.py` — lightweight HTTP session token keep-alive & validity verifier (`curl_cffi` reading `cookies.sqlite`)
 - `modules/account_warmer.py` — organic warm-up runner (home-feed video discovery, player telemetry, comments reading, rare likes)
+- `modules/cookie_robot.py` — cookie robot: before the Google sign-in, walks a fresh profile through 4-5 random trusted sites (google.com + a search first or second) so it has cookies; asked after adding/importing accounts and in the account's «вход» menu («нагулять куки»)
 - `modules/lifecycle_engine.py` — 4-day account ageing state machine (quarantine → aging → probation → mature) with daily quota, cooldown and circuit breaker
-- `modules/account_menu_logic.py` — pure helpers of the wizard «Аккаунты» screen (warm-up pick, import/warm-up summaries, lifecycle table rows)
+- `modules/wizard.py` — shared helpers of the interface (config writes, sessions, accounts, target plan, country question, `run_wizard_app`)
+- `modules/proxy_screen.py` — proxy logic used by the «Прокси» tab (no screens)
+- `modules/account_menu_logic.py` — pure helpers of the «Аккаунты» tab (warm-up pick, import/warm-up summaries, card rows)
 - `modules/profile_manager.py` — channel profile: avatar file checks/copies (`profiles/avatars/`) and the YouTube Studio editor (nickname, description, avatar) that publishes the draft stored in the DB
-- `tests/` — comprehensive automated test suite (709 unit and integration tests)
+- `tests/` — comprehensive automated test suite (930 unit and integration tests)
 - `run_tests.py` — test discovery and test suite runner
 - `test_sessions/` — local browser session storage directories
 
@@ -55,14 +58,14 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 
 ## 5. Commands
 - Run all automated tests: `python run_tests.py`
-- Launch interactive setup wizard: `python youtube_bot.py` (or `python youtube_bot.py --wizard`)
+- Launch the console interface: `python youtube_bot.py` (or `python youtube_bot.py --wizard`)
 - Authenticate single account: `python youtube_bot.py --auth-account <name>`
 - Import accounts from file: `python youtube_bot.py --import-accounts-file <path>`
 - List all stored accounts: `python youtube_bot.py --list-accounts`
 - Check account session heartbeat (lightweight HTTP): `python youtube_bot.py --heartbeat [account]`
 - Run account warm-up: `python youtube_bot.py --warm-up <name> [--warm-up-duration 45]`
-- Publish the saved channel profile: `python youtube_bot.py --apply-profile <name>` (the draft is edited in the wizard: Accounts → Channel profile)
-- Multi-video search & reply: `python youtube_bot.py --search "python" --min-views 10000 --max-views 500000 --comments-per-video 10 --dry-run`
+- Publish the saved channel profile: `python youtube_bot.py --apply-profile <name>` (the draft is edited in the «Аккаунты» tab → account menu → «Профиль канала»)
+- Multi-video search & reply: `python youtube_bot.py --search "python" --min-views 10000 --max-views 500000 --comments-per-video 10 --dry-run` (without `--project`: through all active accounts, `MultiAccountOrchestrator.run_search`; a plain run goes through the projects «в запуске», `youtube_bot.run_projects`)
 - View activity history / audit log: `python youtube_bot.py --history`
 - List YouTube sub-comments: `python youtube_bot.py --video "https://www.youtube.com/watch?v=..." --list-replies --limit 5`
 - Video list with all accounts: `python youtube_bot.py --videos-file videos.txt --concurrency 2 --account-mode each --dry-run`

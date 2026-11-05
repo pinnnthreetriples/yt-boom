@@ -153,7 +153,16 @@ class TestDeckDraws(DeckCase):
         for _ in range(9):
             self.assertIn(await self.post("alpha", edited), edited)
         cards, _ = await self.db.deck_snapshot("alpha")
-        self.assertEqual(sorted(t for t, _ in cards), sorted(edited))
+        self.assertEqual(sorted(t for t, _ in cards if t in edited), sorted(edited))
+
+    async def test_one_account_in_two_projects_keeps_both_decks(self) -> None:
+        # a project's template list differs from another's: switching between them must not drop the used marks
+        first_list, second_list = ["a", "b"], ["x", "y"]
+        round_one = {await self.post("alpha", first_list), await self.post("alpha", first_list)}
+        round_two = {await self.post("alpha", second_list), await self.post("alpha", second_list)}
+        self.assertEqual((round_one, round_two), ({"a", "b"}, {"x", "y"}))
+        cards, _ = await self.db.deck_snapshot("alpha")
+        self.assertEqual(sorted(t for t, used in cards if used), ["a", "b", "x", "y"])  # nothing was reset by the switch
 
     async def test_duplicate_and_blank_templates_are_one_card(self) -> None:
         cards = [await self.post("alpha", ["x", " x ", "", "y", "x"]) for _ in range(2)]

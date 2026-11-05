@@ -17,15 +17,16 @@ from modules.multi_account_orchestrator import MultiAccountOrchestrator
 T0 = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
 
 
-def _account(hours_old: float = 0.0, **overrides) -> AccountRecord:
+def _account(hours_old: float = 0.0, base: datetime = T0, **overrides) -> AccountRecord:
+    """An authenticated account `hours_old` hours old at `base` (the gate reads the real clock: it passes `base=now`)."""
     fields = dict(
         id=1,
         name="acc",
         session_path="s",
-        created_at=T0.isoformat(),
+        created_at=base.isoformat(),
         auth_status="authenticated",
-        authenticated_at=(T0 - timedelta(hours=hours_old)).isoformat(),
-        daily_limit_reset_at=(T0 + timedelta(hours=6)).isoformat(),
+        authenticated_at=(base - timedelta(hours=hours_old)).isoformat(),
+        daily_limit_reset_at=(base + timedelta(hours=6)).isoformat(),
     )
     fields.update(overrides)
     return AccountRecord(**fields)
@@ -235,6 +236,11 @@ class TestDatabaseLifecycle(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await db.get_account(acc.id)).fingerprint_data, payload)
 
 
+def _live_account(hours_old: float = 0.0, **overrides) -> AccountRecord:
+    """Like `_account`, but aged against the real clock, which is what the orchestrator's gate uses."""
+    return _account(hours_old, base=datetime.now(timezone.utc), **overrides)
+
+
 class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
     def _orchestrator(self, db, dry_run=False):
         cfg = MagicMock()
@@ -249,8 +255,8 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
         return orch, warmer
 
     async def test_young_accounts_are_skipped_and_warmed_up_in_the_background(self):
-        young = _account(2, id=1, name="young")
-        mature = _account(100, id=2, name="mature")
+        young = _live_account(2, id=1, name="young")
+        mature = _live_account(100, id=2, name="mature")
         db = AsyncMock(spec=Database)
         db.list_active_accounts.return_value = [young, mature]
         orch, warmer = self._orchestrator(db)
@@ -263,7 +269,7 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(warmer.warm_up.await_args.args[0].name, "young")
 
     async def test_recently_warmed_account_is_not_warmed_again(self):
-        recent = _account(2, last_warmup_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat())
+        recent = _live_account(2, last_warmup_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat())
         db = AsyncMock(spec=Database)
         db.list_active_accounts.return_value = [recent]
         orch, warmer = self._orchestrator(db)
@@ -274,7 +280,7 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_warmup_is_not_retried_on_every_pick(self):
         db = AsyncMock(spec=Database)
-        db.list_active_accounts.return_value = [_account(2)]
+        db.list_active_accounts.return_value = [_live_account(2)]
         orch, warmer = self._orchestrator(db)
         warmer.warm_up.return_value = MagicMock(success=False)
 
@@ -285,7 +291,7 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
 
     async def test_warmup_waits_for_the_account_lock_and_frees_its_open_browser(self):
         db = AsyncMock(spec=Database)
-        db.list_active_accounts.return_value = [_account(2, id=7)]
+        db.list_active_accounts.return_value = [_live_account(2, id=7)]
         orch, warmer = self._orchestrator(db)
         runner = MagicMock(close=AsyncMock())
         orch._runners[7] = runner
@@ -303,7 +309,7 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
 
     async def test_dry_run_never_starts_a_warmup(self):
         db = AsyncMock(spec=Database)
-        db.list_active_accounts.return_value = [_account(2)]
+        db.list_active_accounts.return_value = [_live_account(2)]
         orch, warmer = self._orchestrator(db, dry_run=True)
 
         self.assertEqual(await orch._usable_accounts(), [])
@@ -311,7 +317,7 @@ class TestOrchestratorGate(unittest.IsolatedAsyncioTestCase):
         warmer.warm_up.assert_not_awaited()
 
     async def test_accounts_that_were_never_signed_in_by_the_bot_are_not_gated(self):
-        manual = _account(0, auth_status="pending", authenticated_at=None)
+        manual = _live_account(0, auth_status="pending", authenticated_at=None)
         db = AsyncMock(spec=Database)
         db.list_active_accounts.return_value = [manual]
         orch, _ = self._orchestrator(db)

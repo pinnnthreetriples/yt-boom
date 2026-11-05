@@ -1,4 +1,3 @@
-import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,11 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import yaml
 
-from config import AppConfig, CollectorSettings, LimitsSettings, ProcessorSettings, load_config
+from config import AppConfig, ProcessorSettings, load_config
 from database import Database
 from modules.collector import CollectedItem
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
-from modules.processor import DEFAULT_STYLES, DeepSeekProcessor, resolve_reply_text
+from modules.processor import DEFAULT_STYLES
 
 
 class TestBoostFeatures(unittest.IsolatedAsyncioTestCase):
@@ -69,6 +68,7 @@ class TestBoostFeatures(unittest.IsolatedAsyncioTestCase):
                 "video_cooldown_seconds": 180,
                 "pause_min_seconds": 15,
                 "pause_max_seconds": 45,
+                "visibility_check_enabled": False,  # no anonymous look-up (45 s wait, network) in unit tests
             },
             "validator": {
                 "endpoint_template": "https://www.youtube.com/watch?v={remote_id}",
@@ -285,27 +285,6 @@ class TestBoostFeatures(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs.get("reply_mode"), "custom")
             self.assertEqual(kwargs.get("custom_reply"), "Hello from CLI!")
 
-    def test_wizard_step_reply_mode_switch_and_templates(self):
-        from modules.wizard import step_reply_mode
-
-        # 1. Switch to custom mode
-        with patch("modules.wizard.prompt_user", side_effect=["2", "0"]):
-            mode, replies = step_reply_mode(self.config_path)
-            self.assertEqual(mode, "custom")
-            loaded = load_config(self.config_path)
-            self.assertEqual(loaded.processor.reply_mode, "custom")
-
-        # 2. Add a new template
-        with patch("modules.wizard.prompt_user", side_effect=["3", "New custom template", "0"]):
-            mode, replies = step_reply_mode(self.config_path)
-            self.assertIn("New custom template", replies)
-            loaded = load_config(self.config_path)
-        # 3. Switch back to ai mode
-        with patch("modules.wizard.prompt_user", side_effect=["1", "0"]):
-            mode, replies = step_reply_mode(self.config_path)
-            self.assertEqual(mode, "ai")
-            loaded = load_config(self.config_path)
-            self.assertEqual(loaded.processor.reply_mode, "ai")
 
     def test_resolve_reply_text_edge_cases(self):
         from modules.processor import ProcessorError, resolve_reply_text
