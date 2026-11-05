@@ -288,6 +288,38 @@ class TestRun(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.failed, ())
         self.assertEqual(len([b for b in self.buckets if "/search?" in b["url"]]), 1)
 
+    async def test_a_search_that_did_not_reach_the_results_falls_back_to_the_url(self) -> None:
+        # a covered search box types into nothing: the page never goes to /search
+        self.page.wait_for_url = AsyncMock(side_effect=asyncio.TimeoutError())
+        result = await self.go()
+        self.assertTrue(result.success)
+        self.page.wait_for_url.assert_awaited_once()
+        self.assertEqual(self.page.wait_for_url.await_args.args[0], cookie_robot.GOOGLE_RESULTS_URL)
+        self.assertEqual(len([b for b in self.buckets if "/search?" in b["url"]]), 1)
+
+    async def test_banner_click_has_a_short_timeout(self) -> None:
+        self.consent_button = MagicMock(name="accept")
+        await self.go()
+        banner_clicks = [c for c in self.sim.click_locator.await_args_list if c.args[1] is self.consent_button]
+        self.assertTrue(banner_clicks)
+        self.assertTrue(all(c.kwargs.get("timeout_ms") == cookie_robot.CLICK_TIMEOUT_MS for c in banner_clicks))
+
+    async def test_a_browser_that_will_not_close_does_not_hang_the_run(self) -> None:
+        async def hang() -> None:
+            await asyncio.sleep(30)
+
+        self.runner.close.side_effect = hang
+        with patch.object(cookie_robot, "CLOSE_TIMEOUT", 0.05):
+            result = await asyncio.wait_for(self.go(), timeout=10)
+        self.assertTrue(result.success)
+
+    async def test_start_error_is_one_line(self) -> None:
+        self.runner.start.side_effect = RuntimeError("Timeout 30000ms exceeded.\nCall log:\n  - launching\n  - waiting")
+        result = await self.go()
+        self.assertFalse(result.success)
+        self.assertNotIn("\n", result.details)
+        self.assertIn("Call log: - launching - waiting", result.details)
+
     async def test_broken_progress_callback_does_not_stop_the_run(self) -> None:
         def broken(*_args) -> None:
             raise RuntimeError("bar crashed")
@@ -295,6 +327,53 @@ class TestRun(unittest.IsolatedAsyncioTestCase):
         result = await self.go(on_progress=broken)
         self.assertTrue(result.success)
         self.assertEqual(len(result.failed), 0)
+
+
+class TestRunCookieRobot(unittest.IsolatedAsyncioTestCase):
+    """`youtube_bot.run_cookie_robot`: several accounts, a pause only between runs that opened a browser."""
+
+    async def test_pause_only_between_browser_runs(self) -> None:
+        import youtube_bot
+
+        accounts = {
+            name: AccountRecord(id=i, name=name, session_path=f"s/{name}", created_at="2026-01-01T00:00:00Z")
+            for i, name in enumerate(("a", "c"), 1)
+        }
+
+        class FakeDb:
+            async def get_account(self, name):
+                return accounts.get(name)
+
+        class FakeContext:
+            async def __aenter__(self):
+                return FakeDb()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        robot = MagicMock()
+        robot.run = AsyncMock(side_effect=lambda account, progress: cookie_robot.CookieRobotResult(account.name, True, ("x",), (), 0.1, "ok"))
+        pauses: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            pauses.append(seconds)
+
+        lines: list[str] = []
+        progress: list[tuple] = []
+        cfg = MagicMock()
+        with patch.object(youtube_bot, "load_config", return_value=cfg), patch.object(
+            youtube_bot, "_open_db", lambda _cfg: FakeContext()
+        ), patch.object(youtube_bot, "CookieRobot", return_value=robot), patch.object(youtube_bot.asyncio, "sleep", fake_sleep):
+            results = await youtube_bot.run_cookie_robot(
+                "cfg.yaml", ["missing", "a", "c"], on_progress=lambda *args: progress.append(args), report=lines.append
+            )
+        self.assertEqual([r.success for r in results], [False, True, True])
+        self.assertEqual(results[0].details, "account not found")
+        self.assertEqual(len(pauses), 1)  # a missing account costs no pause; the first real run neither
+        self.assertEqual(len(lines), 3)
+        # the account's name is put in front of the robot's (step, total, site)
+        robot.run.await_args_list[0].args[1](2, 4, "google.com")
+        self.assertEqual(progress, [("a", 2, 4, "google.com")])
 
 
 if __name__ == "__main__":

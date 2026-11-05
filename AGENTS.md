@@ -40,7 +40,7 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/proxy_screen.py` — proxy logic used by the «Прокси» tab (no screens)
 - `modules/account_menu_logic.py` — pure helpers of the «Аккаунты» tab (warm-up pick, import/warm-up summaries, card rows)
 - `modules/profile_manager.py` — channel profile: avatar file checks/copies (`profiles/avatars/`) and the YouTube Studio editor (nickname, description, avatar) that publishes the draft stored in the DB
-- `tests/` — comprehensive automated test suite (922 unit and integration tests)
+- `tests/` — comprehensive automated test suite (930 unit and integration tests)
 - `run_tests.py` — test discovery and test suite runner
 - `test_sessions/` — local browser session storage directories
 

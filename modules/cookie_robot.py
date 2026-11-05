@@ -35,7 +35,8 @@ class Site:
 
 GOOGLE_URL = "https://www.google.com/?hl=en"
 GOOGLE_SEARCH_URL = "https://www.google.com/search?hl=en&q={query}"
-GOOGLE_QUERIES = ("weather today", "world news", "news today", "what time is it")
+GOOGLE_RESULTS_URL = "**/search?*"
+GOOGLE_QUERIES =("weather today", "world news", "news today", "what time is it")
 GOOGLE_SEARCH_BOX = ('textarea[name="q"]', 'input[name="q"]')  # structural: the page is localized
 
 SITE_POOL: tuple[Site, ...] = (
@@ -60,8 +61,10 @@ DWELL_MIN, DWELL_MAX = 5.0, 8.0  # seconds on a page after it loaded
 SCROLLS_MIN, SCROLLS_MAX = 1, 2
 SCROLL_MIN_PX, SCROLL_MAX_PX = 300, 700
 NAV_TIMEOUT_MIN, NAV_TIMEOUT_MAX = 10.0, 12.0  # seconds to load one page
-SITE_MARGIN = 20.0  # on top of load + dwell: banner, typing the search, scrolling
+SITE_MARGIN = 35.0  # on top of load + dwell: banners, the search (two loads), scrolling; only a hang runs into it
 CONSENT_WAIT = 1.5  # seconds to wait for a cookie banner to show up
+CLICK_TIMEOUT_MS = 3000  # a covered banner button must not stall the visit for the default 30 s
+CLOSE_TIMEOUT = 30.0  # seconds the browser gets to close
 
 
 @dataclass(frozen=True)
@@ -143,16 +146,18 @@ class CookieRobot:
                     visited.append(site.name)
                 except Exception as exc:  # one blocked / slow site never stops the walk
                     failed.append(site.name)
-                    logger.warning("Куки-робот: {} не открылся у {!r}: {}", site.name, account.name, exc or exc.__class__.__name__)
+                    logger.warning("Куки-робот: {} не открылся у {!r}: {}", site.name, account.name, str(exc) or exc.__class__.__name__)
         except Exception as exc:
-            error = f"{exc.__class__.__name__}: {exc}"
+            # one line: Playwright errors carry a multi-line call log that would break a Notice
+            error = f"{exc.__class__.__name__}: {' '.join(str(exc).split())}"
             logger.error("Куки-робот: аккаунт {!r}: {}", account.name, error)
         finally:
-            # closing the browser flushes the cookies to the profile and frees its parent.lock
+            # closing the browser flushes the cookies to the profile and releases its parent.lock; a wedged Firefox must
+            # not hang the caller forever
             try:
-                await runner.close()
+                await asyncio.wait_for(runner.close(), timeout=CLOSE_TIMEOUT)
             except Exception as exc:
-                logger.debug("Куки-робот: ошибка при закрытии браузера: {}", exc)
+                logger.debug("Куки-робот: ошибка при закрытии браузера: {}", exc or exc.__class__.__name__)
 
         duration = time.monotonic() - started
         if error is not None and not visited:
@@ -208,7 +213,7 @@ class CookieRobot:
             button = await first_visible(page, CONSENT_ACCEPT_SELECTORS + CMP_ACCEPT_SELECTORS, timeout_seconds=CONSENT_WAIT)
             if button is None:
                 return
-            await self._simulator.click_locator(page, button)
+            await self._simulator.click_locator(page, button, timeout_ms=CLICK_TIMEOUT_MS)
             await self._simulator.human_pause(0.8, 1.6)
         except Exception as exc:
             logger.debug("Куки-робот: баннер согласия не закрылся: {}", exc)
@@ -219,18 +224,15 @@ class CookieRobot:
         box = await first_visible(page, GOOGLE_SEARCH_BOX, timeout_seconds=3.0)
         if box is not None:
             try:
-                await self._simulator.click_locator(page, box)
+                await self._simulator.click_locator(page, box, timeout_ms=CLICK_TIMEOUT_MS)
                 await self._simulator.type_text(page, query, allow_typos=False)
                 await page.keyboard.press("Enter")
+                # the search really happened only when the page went to the results (a covered box types into nothing)
+                await page.wait_for_url(GOOGLE_RESULTS_URL, timeout=nav_timeout * 1000)
                 typed = True
             except Exception as exc:
-                logger.debug("Куки-робот: поисковую строку не удалось заполнить, открываю поиск по ссылке: {}", exc)
-        if typed:
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=nav_timeout * 1000)
-            except Exception as exc:
-                logger.debug("Куки-робот: результаты поиска не загрузились вовремя: {}", exc)
-        else:
+                logger.debug("Куки-робот: поиск через строку не вышел, открываю его по ссылке: {}", str(exc) or exc.__class__.__name__)
+        if not typed:
             await page.goto(GOOGLE_SEARCH_URL.format(query=quote_plus(query)), wait_until="domcontentloaded", timeout=nav_timeout * 1000)
         await self._dismiss_consent(page)
 

@@ -804,14 +804,16 @@ async def run_cookie_robot(
         cfg.browser.headless = headless
     robot = CookieRobot(cfg.browser)
     results: list[CookieRobotResult] = []
+    worked = False  # a browser already ran: the next account waits first (a missing account costs no pause)
     async with _open_db(cfg) as db:
         for name in names:
             account = await db.get_account(name)
             if account is None:
                 results.append(CookieRobotResult(name, False, (), (), 0.0, "account not found"))
             else:
-                if results:
+                if worked:
                     await asyncio.sleep(_pause_between_accounts(account))
+                worked = True
                 progress = None if on_progress is None else (lambda step, total, site, who=account.name: on_progress(who, step, total, site))
                 results.append(await robot.run(account, progress))
             report(f"[{'OK' if results[-1].success else 'FAILED'}] {results[-1].account_name}: {results[-1].details}")

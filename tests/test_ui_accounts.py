@@ -234,6 +234,32 @@ class TestAddAndBulk(AccountsTabCase):
         self.assertIn("[=>        ] 1/4 google.com", drawn)
         self.assertIn("[=========>] 4/4 wikipedia.org", drawn)
 
+    def test_robot_outcome_is_in_the_sign_in_question(self):
+        from modules.cookie_robot import CookieRobotResult
+
+        c = self.add_one()
+        c.press("right")
+        c.press("enter")
+
+        async def failing(config_path, names, on_progress=None, headless=None, report=print):
+            return [CookieRobotResult(names[0], False, (), ("google.com",), 1.0, "0 из 4 сайтов")]
+
+        with patch("youtube_bot.run_cookie_robot", failing), patch("modules.wizard.safe_print"):
+            step = c.pending_run.work()
+        self.assertIn("0 из 4 сайтов", step.question[0].text)
+        self.assertIn("Войти и прогреть", step.question[0].text)
+
+    def test_accounts_without_a_proxy_get_a_warning(self):
+        c = self.add_one()  # a new account has no proxy: the cookies would carry the home IP
+        self.assertIn("с вашего IP", self.screen(c))
+
+    def test_manual_menu_warns_about_the_own_ip(self):
+        from modules.ui.tab_accounts import cookie_robot_menu
+
+        account_id = self.add("work")
+        confirm = cookie_robot_menu(self.ctx, account_id)
+        self.assertIn("с вашего IP", confirm.question[0].text)
+
     def test_cookie_robot_failure_still_asks_to_sign_in(self):
         from modules.ui.shell import Confirm
 
