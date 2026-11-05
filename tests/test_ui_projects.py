@@ -126,8 +126,9 @@ class OneProjectTest(UiCase):
         out = self.screen(self.controller())
         lines = [line.rstrip() for line in out.split("\n")]
         start = lines.index(" ▸ ◇  пробный ‹›")
-        self.assertEqual([line for line in lines[start:start + 7] if line], [
+        self.assertEqual([line for line in lines[start:start + 8] if line], [
             " ▸ ◇  пробный ‹›",
+            "   ▤  ответов на видео: 3 · видео на тему: 5 · лимит без своего лимита",
             "   ▣  показывать",
             "   ●  Проверка видимости: включена",
             "   ≡  журнал 0",
