@@ -24,6 +24,7 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
         cfg_data["app"]["log_file"] = str(self.root / "test.log")
         cfg_data["browser"]["session_root"] = str(self.root / "sessions")
         cfg_data["collector"]["target_mode"] = "raw"
+        cfg_data["limits"]["visibility_check_enabled"] = False  # no anonymous look-up (45 s wait, network) in unit tests
         cfg_data["reply_mode"] = "ai"
         cfg_data["processor"]["reply_mode"] = "ai"
         cfg_data["custom_replies"] = []

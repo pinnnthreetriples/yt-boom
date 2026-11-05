@@ -58,14 +58,19 @@ class TestCommentVisibilityChecker(unittest.IsolatedAsyncioTestCase):
         self.assertIn("не найден", message)
         self.assertNotIn("бан", message.lower())
 
-    async def test_watch_stays_quiet_when_visible_or_unverifiable(self) -> None:
+    async def test_watch_logs_success_when_visible_and_a_distinct_warning_when_unverifiable(self) -> None:
         body = '{"commentId":"Ugx.reply"}'
         for collector, expected in ((_collector(body), True), (_collector("{}", token=None), None)):
             with patch("modules.comment_visibility.asyncio.sleep", AsyncMock()), patch(
                 "modules.comment_visibility.logger"
             ) as log:
                 self.assertEqual(await CommentVisibilityChecker(collector).watch("v", "Ugx.reply", "a"), expected)
-            log.warning.assert_not_called()
+            if expected:
+                log.success.assert_called_once()
+                log.warning.assert_not_called()
+            else:
+                log.success.assert_not_called()
+                self.assertIn("не удалось проверить", log.warning.call_args.args[0])
 
     async def test_unexpected_errors_never_escape_the_background_task(self) -> None:
         collector = _collector("{}")

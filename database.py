@@ -224,6 +224,11 @@ _ACTIVITY_PROJECT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("account_id", "INTEGER REFERENCES accounts(id) ON DELETE SET NULL"),
 )
 
+# Result of the anonymous visibility check of a published reply (NULL = never checked). Written after the insert,
+# by `Database.set_activity_visibility`; observability only, it never touches `status` or any counter.
+_ACTIVITY_VISIBILITY_COLUMNS: tuple[tuple[str, str], ...] = (("visibility", "TEXT"),)
+VISIBILITY_STATES: tuple[str, ...] = ("seen", "unseen", "unknown")
+
 _ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
     ("email", "TEXT"),
     ("password", "TEXT"),
@@ -402,6 +407,7 @@ class ActivityLogEntry(BaseModel):
     payload_id: int | None = None
     project_id: int | None = None
     account_id: int | None = None
+    visibility: str | None = None  # seen / unseen / unknown; None = the reply was not checked
 
 
 class ActivityLogCreate(BaseModel):
@@ -1040,7 +1046,7 @@ class Database:
     async def _ensure_activity_columns(self, conn: aiosqlite.Connection) -> None:
         """Incremental migration: the journal records the project and the account of each reply."""
         existing = await self._columns(conn, "activity_log")
-        for column, ddl in _ACTIVITY_PROJECT_COLUMNS:
+        for column, ddl in (*_ACTIVITY_PROJECT_COLUMNS, *_ACTIVITY_VISIBILITY_COLUMNS):
             if column not in existing:
                 try:
                     await conn.execute(f"ALTER TABLE activity_log ADD COLUMN {column} {ddl}")
@@ -1896,6 +1902,13 @@ class Database:
         if row is None:
             raise RecordNotFoundError(f"activity_log {log_id} not found")
         return ActivityLogEntry.model_validate(dict(row))
+
+    async def set_activity_visibility(self, log_id: int, state: str) -> None:
+        """Store the visibility check result of one journal record; a record that is gone is a silent no-op."""
+        if state not in VISIBILITY_STATES:
+            raise ValueError(f"visibility must be one of {VISIBILITY_STATES}, got {state!r}")
+        async with self._transaction() as conn:
+            await conn.execute("UPDATE activity_log SET visibility = ? WHERE id = ?", (state, log_id))
 
     async def count_successful_replies_for_video(self, video_id: str, status: str | None = None) -> int:
         """Count replies successfully submitted or simulated for a specific video."""

@@ -450,6 +450,8 @@ class LimitsSettings(BaseModel):
     pause_max_seconds: float = Field(default=20.0, ge=0)
     # Wait this long after a posted reply, then look for it as an anonymous visitor would (0 turns the check off).
     visibility_check_delay_seconds: float = Field(default=45.0, ge=0)
+    # The switch of the «Запуск» tab; the check runs only when it is on AND the delay above is above 0.
+    visibility_check_enabled: bool = True
     retry_backoff_seconds: float = Field(default=45.0, ge=1)
     max_queue_attempts: int = Field(default=3, ge=1, le=10)
 

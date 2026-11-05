@@ -68,6 +68,7 @@ class TestBoostFeatures(unittest.IsolatedAsyncioTestCase):
                 "video_cooldown_seconds": 180,
                 "pause_min_seconds": 15,
                 "pause_max_seconds": 45,
+                "visibility_check_enabled": False,  # no anonymous look-up (45 s wait, network) in unit tests
             },
             "validator": {
                 "endpoint_template": "https://www.youtube.com/watch?v={remote_id}",
