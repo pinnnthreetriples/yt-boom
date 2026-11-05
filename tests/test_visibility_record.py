@@ -78,7 +78,7 @@ class TestWatchLogging(unittest.IsolatedAsyncioTestCase):
         message = log.success.call_args.args[0]
         self.assertIn("[ВИДИМОСТЬ]", message)
         self.assertIn("виден всем", message)
-        self.assertEqual(log.success.call_args.args[1:], ("Ugx.r", "acc", "vid"))
+        self.assertEqual(log.success.call_args.args[1:4], ("Ugx.r", "acc", "vid"))  # then looks made and seconds waited
         log.warning.assert_not_called()
 
     async def test_unseen_and_unknown_are_warnings_with_different_words(self) -> None:
