@@ -414,7 +414,8 @@ class MultiAccountOrchestrator:
             )
 
     async def _may_comment_now(self, acc: AccountRecord) -> bool:
-        """Re-check an account that was picked earlier (mode "each") against its current counters in the database."""
+        """Re-check an account about to comment (its turn in "each" mode, its video queue in "share") against its
+        current counters in the database."""
         fresh = await self._db.get_account(acc.id)
         if fresh is not None and not fresh.is_active:  # switched off in the wizard while the run was going
             return False
@@ -871,7 +872,7 @@ class MultiAccountOrchestrator:
         """Where the circle of the previous launch stopped (0 for the first one or a damaged value)."""
         try:
             return max(0, int(await self._db.get_setting(self._share_offset_key()) or 0))
-        except (ValueError, TypeError) as exc:
+        except Exception as exc:  # a damaged value or a failing database: start the circle from the first account
             logger.debug("[SHARE] Смещение круга не прочитано: {}", exc)
             return 0
 
@@ -915,7 +916,8 @@ class MultiAccountOrchestrator:
             return 0
 
         offset = await self._share_offset()
-        await self._save_share_offset(offset + len(todo))
+        cursor = offset + len(todo)  # where the circle goes on: the next launch starts here, so do the hand-overs
+        await self._save_share_offset(cursor)
         order = {video.id: index for index, video in enumerate(todo)}
         posted: defaultdict[int, int] = defaultdict(int)  # replies of this run under each video
         orphans: list[VideoPoolItem] = []  # videos of accounts that were stopped before finishing them
@@ -962,7 +964,9 @@ class MultiAccountOrchestrator:
                     )
                     break
                 handed = sorted(orphans, key=lambda video: order[video.id])
-                assignments = self._deal(handed, helpers, 0)
+                assignments = self._deal(handed, helpers, cursor)  # the circle goes on: no skew to the lowest id
+                cursor += len(handed)
+                await self._save_share_offset(cursor)
                 logger.info(
                     "ИНФО | Видео аккаунтов без лимита переданы другим: {}",
                     ", ".join(f"{acc.name} — {len(queue)}" for acc, queue in assignments),
