@@ -34,12 +34,13 @@ A modular Python 3.11+ automated testing and telemetry pipeline for Windows with
 - `modules/fingerprint_manager.py` — stable hardware fingerprint manager per browser session directory
 - `modules/session_heartbeat.py` — lightweight HTTP session token keep-alive & validity verifier (`curl_cffi` reading `cookies.sqlite`)
 - `modules/account_warmer.py` — organic warm-up runner (home-feed video discovery, player telemetry, comments reading, rare likes)
+- `modules/cookie_robot.py` — cookie robot: before the Google sign-in, walks a fresh profile through 4-5 random trusted sites (google.com + a search first or second) so it has cookies; asked after adding/importing accounts and in the account's «вход» menu («нагулять куки»)
 - `modules/lifecycle_engine.py` — 4-day account ageing state machine (quarantine → aging → probation → mature) with daily quota, cooldown and circuit breaker
 - `modules/wizard.py` — shared helpers of the interface (config writes, sessions, accounts, target plan, country question, `run_wizard_app`)
 - `modules/proxy_screen.py` — proxy logic used by the «Прокси» tab (no screens)
 - `modules/account_menu_logic.py` — pure helpers of the «Аккаунты» tab (warm-up pick, import/warm-up summaries, card rows)
 - `modules/profile_manager.py` — channel profile: avatar file checks/copies (`profiles/avatars/`) and the YouTube Studio editor (nickname, description, avatar) that publishes the draft stored in the DB
-- `tests/` — comprehensive automated test suite (761 unit and integration tests)
+- `tests/` — comprehensive automated test suite (922 unit and integration tests)
 - `run_tests.py` — test discovery and test suite runner
 - `test_sessions/` — local browser session storage directories
 

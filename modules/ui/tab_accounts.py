@@ -338,6 +338,63 @@ def warm_now(ctx: AppContext, account_id: int) -> Step:
                    lambda i: Run(work, f"{icon('warmup')} Прогрев · {acc.name}") if i == 1 else None)
 
 
+def cookie_progress_printer(total_accounts: int) -> Callable[[str, int, int, str], None]:
+    """Draws `[=====>    ] 3/5 wikipedia.org` in place on one terminal line (with the account name for several)."""
+    from modules.cookie_robot import format_progress_bar
+    from modules.wizard import safe_print
+
+    width = 0
+
+    def draw(account: str, step: int, total: int, site: str) -> None:
+        nonlocal width
+        line = format_progress_bar(step, total, site)
+        if total_accounts > 1:
+            line = f"{account}  {line}"
+        line = f" {line}"
+        safe_print("\r" + line.ljust(width), end="", flush=True)
+        width = len(line)
+
+    return draw
+
+
+def cookie_robot_work(ctx: AppContext, names: list[str], then: Callable[[str], Step] | None = None) -> Callable[[], Step]:
+    """Work of the «куки-робот» `Run`: the robot over `names` with the progress bar, then a Notice with the outcome.
+
+    With `then` (the add / import flow) the next step is `then(outcome)` instead: the sign-in question follows either way."""
+
+    def work() -> Step:
+        from modules.wizard import safe_print
+        from youtube_bot import run_cookie_robot
+
+        draw = cookie_progress_printer(len(names))
+        try:
+            results = asyncio.run(run_cookie_robot(str(ctx.config_path), names, on_progress=draw, report=lambda _line: None))
+        except Exception as exc:
+            ok, text = False, f"Куки-робот не отработал: {exc.__class__.__name__} (подробности в логе)"
+        else:
+            good = [r for r in results if r.success]
+            ok = bool(good)
+            if len(results) == 1:
+                text = f"«{results[0].account_name}»: куки-робот — {results[0].details}"
+            else:
+                text = f"Куки-робот: {len(good)} из {len(results)} акк."
+                bad = next((r for r in results if not r.success), None)
+                if bad is not None:
+                    text += f" · «{bad.account_name}»: {bad.details}"
+        safe_print()  # the progress line stays; what comes next starts under it
+        if then is not None:
+            return then(text)
+        return Notice("ok" if ok else "err", fit(text, 110))
+
+    return work
+
+
+def cookie_robot_menu(ctx: AppContext, account_id: int) -> Step:
+    acc = _fresh(ctx, account_id)
+    return Confirm([Cell(f"Нагулять куки «{acc.name}»? Откроется браузер, 4–5 сайтов, ~1 мин")], ["Нет", "Нагулять"],
+                   lambda i: Run(cookie_robot_work(ctx, [acc.name]), f"{icon('cookie')} Куки-робот · {acc.name}") if i == 1 else None)
+
+
 def release(ctx: AppContext, account_id: int) -> Step:
     acc = _fresh(ctx, account_id)
 
@@ -388,6 +445,8 @@ def login_menu(ctx: AppContext, account_id: int) -> Step:
             hint="По почте и паролю аккаунта, откроется браузер", enter=lambda: auto_login(ctx, account_id)),
         Row("l-manual", [Cell(icon("window_on"), "", 3), Cell("войти вручную")],
             hint="Откроется окно браузера: войдите в Google и закройте окно", enter=lambda: manual_login(ctx, acc.name)),
+        Row("l-cookies", [Cell(icon("cookie"), "", 3), Cell("нагулять куки")],
+            hint="Перед входом: браузер обойдёт 4–5 сайтов, чтобы у профиля были куки Google", enter=lambda: cookie_robot_menu(ctx, account_id)),
         Row("l-check", [Cell(icon("check"), "", 3), Cell("проверить вход")],
             hint="Есть ли сохранённая сессия YouTube", enter=lambda: check_login(acc)),
         Row("l-logout", [Cell(icon("no_login"), "", 3), Cell("выйти")],
@@ -768,14 +827,24 @@ def register(ctx: AppContext, lines: list[str], mode: str, total: int) -> Step:
         return Notice("warn", fit(text, 74))
     names = [a.name for a in result.added]
 
-    def warm_then_remind() -> Notice:
-        done = warm_selected(ctx, names)
-        return Notice(done.kind, fit(f"{done.text} · {NEW_WITHOUT_PROJECT}", 110))
+    def sign_in_question(outcome: str = "") -> Step:
+        def warm_then_remind() -> Notice:
+            done = warm_selected(ctx, names)
+            return Notice(done.kind, fit(f"{done.text} · {NEW_WITHOUT_PROJECT}", 110))
 
-    # decision 7: a new account joins no project — say it in the notice that closes the adding
-    return Confirm([Cell(fit(text + ". Войти и прогреть сейчас?", 60), "ok")], ["Позже", "Войти и прогреть"],
-                   lambda i: Run(warm_then_remind, f"{icon('warmup')} Вход и прогрев · {len(names)} акк.")
-                   if i == 1 else Notice("ok", fit(f"{text} · {NEW_WITHOUT_PROJECT}", 110)))
+        later = f"{text} · {outcome}" if outcome else text  # the cookie robot's outcome rides in the notice of «Позже»
+        # decision 7: a new account joins no project — say it in the notice that closes the adding
+        return Confirm([Cell(fit(text + ". Войти и прогреть сейчас?", 60), "ok")], ["Позже", "Войти и прогреть"],
+                       lambda i: Run(warm_then_remind, f"{icon('warmup')} Вход и прогрев · {len(names)} акк.")
+                       if i == 1 else Notice("ok", fit(f"{later} · {NEW_WITHOUT_PROJECT}", 110)))
+
+    def cookies_pick(i: int) -> Step:
+        if i != 1:
+            return sign_in_question()
+        return Run(cookie_robot_work(ctx, names, then=sign_in_question), f"{icon('cookie')} Куки-робот · {len(names)} акк.")
+
+    # a fresh profile has no cookies at all, which is what makes Google ask for a captcha at the sign-in
+    return Confirm([Cell("Нагулять профиль перед входом (куки-робот)?")], ["Нет", "Да"], cookies_pick)
 
 
 def warm_selected(ctx: AppContext, names: list[str]) -> Notice:

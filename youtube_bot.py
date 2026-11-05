@@ -15,6 +15,7 @@ from loguru import logger
 from config import AppConfig, ProxyUnavailableError, load_config, mask_proxy_url, resolve_account_proxy
 from database import DEFAULT_PROJECT_NAME, AccountRecord, ActivityLogCreate, Database, ProjectRecord, RecordNotFoundError
 from modules.collector import CollectorError
+from modules.cookie_robot import CookieRobot, CookieRobotResult
 from modules.account_parser import looks_like_credentials, parse_account_line
 from modules.account_menu_logic import format_profile_summary, profile_pending_fields
 from modules.account_warmer import AccountWarmer, WarmUpResult
@@ -783,6 +784,36 @@ async def warm_selected_cli(
                 results.extend(await warm_accounts(db, cfg, [account], duration, report=lambda _line: None))
             else:
                 results.append(WarmUpResult(account.name, True, None, 0.0, "skipped: past quarantine and ageing"))
+            report(f"[{'OK' if results[-1].success else 'FAILED'}] {results[-1].account_name}: {results[-1].details}")
+    return results
+
+
+async def run_cookie_robot(
+    config_path: str,
+    names: list[str],
+    on_progress: Callable[[str, int, int, str], None] | None = None,
+    headless: bool | None = None,
+    report: Callable[[str], None] = print,
+) -> list[CookieRobotResult]:
+    """Wizard / UI «куки-робот»: the accounts called `names`, one after another (a pause between them).
+
+    `on_progress(account_name, step, total_steps, site)` is called as each site starts; `report` gets one line per account.
+    """
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    robot = CookieRobot(cfg.browser)
+    results: list[CookieRobotResult] = []
+    async with _open_db(cfg) as db:
+        for name in names:
+            account = await db.get_account(name)
+            if account is None:
+                results.append(CookieRobotResult(name, False, (), (), 0.0, "account not found"))
+            else:
+                if results:
+                    await asyncio.sleep(_pause_between_accounts(account))
+                progress = None if on_progress is None else (lambda step, total, site, who=account.name: on_progress(who, step, total, site))
+                results.append(await robot.run(account, progress))
             report(f"[{'OK' if results[-1].success else 'FAILED'}] {results[-1].account_name}: {results[-1].details}")
     return results
 
