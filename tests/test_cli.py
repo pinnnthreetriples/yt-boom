@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from config import load_config
 from database import Database
-from youtube_bot import format_author, list_sub_comments, print_status, run_reply_bot
+from youtube_bot import EXTRA_CANDIDATES, format_author, list_sub_comments, print_status, run_reply_bot
 
 
 class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
@@ -312,7 +312,7 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
 
             mock_pop.assert_called_once_with(
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                limit=2,
+                limit=2 + EXTRA_CANDIDATES,  # two per reply wanted, plus spares for targets without a Reply button
                 target_mode="sub_comment",
             )
             mock_gen.assert_called_once()

@@ -624,7 +624,9 @@ class MultiAccountOrchestrator:
                                 await self._db.record_account_comment_success(acc.id)
                                 # inside the lock, like the account's counter: the next pick of this account sees it
                                 await self._count_project_reply(acc)
-                            else:
+                            elif not getattr(sub_res, "reply_unavailable", False):
+                                # a comment without a Reply button is the target's fault: it must not push the
+                                # account towards the 3-errors circuit breaker
                                 await self._record_error(acc)
 
                     mode = "dry_run" if self._dry_run else "live"
@@ -690,6 +692,24 @@ class MultiAccountOrchestrator:
                         video_comments_done += 1
                         posted = True
                         self._watch_visibility(acc, video, sub_res.remote_id)
+                    elif getattr(sub_res, "reply_unavailable", False):
+                        logger.warning(
+                            "ИНФО | Комментарий {} к видео {} пропущен: ответить на него нельзя (кнопку скрыл YouTube)",
+                            it.external_id,
+                            video.video_id,
+                        )
+                        if not self._dry_run:
+                            try:
+                                node = await self._db.upsert_test_node(self._yt_target.name, self._yt_target.base_url)
+                                await self._db.mark_reply_unavailable(
+                                    node_id=node.id,
+                                    source_ref=it.external_id,
+                                    language=getattr(it, "language", "en"),
+                                    source_text=getattr(it, "text", None),
+                                    reason=sub_res.error or "",
+                                )
+                            except Exception as exc:
+                                logger.debug("Не удалось запомнить комментарий без кнопки «Ответить»: {}", exc)
                     else:
                         logger.error(
                             "ОШИБКА | Не удалось отправить ответ аккаунтом {!r} к видео {}: {}",

@@ -13,7 +13,15 @@ from typing import Any, Awaitable, Callable, Iterable, NamedTuple
 from loguru import logger
 
 from config import AppConfig, ProxyUnavailableError, load_config, mask_proxy_url, resolve_account_proxy
-from database import DEFAULT_PROJECT_NAME, AccountRecord, ActivityLogCreate, Database, ProjectRecord, RecordNotFoundError
+from database import (
+    DEFAULT_PROJECT_NAME,
+    REPLY_UNAVAILABLE_MARK,
+    AccountRecord,
+    ActivityLogCreate,
+    Database,
+    ProjectRecord,
+    RecordNotFoundError,
+)
 from modules.collector import CollectorError
 from modules.account_parser import looks_like_credentials, parse_account_line
 from modules.account_menu_logic import format_profile_summary, profile_pending_fields
@@ -488,6 +496,9 @@ async def _authenticate_account(
 
 
 INTRO_WARM_UP_SECONDS = 60.0
+# Spare comment candidates fetched beyond the replies wanted: a target YouTube gives no Reply button is skipped, and
+# targets other accounts already answered are skipped too; without spares the run ends with nothing posted.
+EXTRA_CANDIDATES = 4
 
 
 async def _intro_warm_up(db: Database, cfg: AppConfig, account: AccountRecord) -> None:
@@ -1547,14 +1558,14 @@ async def run_reply_bot(
         if effective_target_mode in ("popular_parent", "sub_comment", "mixed", "first_reply", "first_sub_comment"):
             logger.info("Сбор комментариев для {} (режим={})", video_url, effective_target_mode)
             try:
-                items = await collector.fetch_popular_comments(video_url, limit=limit * 2, target_mode=effective_target_mode)
+                items = await collector.fetch_popular_comments(video_url, limit=limit * 2 + EXTRA_CANDIDATES, target_mode=effective_target_mode)
             except Exception as exc:
                 logger.debug("Сбор популярных комментариев завершился ошибкой, резервный метод: {}", exc)
         else:
             logger.info("Сбор комментариев для {} (режим=first_reply)", video_url)
 
         if not items:
-            items = await collector.collect_from_videos([video_url], max_items=limit * 2)
+            items = await collector.collect_from_videos([video_url], max_items=limit * 2 + EXTRA_CANDIDATES)
 
         if not items:
             logger.warning("Не найдено подходящих комментариев по фильтрам для {}", video_url)
@@ -1714,7 +1725,11 @@ async def run_reply_bot(
                     logger.success("Ответ успешно опубликован и сохранен в базе (ID={})", sub_res.remote_id)
                     processed += 1
                 else:
-                    await db.mark_payload_failed(payload.id, sub_res.error or "submission failed")
+                    no_reply_button = bool(getattr(sub_res, "reply_unavailable", False))
+                    fail_text = (
+                        f"{REPLY_UNAVAILABLE_MARK}: {sub_res.error}" if no_reply_button else (sub_res.error or "submission failed")
+                    )
+                    await db.mark_payload_failed(payload.id, fail_text)
                     await db.log_activity(
                         ActivityLogCreate(
                             video_id=video_id,
@@ -1726,12 +1741,15 @@ async def run_reply_bot(
                             reply_text=reply_text,
                             mode="live",
                             status="failed",
-                            error=sub_res.error or "submission failed",
+                            error=fail_text,
                             duration_sec=sub_res.duration_seconds,
                             payload_id=payload.id,
                             account_id=owner.id if owner is not None else None,
                         )
                     )
+                    if no_reply_button:  # the target, not the account: take the next candidate at once, no pause
+                        logger.warning("Комментарий {} пропущен: ответить на него нельзя", item.external_id)
+                        continue
                     logger.error("Не удалось отправить ответ: {}", sub_res.error)
 
             if processed < limit:
@@ -1925,7 +1943,7 @@ async def run_multi_video_pipeline(
             try:
                 items = await collector.fetch_popular_comments(
                     vid_url,
-                    limit=comments_per_video * 2,
+                    limit=comments_per_video * 2 + EXTRA_CANDIDATES,
                     target_mode=effective_target_mode,
                 )
             except Exception as exc:
@@ -1934,7 +1952,7 @@ async def run_multi_video_pipeline(
 
             if not items:
                 try:
-                    items = await collector.collect_from_videos([vid_url], max_items=comments_per_video * 2)
+                    items = await collector.collect_from_videos([vid_url], max_items=comments_per_video * 2 + EXTRA_CANDIDATES)
                 except Exception as exc:
                     logger.debug("Резервный сбор комментариев завершился ошибкой для {}: {}", vid_id, exc)
 
@@ -2099,7 +2117,13 @@ async def run_multi_video_pipeline(
                         processed_for_video += 1
                         total_replies += 1
                     else:
-                        await db.mark_payload_failed(payload.id, sub_res.error or "submission failed")
+                        no_reply_button = bool(getattr(sub_res, "reply_unavailable", False))
+                        fail_text = (
+                            f"{REPLY_UNAVAILABLE_MARK}: {sub_res.error}"
+                            if no_reply_button
+                            else (sub_res.error or "submission failed")
+                        )
+                        await db.mark_payload_failed(payload.id, fail_text)
                         await db.log_activity(
                             ActivityLogCreate(
                                 video_id=vid_id,
@@ -2111,12 +2135,15 @@ async def run_multi_video_pipeline(
                                 reply_text=reply_text,
                                 mode="live",
                                 status="failed",
-                                error=sub_res.error or "submission failed",
+                                error=fail_text,
                                 duration_sec=sub_res.duration_seconds,
                                 payload_id=payload.id,
                                 account_id=owner.id if owner is not None else None,
                             )
                         )
+                        if no_reply_button:  # the target, not the account: take the next candidate at once, no pause
+                            logger.warning("Комментарий {} пропущен: ответить на него нельзя", item.external_id)
+                            continue
                         logger.error("Не удалось отправить ответ: {}", sub_res.error)
 
                 if processed_for_video < comments_per_video:
