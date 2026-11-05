@@ -82,6 +82,7 @@ processor:
   lowercase_initial_probability: 0.2
   max_output_length: 400
   paraphrase_custom: true
+  reply_language: auto  # auto = язык комментария/шаблона; либо код: ru, en, es...
 browser:
   headless: false
   os: windows

@@ -302,6 +302,14 @@ class TestDeepseekAndReplyMode(SetupScreenCase):
         self.run_keys(lambda: step_reply_mode(self.config_path), DOWN, DOWN, DOWN, DOWN, ENTER, DOWN, ENTER, ESC)
         self.assertIs(self.raw()["processor"]["paraphrase_custom"], False)
 
+    def test_reply_language_is_picked_from_the_list(self):
+        # ↓×5 «Язык ответов» → picker opens on «Авто»: ↓ «Русский»
+        _, output = self.run_keys(
+            lambda: step_reply_mode(self.config_path), *([DOWN] * 5), ENTER, DOWN, ENTER, ESC,
+        )
+        self.assertEqual(self.raw()["processor"]["reply_language"], "ru")
+        self.assertIn("Язык ответов: Русский", output)
+
     def test_reply_mode_notice_does_not_reappear_on_deepseek(self):
         from modules.wizard import update_config_file
         update_config_file(self.config_path, {"processor.paraphrase_custom": False})

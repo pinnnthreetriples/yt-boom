@@ -405,6 +405,23 @@ def print_step_header(step_idx: int, total: int, title: str, hint: str) -> None:
 _setup_in_wizard = False  # True while run_step_by_step_wizard runs: headers show «Этап n/5»
 
 
+_REPLY_LANGUAGES = [
+    ("auto", "Авто: как в комментарии / шаблоне"),
+    ("ru", "Русский"),
+    ("en", "English"),
+    ("es", "Español"),
+    ("pt", "Português"),
+    ("de", "Deutsch"),
+    ("fr", "Français"),
+    ("tr", "Türkçe"),
+    ("uk", "Українська"),
+]
+
+
+def _reply_language_label(code: str) -> str:
+    return dict(_REPLY_LANGUAGES).get(code, code)
+
+
 def _setup_screen(step: int, title: str, hint: str, status: list[Any], notice: tuple[str, str] | None = None) -> None:
     """Clear and draw a setup screen: header, status table, last action result."""
     clear_terminal()
@@ -1271,6 +1288,7 @@ def step_reply_mode(config_path: Path) -> tuple[str, list[str]]:
         current_replies = list(getattr(cfg.processor, "custom_replies", []))
         ai = current_mode == "ai"
         paraphrase = bool(getattr(cfg.processor, "paraphrase_custom", True))
+        reply_lang = getattr(cfg.processor, "reply_language", "auto")
 
         status: list[Any] = [
             ("Режим", "ИИ DeepSeek" if ai else "свой текст"),
@@ -1278,6 +1296,7 @@ def step_reply_mode(config_path: Path) -> tuple[str, list[str]]:
         ]
         if not ai:
             status.append(("Рандомизация", "вкл: ИИ меняет слова каждый раз" if paraphrase else "выкл: шаблон уходит как есть"))
+        status.append(("Язык ответов", _reply_language_label(reply_lang)))
         status += [(f"  {i}.", r) for i, r in enumerate(current_replies[:5], 1)]
         if len(current_replies) > 5:
             status.append(("", f"… ещё {len(current_replies) - 5}", "dim"))
@@ -1290,6 +1309,7 @@ def step_reply_mode(config_path: Path) -> tuple[str, list[str]]:
             ("3", "Добавить шаблон", "", ""),
             ("4", "Удалить шаблон", "", ""),
             ("P", "Рандомизация текста", "● вкл: ИИ меняет слова каждый раз" if paraphrase else "выкл: шаблон уходит как есть", CLR_DIM),
+            ("L", "Язык ответов", _reply_language_label(reply_lang), CLR_DIM),
             None,
             ("0", "← Назад", "", ""),
         ]
@@ -1325,6 +1345,22 @@ def step_reply_mode(config_path: Path) -> tuple[str, list[str]]:
             notice = ("ok", "Рандомизация текста включена") if pick == "1" else ("info", "Рандомизация текста выключена")
             if pick == "1" and not getattr(cfg.deepseek, "api_key", ""):
                 notice = ("warn", "Включено, но ключ DeepSeek не задан - пока шаблон уйдёт как есть")
+        elif choice == "L":
+            codes = [code for code, _ in _REPLY_LANGUAGES]
+            picks: list[MenuRow | None] = [
+                (str(i), label, "● выбран" if code == reply_lang else "", CLR_DIM)
+                for i, (code, label) in enumerate(_REPLY_LANGUAGES, 1)
+            ]
+            pick, _ = arrow_menu(
+                lambda: picks, [" Язык ответов"], codes.index(reply_lang) if reply_lang in codes else 0, esc_key="0",
+            )
+            if not pick.isdigit() or not 1 <= int(pick) <= len(codes):
+                continue
+            code = codes[int(pick) - 1]
+            update_config_file(config_path, {"processor.reply_language": code})
+            notice = ("ok", f"Язык ответов: {_reply_language_label(code)}")
+            if code != "auto" and not ai and not (paraphrase and getattr(cfg.deepseek, "api_key", "")):
+                notice = ("warn", "Для перевода шаблонов нужна включённая рандомизация и ключ DeepSeek - иначе шаблон уйдёт как есть")
         elif choice == "3":
             if text := ask_text("Текст шаблона"):
                 save_replies(current_replies + [text])

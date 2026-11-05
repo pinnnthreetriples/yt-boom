@@ -138,6 +138,17 @@ class ProcessorSettings(BaseModel):
     reply_mode: Literal["ai", "custom"] = "ai"
     custom_replies: list[str] = Field(default_factory=list)
     paraphrase_custom: bool = True  # reword custom templates through DeepSeek (needs an API key)
+    # Language of the posted replies: "auto" follows the comment (AI) / the template (custom); an ISO 639-1 code
+    # (ru, en, ...) forces it, translating a template of another language when paraphrase_custom is on.
+    reply_language: str = "auto"
+
+    @field_validator("reply_language")
+    @classmethod
+    def _normalize_reply_language(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value != "auto" and not re.fullmatch(r"[a-z]{2}", value):
+            raise ValueError("processor.reply_language must be 'auto' or a two-letter ISO 639-1 code like 'ru'")
+        return value
 
     @field_validator("user_prompt_template")
     @classmethod

@@ -49,6 +49,7 @@ PARAPHRASE_SYSTEM_PROMPT = (
     "Do not add or drop facts. Reply with the rewritten comment only, without quotes or explanations."
 )
 _MENTION = re.compile(r"@[\w.\-]+")
+_CYRILLIC = re.compile(r"[Ѐ-ӿ]")
 
 
 def _trigrams(text: str) -> set[str]:
@@ -62,6 +63,33 @@ def text_similarity(first: str, second: str) -> float:
     if not a or not b:  # emoji- or punctuation-only text has no trigrams: identical text still counts as a copy
         return 1.0 if first.strip().lower() == second.strip().lower() and first.strip() else 0.0
     return len(a & b) / len(a | b)
+
+
+_LANGUAGE_NAMES = {
+    "ru": "Russian", "uk": "Ukrainian", "be": "Belarusian", "kk": "Kazakh", "en": "English", "es": "Spanish",
+    "pt": "Portuguese", "de": "German", "fr": "French", "it": "Italian", "tr": "Turkish", "pl": "Polish",
+    "ar": "Arabic", "hi": "Hindi", "id": "Indonesian", "ja": "Japanese", "ko": "Korean", "zh": "Chinese",
+}
+
+
+def _language_rule(code: str) -> str:
+    """Hard instruction that keeps the reply in the comment's language (an English prompt makes DeepSeek drift to English)."""
+    name = _LANGUAGE_NAMES.get((code or "").lower())
+    if not name:
+        return "Reply in the exact same language as the comment above, even if these instructions are in English."
+    return (
+        f"The comment is written in {name}. Write the reply ONLY in {name}"
+        + ("" if name == "English" else ", never in English")
+        + "."
+    )
+
+
+def _forced_language_rule(code: str) -> str:
+    """Rule for a language fixed in settings: the reply is in it whatever language the comment is in."""
+    name = _LANGUAGE_NAMES.get(code, code.upper())
+    return f"Write the reply ONLY in {name}, regardless of the language of the comment" + (
+        ", never in English." if code != "en" else "."
+    )
 
 
 class ProcessorError(RuntimeError):
@@ -182,6 +210,15 @@ class DeepSeekProcessor:
         """
         mentions = [m.rstrip(".-") for m in _MENTION.findall(text)]
         limit = max(self._text.max_output_length, int(len(text) * 1.5))
+        # The template's language wins, whatever language the comment under it is in; never translate.
+        forced = getattr(self._text, "reply_language", "auto")
+        if forced != "auto":
+            name = _LANGUAGE_NAMES.get(forced, forced.upper())
+            template_rule = f"Write the rewrite ONLY in {name}. If the text is in another language, translate it into {name}."
+        elif _CYRILLIC.search(text):
+            template_rule = "The text is in Russian. Write the rewrite ONLY in Russian, never in English, and never translate it."
+        else:
+            template_rule = "Write the rewrite in the exact same language as the text. Never translate it."
         for attempt in (1, 2):
             prompt = f"Comment:\n{text}"
             if self._recent_variants:
@@ -193,8 +230,8 @@ class DeepSeekProcessor:
                 response = await self._client.chat.completions.create(
                     model=self._api.model,
                     messages=[
-                        {"role": "system", "content": PARAPHRASE_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
+                        {"role": "system", "content": f"{PARAPHRASE_SYSTEM_PROMPT}\n\n{template_rule}"},
+                        {"role": "user", "content": f"{prompt}\n\n{template_rule}"},
                     ],
                     temperature=max(float(self._api.temperature), 0.9),
                     max_tokens=self._api.max_tokens,
@@ -233,9 +270,11 @@ class DeepSeekProcessor:
             available_styles = getattr(self._text, "styles", None) or DEFAULT_STYLES
             chosen_style = self._rng.choice(available_styles)
 
+        forced = getattr(self._text, "reply_language", "auto")
+        prompt_language = (item.language if forced == "auto" else forced).upper()
         prompt_kwargs = {
             "text": item.text,
-            "language": item.language.upper(),
+            "language": prompt_language,
             "parent_text": item.parent_text or "",
             "parent_author": item.parent_author or "",
             "author": item.author or "",
@@ -244,7 +283,7 @@ class DeepSeekProcessor:
         try:
             prompt = self._text.user_prompt_template.format(**prompt_kwargs)
         except KeyError:
-            prompt = self._text.user_prompt_template.format(text=item.text, language=item.language.upper())
+            prompt = self._text.user_prompt_template.format(text=item.text, language=prompt_language)
 
         if item.parent_text and "{parent_text}" not in self._text.user_prompt_template:
             prompt = f"Context (parent comment): {item.parent_text}\nTarget sub-comment to reply to: {item.text}\n" + prompt
@@ -252,9 +291,10 @@ class DeepSeekProcessor:
         if "{style}" not in self._text.user_prompt_template and chosen_style:
             prompt = f"{prompt}\nTone/Style: {chosen_style}"
 
+        language_rule = _language_rule(item.language) if forced == "auto" else _forced_language_rule(forced)
         messages = [
-            {"role": "system", "content": f"{self._text.system_prompt.strip()}\n\n{ANTI_CLICHE_RULES}"},
-            {"role": "user", "content": prompt.strip()},
+            {"role": "system", "content": f"{self._text.system_prompt.strip()}\n\n{ANTI_CLICHE_RULES}\n\n{language_rule}"},
+            {"role": "user", "content": f"{prompt.strip()}\n\n{language_rule}"},
         ]
 
         last_error = "unknown error"
