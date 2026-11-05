@@ -108,7 +108,7 @@ class MultiAccountOrchestrator:
         self._dry_run = dry_run
         self._account_mode = account_mode or self._cfg.limits.account_mode
         self._rng = rng or random.Random()
-        self._deck = ReplyDeck(self._db, self._rng)
+        self._deck = ReplyDeck(self._db, self._rng, project_id=self._project_id)
         # the search proxy lives in the database: `ensure_db` sets it on the collector made here
         self._own_collector = collector is None
         self._collector = collector or YouTubeCollector(self._cfg.collector, None)
@@ -638,8 +638,10 @@ class MultiAccountOrchestrator:
                             continue
                         if not self._dry_run:  # inside the lock: the next worker of this account sees it
                             if sub_res.success:
-                                await self._db.record_account_comment_success(acc.id)
+                                # the reply IS posted: burn the template first. `settle` never raises, so a deck
+                                # error cannot skip the counters below, and a failure of those cannot un-burn it
                                 await self._deck.settle(deck_card, posted=True)
+                                await self._db.record_account_comment_success(acc.id)
                                 # inside the lock, like the account's counter: the next pick of this account sees it
                                 await self._count_project_reply(acc)
                             elif not getattr(sub_res, "reply_unavailable", False):

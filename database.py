@@ -230,20 +230,27 @@ _ACTIVITY_PROJECT_COLUMNS: tuple[tuple[str, str], ...] = (
 _ACTIVITY_VISIBILITY_COLUMNS: tuple[tuple[str, str], ...] = (("visibility", "TEXT"),)
 VISIBILITY_STATES: tuple[str, ...] = ("seen", "unseen", "unknown")
 
-# Per-account "deck" of custom reply templates: `reply_deck` holds the current shuffled round (pos = order of the cards
-# still unused, used = 1 once the template was really posted), `reply_deck_state` the last template the account posted.
+# Per-account "deck" of custom reply templates. A deck is one (account, scope) pair: the scope is the project the
+# templates belong to ("p<id>", an account may work in several projects with overlapping lists) or "default" without
+# one. `reply_deck` holds the current shuffled round (pos = order of the cards still unused, used = 1 once the
+# template was really posted), `reply_deck_state` the last template posted from that deck.
+DEFAULT_DECK_SCOPE = "default"
+
 _REPLY_DECK_SCHEMA = """
 CREATE TABLE IF NOT EXISTS reply_deck (
     account  TEXT    NOT NULL,
+    scope    TEXT    NOT NULL DEFAULT 'default',
     template TEXT    NOT NULL,
     pos      INTEGER NOT NULL DEFAULT 0,
     used     INTEGER NOT NULL DEFAULT 0 CHECK (used IN (0, 1)),
-    PRIMARY KEY (account, template)
+    PRIMARY KEY (account, scope, template)
 );
 
 CREATE TABLE IF NOT EXISTS reply_deck_state (
-    account       TEXT PRIMARY KEY,
-    last_template TEXT
+    account       TEXT NOT NULL,
+    scope         TEXT NOT NULL DEFAULT 'default',
+    last_template TEXT,
+    PRIMARY KEY (account, scope)
 );
 """
 
@@ -931,6 +938,7 @@ class Database:
             if columns and "proxy_id" not in columns:  # first start with the proxy library: keep the old file
                 backed_up = await self._backup_before_migration(conn, "proxies") is not None
             await conn.executescript(_MULTI_ACCOUNT_SCHEMA)
+            await self._migrate_reply_deck(conn)
             await conn.executescript(_REPLY_DECK_SCHEMA)
             await self._ensure_account_columns(conn)
             await self._ensure_account_mode_columns(conn)
@@ -1018,6 +1026,37 @@ class Database:
             return {str(row[1]) for row in await cursor.fetchall()}
         finally:
             await cursor.close()
+
+    async def _migrate_reply_deck(self, conn: aiosqlite.Connection) -> None:
+        """Decks made before they had a scope (key = account, template) move into the "default" scope, rows kept."""
+        if not await self._columns(conn, "reply_deck") or "scope" in await self._columns(conn, "reply_deck"):
+            return
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            await conn.execute("ALTER TABLE reply_deck RENAME TO reply_deck_v1")
+            if await self._columns(conn, "reply_deck_state"):
+                await conn.execute("ALTER TABLE reply_deck_state RENAME TO reply_deck_state_v1")
+            for statement in _REPLY_DECK_SCHEMA.split(";"):
+                if statement.strip():
+                    await conn.execute(statement)
+            await conn.execute(
+                "INSERT INTO reply_deck (account, scope, template, pos, used) "
+                "SELECT account, ?, template, pos, used FROM reply_deck_v1",
+                (DEFAULT_DECK_SCOPE,),
+            )
+            if await self._columns(conn, "reply_deck_state_v1"):
+                await conn.execute(
+                    "INSERT INTO reply_deck_state (account, scope, last_template) "
+                    "SELECT account, ?, last_template FROM reply_deck_state_v1",
+                    (DEFAULT_DECK_SCOPE,),
+                )
+                await conn.execute("DROP TABLE reply_deck_state_v1")
+            await conn.execute("DROP TABLE reply_deck_v1")
+            await conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                await conn.execute("ROLLBACK")
+            raise
 
     @staticmethod
     async def _scalar(conn: aiosqlite.Connection, query: str, params: tuple[Any, ...] = ()) -> Any:
@@ -2473,15 +2512,17 @@ class Database:
     async def deck_load(
         self,
         account: str,
+        scope: str,
         templates: list[str],
         rng: random.Random,
     ) -> tuple[list[str], bool]:
-        """Bring the account's deck in line with `templates` and return (unused cards in draw order, reshuffled).
+        """Bring the (account, scope) deck in line with `templates`: (unused cards in draw order, reshuffled).
 
-        Templates missing from `templates` are ignored (their rows stay, so an account that works in two projects
-        with different lists keeps both decks); new ones join the unused part at a random place. When no card is left a new
-        deck is shuffled from all `templates`; its first card differs from the account's last posted template
-        whenever there is more than one template. Nothing is burned here: see `deck_burn`.
+        A deck is private to its scope: another scope (project) of the same account never sees or resets its cards,
+        even for a template both lists share. Templates missing from `templates` are ignored (their rows stay); new
+        ones join the unused part at a random place. When no card is left a new deck is shuffled from all
+        `templates`; its first card differs from the last template posted from this deck whenever there is more than
+        one template. Nothing is burned here: see `deck_burn`.
         """
         if not templates:
             return [], False
@@ -2489,7 +2530,10 @@ class Database:
         reshuffled = False
         async with self._transaction() as conn:
             rows = await (
-                await conn.execute("SELECT template, used FROM reply_deck WHERE account = ? ORDER BY pos ASC", (account,))
+                await conn.execute(
+                    "SELECT template, used FROM reply_deck WHERE account = ? AND scope = ? ORDER BY pos ASC",
+                    (account, scope),
+                )
             ).fetchall()
             current = {str(r["template"]): bool(r["used"]) for r in rows}
             unused = [str(r["template"]) for r in rows if not r["used"] and str(r["template"]) in wanted]
@@ -2497,7 +2541,9 @@ class Database:
                 unused.insert(rng.randint(0, len(unused)), fresh)
             if not unused:
                 state = await (
-                    await conn.execute("SELECT last_template FROM reply_deck_state WHERE account = ?", (account,))
+                    await conn.execute(
+                        "SELECT last_template FROM reply_deck_state WHERE account = ? AND scope = ?", (account, scope)
+                    )
                 ).fetchone()
                 last = state["last_template"] if state else None
                 unused = list(wanted)
@@ -2508,31 +2554,47 @@ class Database:
                 reshuffled = True
             for pos, template in enumerate(unused):
                 await conn.execute(
-                    "INSERT INTO reply_deck (account, template, pos, used) VALUES (?, ?, ?, 0) "
-                    "ON CONFLICT(account, template) DO UPDATE SET pos = excluded.pos, used = 0",
-                    (account, template, pos),
+                    "INSERT INTO reply_deck (account, scope, template, pos, used) VALUES (?, ?, ?, ?, 0) "
+                    "ON CONFLICT(account, scope, template) DO UPDATE SET pos = excluded.pos, used = 0",
+                    (account, scope, template, pos),
                 )
         return unused, reshuffled
 
-    async def deck_burn(self, account: str, template: str) -> None:
-        """The template was really posted by `account`: it leaves the deck until the next shuffle."""
+    async def deck_burn(self, account: str, scope: str, template: str) -> None:
+        """The template was really posted from this deck: it leaves it until the next shuffle."""
         async with self._transaction() as conn:
             await conn.execute(
-                "UPDATE reply_deck SET used = 1 WHERE account = ? AND template = ?", (account, template)
+                "UPDATE reply_deck SET used = 1 WHERE account = ? AND scope = ? AND template = ?",
+                (account, scope, template),
             )
             await conn.execute(
-                "INSERT INTO reply_deck_state (account, last_template) VALUES (?, ?) "
-                "ON CONFLICT(account) DO UPDATE SET last_template = excluded.last_template",
-                (account, template),
+                "INSERT INTO reply_deck_state (account, scope, last_template) VALUES (?, ?, ?) "
+                "ON CONFLICT(account, scope) DO UPDATE SET last_template = excluded.last_template",
+                (account, scope, template),
             )
 
-    async def deck_snapshot(self, account: str) -> tuple[list[tuple[str, bool]], str | None]:
-        """Read-only view: ([(template, used)] in draw order, last posted template)."""
-        rows = await self._fetch_all(
-            "SELECT template, used FROM reply_deck WHERE account = ? ORDER BY used ASC, pos ASC", (account,)
-        )
-        state = await self._fetch_one("SELECT last_template FROM reply_deck_state WHERE account = ?", (account,))
-        return [(str(r["template"]), bool(r["used"])) for r in rows], (state["last_template"] if state else None)
+    async def deck_snapshot(self, account: str, scope: str | None = None) -> tuple[list[tuple[str, bool]], str | None]:
+        """Read-only view: ([(template, used)] in draw order, last posted template).
+
+        Without `scope` every deck of the account is merged; the last template is then known only when the account
+        has a single deck.
+        """
+        if scope is None:
+            rows = await self._fetch_all(
+                "SELECT template, used FROM reply_deck WHERE account = ? ORDER BY scope, used ASC, pos ASC", (account,)
+            )
+            states = await self._fetch_all("SELECT last_template FROM reply_deck_state WHERE account = ?", (account,))
+            last = states[0]["last_template"] if len(states) == 1 else None
+        else:
+            rows = await self._fetch_all(
+                "SELECT template, used FROM reply_deck WHERE account = ? AND scope = ? ORDER BY used ASC, pos ASC",
+                (account, scope),
+            )
+            state = await self._fetch_one(
+                "SELECT last_template FROM reply_deck_state WHERE account = ? AND scope = ?", (account, scope)
+            )
+            last = state["last_template"] if state else None
+        return [(str(r["template"]), bool(r["used"])) for r in rows], last
 
     async def get_account(self, account_id_or_name: int | str) -> AccountRecord | None:
         if isinstance(account_id_or_name, int):

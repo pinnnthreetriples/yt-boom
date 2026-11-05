@@ -7,7 +7,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from loguru import logger
 
@@ -155,14 +155,70 @@ class TestDeckDraws(DeckCase):
         cards, _ = await self.db.deck_snapshot("alpha")
         self.assertEqual(sorted(t for t, _ in cards if t in edited), sorted(edited))
 
-    async def test_one_account_in_two_projects_keeps_both_decks(self) -> None:
-        # a project's template list differs from another's: switching between them must not drop the used marks
-        first_list, second_list = ["a", "b"], ["x", "y"]
-        round_one = {await self.post("alpha", first_list), await self.post("alpha", first_list)}
-        round_two = {await self.post("alpha", second_list), await self.post("alpha", second_list)}
-        self.assertEqual((round_one, round_two), ({"a", "b"}, {"x", "y"}))
-        cards, _ = await self.db.deck_snapshot("alpha")
-        self.assertEqual(sorted(t for t, used in cards if used), ["a", "b", "x", "y"])  # nothing was reset by the switch
+    async def test_overlapping_lists_of_two_projects_keep_independent_decks(self) -> None:
+        list_a = ["shared", "a2", "a3", "a4"]
+        list_b = ["shared", "b2", "b3"]
+        deck_a = ReplyDeck(self.db, random.Random(1), project_id=1)
+        deck_b = ReplyDeck(self.db, random.Random(2), project_id=2)
+
+        # project A is halfway through its round: "shared" and "a3" are posted
+        await self.db.deck_load("alpha", deck_a.scope, list_a, random.Random(3))
+        await self.db.deck_burn("alpha", deck_a.scope, "shared")
+        await self.db.deck_burn("alpha", deck_a.scope, "a3")
+
+        # project B posts its whole deck, then its deck reshuffles
+        round_one = []
+        for _ in list_b:
+            card = await deck_b.draw("alpha", list_b)
+            await deck_b.settle(card, posted=True)
+            round_one.append(card.template)
+        self.assertEqual(sorted(round_one), sorted(list_b))
+        card = await deck_b.draw("alpha", list_b)  # exhausted: reshuffled
+        await deck_b.settle(card, posted=True)
+
+        # that reshuffle did not make "shared" eligible again in A's unfinished round
+        cards_a, _ = await self.db.deck_snapshot("alpha", deck_a.scope)
+        self.assertEqual(sorted(t for t, used in cards_a if used), ["a3", "shared"])
+        left = []
+        for _ in range(2):
+            card = await deck_a.draw("alpha", list_a)
+            await deck_a.settle(card, posted=True)
+            left.append(card.template)
+        self.assertEqual(sorted(left), ["a2", "a4"])
+        # and A burning cards never touched B's deck either
+        cards_b, _ = await self.db.deck_snapshot("alpha", deck_b.scope)
+        self.assertEqual(sum(used for _, used in cards_b), 1)
+
+    async def test_decks_made_before_scopes_move_into_the_default_scope(self) -> None:
+        import sqlite3
+
+        path = Path(self.temp_dir.name) / "old.db"
+        old = sqlite3.connect(path)
+        old.executescript(
+            """
+            CREATE TABLE reply_deck (account TEXT NOT NULL, template TEXT NOT NULL, pos INTEGER NOT NULL DEFAULT 0,
+                used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (account, template));
+            CREATE TABLE reply_deck_state (account TEXT PRIMARY KEY, last_template TEXT);
+            INSERT INTO reply_deck VALUES ('alpha', 'one', 0, 1), ('alpha', 'two', 1, 0);
+            INSERT INTO reply_deck_state VALUES ('alpha', 'one');
+            """
+        )
+        old.commit()
+        old.close()
+        db = Database(path)
+        await db.connect()
+        await db.init_schema()
+        await db.init_schema()  # a second start changes nothing
+        try:
+            cards, last = await db.deck_snapshot("alpha", "default")
+            self.assertEqual(cards, [("two", False), ("one", True)])
+            self.assertEqual(last, "one")
+            deck = ReplyDeck(db, random.Random(1))
+            card = await deck.draw("alpha", ["one", "two"])
+            self.assertEqual(card.template, "two")  # the saved round continues
+            await deck.settle(card, posted=True)
+        finally:
+            await db.close()
 
     async def test_duplicate_and_blank_templates_are_one_card(self) -> None:
         cards = [await self.post("alpha", ["x", " x ", "", "y", "x"]) for _ in range(2)]
@@ -235,13 +291,47 @@ class TestDeckConcurrency(DeckCase):
         await self.deck.settle(card, posted=False)
 
 
+    async def test_a_waiting_worker_is_not_timed_out_while_the_holder_is_alive(self) -> None:
+        held = await self.deck.draw("alpha", ["a"])
+        waiter = asyncio.create_task(self.deck.draw("alpha", ["a"]))
+        with patch("modules.reply_deck._REAP_INTERVAL_SECONDS", 0.05):
+            await asyncio.sleep(0.4)  # many reap intervals later the holder is still alive: no error, still waiting
+        self.assertFalse(waiter.done())
+        await self.deck.settle(held, posted=True)
+        card = await asyncio.wait_for(waiter, 2)
+        self.assertEqual(card.template, "a")
+        await self.deck.settle(card, posted=False)
+
+    async def test_a_reservation_of_a_dead_task_does_not_block_the_account(self) -> None:
+        holder = asyncio.create_task(self.deck.draw("alpha", ["a"]))
+        await holder  # drew the card and finished without ever settling it
+        with patch("modules.reply_deck._REAP_INTERVAL_SECONDS", 0.05):
+            card = await asyncio.wait_for(asyncio.create_task(self.deck.draw("alpha", ["a"])), 2)
+        self.assertEqual(card.template, "a")
+
+    async def test_a_task_waiting_for_its_own_card_gets_an_error_not_a_deadlock(self) -> None:
+        held = await self.deck.draw("alpha", ["only"])
+        with self.assertRaises(ProcessorError):
+            await self.deck.draw("alpha", ["only"])  # same task: must fail at once, not wait for itself
+        await self.deck.settle(held, posted=False)
+
+    async def test_a_failing_burn_never_raises_and_releases_the_card(self) -> None:
+        card = await self.deck.draw("alpha", ["a"])
+        with patch.object(Database, "deck_burn", AsyncMock(side_effect=RuntimeError("database is locked"))):
+            await self.deck.settle(card, posted=True)  # must not raise
+        again = await asyncio.wait_for(asyncio.create_task(self.deck.draw("alpha", ["a"])), 2)
+        self.assertEqual(again.template, "a")  # not burned (logged), and no longer reserved
+
+
 class _FakeProcessor:
     def __init__(self, answer: str = "paraphrased text") -> None:
         self.answer = answer
         self.calls: list[str] = []
+        self.sources: list[str | None] = []
 
-    async def paraphrase(self, text: str) -> str:
+    async def paraphrase(self, text: str, *, source: str | None = None) -> str:
         self.calls.append(text)
+        self.sources.append(source)
         return self.answer
 
 
@@ -274,6 +364,7 @@ class TestPrepareReply(DeckCase):
             processor=processor, custom_replies=["only template"], rng=random.Random(1),
         )
         self.assertEqual(processor.calls, ["only template"])
+        self.assertEqual(processor.sources, ["only template"])  # the raw template decides the language of the rewrite
         self.assertEqual(prepared.text, "reworded")
         await self.deck.settle(prepared.card, posted=False)
 
@@ -336,7 +427,8 @@ class TestDeckInOrchestrator(unittest.IsolatedAsyncioTestCase):
         except Exception:
             pass
 
-    async def run_once(self, result: SubmissionResult, *, dry_run: bool, vid: str) -> list[str]:
+    async def build(self, behaviour, *, dry_run: bool, vid: str) -> tuple[MultiAccountOrchestrator, list[str]]:
+        """An orchestrator whose runner calls `behaviour(text)` (returns a result, raises, or blocks)."""
         posted: list[str] = []
 
         def factory(acc):
@@ -344,7 +436,7 @@ class TestDeckInOrchestrator(unittest.IsolatedAsyncioTestCase):
 
             async def run(text, external_id=None, payload_id=None, dry_run=False):
                 posted.append(text)
-                return result
+                return await behaviour(text)
 
             runner.run = AsyncMock(side_effect=run)
             runner.close = AsyncMock()
@@ -371,6 +463,13 @@ class TestDeckInOrchestrator(unittest.IsolatedAsyncioTestCase):
             self.config, db=self.db, concurrency=1, account_mode="share", collector=collector,
             runner_factory=factory, rng=random.Random(11), dry_run=dry_run,
         )
+        return orchestrator, posted
+
+    async def run_once(self, result: SubmissionResult, *, dry_run: bool, vid: str) -> list[str]:
+        async def behaviour(text):
+            return result
+
+        orchestrator, posted = await self.build(behaviour, dry_run=dry_run, vid=vid)
         await orchestrator.execute_video_pool(max_comments_per_video=1)
         return posted
 
@@ -393,6 +492,178 @@ class TestDeckInOrchestrator(unittest.IsolatedAsyncioTestCase):
         cards, last = await self.db.deck_snapshot("acc_1")
         self.assertEqual([t for t, used in cards if used], good)  # exactly the posted template is burned
         self.assertEqual(last, good[0])
+
+    async def test_reply_unavailable_and_runner_exception_keep_the_card(self) -> None:
+        unavailable = SubmissionResult(success=False, error="no reply button", duration_seconds=0.1, reply_unavailable=True)
+        await self.run_once(unavailable, dry_run=False, vid="vid_nobtn001")
+
+        async def crash(text):
+            raise RuntimeError("Camoufox died")
+
+        orchestrator, posted = await self.build(crash, dry_run=False, vid="vid_crash001")
+        await orchestrator.execute_video_pool(max_comments_per_video=1)
+        self.assertEqual(len(posted), 1)
+        cards, last = await self.db.deck_snapshot("acc_1")
+        self.assertTrue(cards and all(not used for _, used in cards))
+        self.assertIsNone(last)
+        self.assertFalse(orchestrator._deck._reserved.get("acc_1"))  # nothing stays reserved
+
+    async def test_cancellation_releases_the_card(self) -> None:
+        self.config.processor.custom_replies = ["Only one"]  # a leaked reservation would block every later draw
+        entered = asyncio.Event()
+
+        async def hang(text):
+            entered.set()
+            await asyncio.Event().wait()
+
+        orchestrator, _ = await self.build(hang, dry_run=False, vid="vid_cancel01")
+        task = asyncio.create_task(orchestrator.execute_video_pool(max_comments_per_video=1))
+        await asyncio.wait_for(entered.wait(), 10)
+        self.assertEqual(list(orchestrator._deck._reserved["acc_1"]), ["Only one"])
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(orchestrator._deck._reserved["acc_1"])
+        card = await asyncio.wait_for(orchestrator._deck.draw("acc_1", ["Only one"]), 2)
+        self.assertEqual(card.template, "Only one")
+        cards, _ = await self.db.deck_snapshot("acc_1")
+        self.assertTrue(all(not used for _, used in cards))
+
+    async def test_a_failing_burn_does_not_hide_the_posted_reply(self) -> None:
+        async def success(text):
+            return SubmissionResult(success=True, remote_id="rem_ok", duration_seconds=0.1)
+
+        orchestrator, posted = await self.build(success, dry_run=False, vid="vid_burnerr1")
+        orchestrator._count_project_reply = AsyncMock()
+        messages: list[str] = []
+        sink = logger.add(lambda m: messages.append(str(m)), level="ERROR")
+        try:
+            with patch.object(Database, "deck_burn", AsyncMock(side_effect=RuntimeError("database is locked"))):
+                done = await orchestrator.execute_video_pool(max_comments_per_video=1)
+        finally:
+            logger.remove(sink)
+        self.assertEqual(done, 1)
+        self.assertEqual(len(posted), 1)
+        orchestrator._count_project_reply.assert_awaited_once()
+        self.assertIsNotNone((await self.db.get_account("acc_1")).last_comment_at)  # the account's counter ran
+        payload = await self.db.get_payload_by_source_ref("vid_burnerr1#root#c")
+        self.assertIsNotNone(payload)  # payload tracking ran
+        self.assertEqual(payload.status, "submitted")
+        logs = await self.db.list_activity_logs()
+        self.assertEqual([entry.status for entry in logs], ["success"])
+        self.assertTrue(any("КОЛОДА" in m and "database is locked" in m for m in messages))  # and the failure is loud
+        self.assertFalse(orchestrator._deck._reserved.get("acc_1"))
+
+
+class TestDeckInYoutubeBot(unittest.IsolatedAsyncioTestCase):
+    """run_reply_bot / run_multi_video_pipeline: a template leaves the deck only after a post that really happened."""
+
+    async def asyncSetUp(self) -> None:
+        import yaml
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.db_path = self.root / "test.db"
+        self.config_path = self.root / "cfg.yaml"
+        with open("config.yaml", "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        data["app"]["db_path"] = str(self.db_path)
+        data["app"]["log_file"] = str(self.root / "test.log")
+        data["browser"]["session_root"] = str(self.root / "sessions")
+        data["collector"]["target_mode"] = "raw"
+        data["limits"]["visibility_check_enabled"] = False
+        data["reply_mode"] = data["processor"]["reply_mode"] = "custom"
+        data["custom_replies"] = data["processor"]["custom_replies"] = ["First template", "Second template"]
+        data["processor"]["paraphrase_custom"] = False
+        data["processor"]["latin_mix_probability"] = 0.0
+        self.config_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+        self.runs = 0
+
+    async def asyncTearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    async def deck_state(self) -> tuple[list[str], list[str]]:
+        db = Database(self.db_path)
+        await db.connect()
+        try:
+            cards, _ = await db.deck_snapshot("default")
+            return [t for t, used in cards if used], [t for t, used in cards if not used]
+        finally:
+            await db.close()
+
+    async def run_bot(self, which: str, outcome, *, dry_run: bool = False) -> list[str]:
+        """Run one reply with the runner answering `outcome` (a result, or an exception to raise); returns the texts."""
+        from contextlib import ExitStack
+
+        from youtube_bot import run_multi_video_pipeline, run_reply_bot
+
+        sent: list[str] = []
+        self.runs += 1  # a comment that failed as "no Reply button" is never offered again: every run gets a new one
+        item = CollectedItem(
+            endpoint="youtube:vid", external_id=f"vidbot#c{self.runs}", text="Great breakdown!", language="en",
+            confidence=0.99, author="@fan", is_reply=False,
+        )
+
+        async def fake_run(self_runner, text, **kwargs):
+            sent.append(text)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        patches = [
+            patch("modules.youtube_runner.YouTubeRunner.run", fake_run),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ]
+        if which == "single":
+            patches.append(patch("modules.youtube_collector.YouTubeCollector.collect_from_videos",
+                                 new_callable=AsyncMock, return_value=[item]))
+        else:
+            patches += [
+                patch("modules.youtube_collector.YouTubeCollector.search_videos", new_callable=AsyncMock,
+                      return_value=[{"video_id": "vidbot", "title": "Topic", "view_count": 5000}]),
+                patch("modules.youtube_collector.YouTubeCollector.fetch_popular_comments", new_callable=AsyncMock,
+                      return_value=[item]),
+            ]
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            if which == "single":
+                await run_reply_bot("https://www.youtube.com/watch?v=dQw4w9WgXcQ", config_path=str(self.config_path),
+                                    target_mode="raw", limit=1, dry_run=dry_run)
+            else:
+                await run_multi_video_pipeline("python", config_path=str(self.config_path), max_videos=1,
+                                               comments_per_video=1, dry_run=dry_run)
+        return sent
+
+    async def check_paths(self, which: str) -> None:
+        for outcome in (
+            RuntimeError("browser died"),
+            SubmissionResult(success=False, error="captcha", duration_seconds=0.5),
+            SubmissionResult(success=False, error="no reply button", duration_seconds=0.5, reply_unavailable=True),
+        ):
+            sent = await self.run_bot(which, outcome)
+            self.assertEqual(len(sent), 1, outcome)
+            used, unused = await self.deck_state()
+            self.assertEqual(used, [], f"{which}: {outcome!r} must not burn a template")
+            self.assertEqual(sorted(unused), ["First template", "Second template"])
+
+        sent = await self.run_bot(which, SubmissionResult(success=True, remote_id="ok1", duration_seconds=0.5))
+        used, unused = await self.deck_state()
+        self.assertEqual(used, sent)  # exactly the posted template, once
+        self.assertEqual(len(unused), 1)
+        self.assertNotEqual(unused[0], sent[0])
+
+    async def test_single_video_paths(self) -> None:
+        await self.check_paths("single")
+
+    async def test_multi_video_paths(self) -> None:
+        await self.check_paths("multi")
+
+    async def test_dry_run_never_burns(self) -> None:
+        for which in ("single", "multi"):
+            await self.run_bot(which, SubmissionResult(success=True, remote_id="sim", duration_seconds=0.1), dry_run=True)
+            used, _ = await self.deck_state()
+            self.assertEqual(used, [], which)
 
 
 if __name__ == "__main__":

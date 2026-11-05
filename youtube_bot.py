@@ -53,6 +53,16 @@ from modules.youtube_runner import YouTubeRunner
 from modules.logger_config import configure_windows_encoding, setup_bot_logging
 
 
+async def _deck_project_id(db: Database) -> int | None:
+    """The project a run without --project takes its replies from (see below): the scope of the template deck."""
+    try:
+        projects = await db.list_projects()
+        project = projects[0] if len(projects) == 1 else await db.get_project_by_name(DEFAULT_PROJECT_NAME)
+        return int(project.id) if project is not None else None
+    except Exception:  # the deck then falls back to its own default scope
+        return None
+
+
 async def _settings_without_project(db: Database, cfg: AppConfig, log: bool = True) -> AppConfig | None:
     """Target and replies for a run without --project (`--search`, `--account`, `--video`): config.yaml no longer
     holds them (the interface writes into the projects), so they come from the only project, else from «Основной».
@@ -1525,7 +1535,7 @@ async def run_reply_bot(
         if effective_mode == "ai" or should_paraphrase(cfg.deepseek, cfg.processor)
         else None
     )
-    deck = ReplyDeck(db, rng)
+    deck = ReplyDeck(db, rng, project_id=await _deck_project_id(db))
     simulator = InteractionSimulator(rng=rng)
 
     session_dir: str | Path | None = None
@@ -1891,7 +1901,7 @@ async def run_multi_video_pipeline(
         if effective_mode == "ai" or should_paraphrase(cfg.deepseek, cfg.processor)
         else None
     )
-    deck = ReplyDeck(db, rng)
+    deck = ReplyDeck(db, rng, project_id=await _deck_project_id(db))
     simulator = InteractionSimulator(rng=rng)
 
     session_dir: str | Path | None = None
