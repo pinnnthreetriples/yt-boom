@@ -16,7 +16,8 @@ from modules.collector import CollectedItem, Collector, CollectorError
 from modules.interaction_simulator import InteractionSimulator
 from modules.process_guard import bind_to_kill_on_close_job
 from modules.projects import project_seed
-from modules.processor import DeepSeekProcessor, ProcessorError, resolve_reply_text
+from modules.processor import DeepSeekProcessor, ProcessorError
+from modules.reply_deck import ReplyDeck, prepare_reply
 from modules.ui_test_runner import UITestRunner
 from modules.validator import DeliveryValidator
 
@@ -36,6 +37,7 @@ class Orchestrator:
         self._cfg = config
         self._rng = random.Random()
         self._db = Database(config.app.db_path, project_seed=project_seed(config))
+        self._deck = ReplyDeck(self._db, self._rng)
         self._collector = Collector(config.collector, config.browser.proxy)
         self._processor = DeepSeekProcessor(config.deepseek, config.processor, rng=self._rng)
         self._validator = DeliveryValidator(config.validator)
@@ -128,6 +130,8 @@ class Orchestrator:
                 cooldown,
             )
 
+        deck_card = None  # custom template drawn for this iteration; burned only when the reply was posted
+        posted = False
         try:
             items = await self._collector.collect()
             if not items:
@@ -156,11 +160,15 @@ class Orchestrator:
                 item.confidence,
             )
             if getattr(self._cfg.processor, "reply_mode", "ai") == "custom":
-                text = resolve_reply_text(
+                prepared = await prepare_reply(
                     item,
+                    deck=self._deck,
+                    account=f"node:{node.name}",
+                    text_settings=self._cfg.processor,
                     custom_replies=getattr(self._cfg.processor, "custom_replies", None),
                     rng=self._rng,
                 )
+                text, deck_card = prepared.text, prepared.card
             else:
                 text = await self._processor.generate(item)
             payload = await self._db.create_payload(
@@ -170,11 +178,13 @@ class Orchestrator:
                 source_ref=item.external_id,
                 source_text=item.text,
             )
-            return await self._submit_payload(node, target, payload, item)
+            posted = await self._submit_payload(node, target, payload, item)
+            return posted
         except (CollectorError, ProcessorError) as exc:
             logger.error("Iteration {} aborted: {}", index, exc)
             return False
         finally:
+            await self._deck.settle(deck_card, posted=posted)
             await self._release_node(node, cooldown_seconds=cooldown)
 
     async def _acquire_node(self) -> TestNode | None:

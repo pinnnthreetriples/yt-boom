@@ -83,6 +83,8 @@ processor:
   lowercase_initial_probability: 0.2
   max_output_length: 400
   paraphrase_custom: true
+  reply_language: auto  # auto = язык комментария/шаблона; либо код: ru, en, es...; в интерфейсе: вкладка «Ответы», строка «язык»
+  latin_mix_probability: 0.0  # доля ответов, где в одном слове часть букв пишется латиницей (prивет); 0 = выкл. Код делает это после ответа DeepSeek, в режимах ИИ и свой текст; в интерфейсе: вкладка «Ответы», строка «смешивание букв»
 browser:
   headless: false
   os: windows

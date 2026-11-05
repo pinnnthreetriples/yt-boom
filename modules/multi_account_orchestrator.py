@@ -28,6 +28,7 @@ from modules.pool_manager import PoolManager
 from modules.projects import REFERENCE_LINKS, project_config, project_seed
 from modules.proxy_library import sync_config_accounts
 from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
+from modules.reply_deck import ReplyDeck, prepare_reply
 from modules.ui_test_runner import SubmissionResult
 from modules.youtube_collector import YouTubeCollector, empty_search_hint, extract_video_id, title_keywords
 from modules.youtube_runner import YouTubeRunner
@@ -89,11 +90,15 @@ class MultiAccountOrchestrator:
         project: ProjectRecord | None = None,
         claimed: set[str] | None = None,
         warmups: WarmupLedger | None = None,
+        custom_reply: str | None = None,
+        deck_project_id: int | None = None,
     ) -> None:
         """`project`: run only its members, its video pool and its target / replies (`project_config`); None keeps
         the run without projects (every active account, every pool). `claimed`: the comments taken earlier in the
         same launch (shared by the projects run one after another: one comment gets one reply from the whole bot).
-        `warmups`: the warm-ups of that launch (shared the same way)."""
+        `warmups`: the warm-ups of that launch (shared the same way). `custom_reply`: one explicit text sent as it is
+        (`--custom-reply`): it bypasses the template deck. `deck_project_id`: the project whose templates a run
+        without `project` uses (`--search`), so its template decks are the ones the other entry points use."""
         base = config_or_path if isinstance(config_or_path, AppConfig) else load_config(config_or_path)
         self._project = project
         self._cfg = project_config(base, project) if project is not None else base
@@ -107,6 +112,8 @@ class MultiAccountOrchestrator:
         self._dry_run = dry_run
         self._account_mode = account_mode or self._cfg.limits.account_mode
         self._rng = rng or random.Random()
+        self._custom_reply = (custom_reply or "").strip() or None
+        self._deck = ReplyDeck(self._db, self._rng, project_id=self._project_id or deck_project_id)
         # the search proxy lives in the database: `ensure_db` sets it on the collector made here
         self._own_collector = collector is None
         self._collector = collector or YouTubeCollector(self._cfg.collector, None)
@@ -546,6 +553,7 @@ class MultiAccountOrchestrator:
 
                 self._in_flight[acc.id] += 1
                 posted = False
+                deck_card = None  # custom template drawn from this account's deck; burned only after a real post
                 try:
                     logger.info(
                         "🎯 Цель: {} — {!r} (аккаунт: {!r})",
@@ -558,19 +566,23 @@ class MultiAccountOrchestrator:
                     effective_mode = getattr(self._cfg.processor, "reply_mode", "ai")
                     try:
                         if effective_mode == "custom":
-                            reply_text = resolve_reply_text(
+                            # the template comes from this account's deck; it is burned only after a real post
+                            prepared = await prepare_reply(
                                 it,
-                                custom_reply=None,
+                                deck=self._deck,
+                                account=acc.name,
+                                text_settings=self._cfg.processor,
+                                processor=self._processor,
+                                custom_reply=self._custom_reply,
                                 custom_replies=getattr(self._cfg.processor, "custom_replies", None),
+                                dry_run=self._dry_run,
                                 rng=self._rng,
                             )
-                            if self._processor is not None:
-                                reply_text = await self._processor.paraphrase(reply_text)
+                            reply_text, deck_card = prepared.text, prepared.card
+                        elif self._processor is not None:
+                            reply_text = await self._processor.generate(it)
                         else:
-                            if self._processor is not None:
-                                reply_text = await self._processor.generate(it)
-                            else:
-                                reply_text = resolve_reply_text(it, rng=self._rng)
+                            reply_text = resolve_reply_text(it, rng=self._rng)
                         logger.info("💬 НАШ ОТВЕТ ({!r}): «{}»", acc.name, reply_text)
                     except Exception as exc:
                         logger.error("ОШИБКА | Сбой подготовки ответа: {}", exc)
@@ -632,6 +644,9 @@ class MultiAccountOrchestrator:
                             continue
                         if not self._dry_run:  # inside the lock: the next worker of this account sees it
                             if sub_res.success:
+                                # the reply IS posted: burn the template first. `settle` never raises, so a deck
+                                # error cannot skip the counters below, and a failure of those cannot un-burn it
+                                await self._deck.settle(deck_card, posted=True)
                                 await self._db.record_account_comment_success(acc.id)
                                 # inside the lock, like the account's counter: the next pick of this account sees it
                                 await self._count_project_reply(acc)
@@ -729,6 +744,7 @@ class MultiAccountOrchestrator:
                             sub_res.error,
                         )
                 finally:
+                    await self._deck.settle(deck_card, posted=False)  # no-op once burned; frees the card otherwise
                     self._in_flight[acc.id] -= 1
                     if not posted:  # a failed comment stays free for another account
                         self._claimed.discard(it.external_id)

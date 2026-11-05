@@ -14,6 +14,28 @@ from modules.ui.tab_projects import no_project_view, switch_row
 _WRITERS = ["ИИ DeepSeek", "мои шаблоны"]
 _COMMON = "общее для всех проектов"
 
+# Language of the posted replies (processor.reply_language): code, label. Common to every project (config.yaml).
+_LANGUAGES = [
+    ("auto", "авто: как в комментарии / шаблоне"),
+    ("ru", "русский"),
+    ("en", "English"),
+    ("es", "Español"),
+    ("pt", "Português"),
+    ("de", "Deutsch"),
+    ("fr", "Français"),
+    ("tr", "Türkçe"),
+    ("uk", "Українська"),
+]
+
+# Share of replies where one Russian word gets a few letters in Latin (processor.latin_mix_probability). The code
+# does this to the finished reply, DeepSeek is never asked to mix alphabets; works for AI replies and templates.
+_MIX_LEVELS = [
+    (0.0, "выкл"),
+    (0.1, "редко · 10%"),
+    (0.3, "иногда · 30%"),
+    (0.6, "часто · 60%"),
+]
+
 
 def _real_key(cfg: Any) -> str:
     key = (cfg.deepseek.api_key or "").strip()
@@ -101,6 +123,51 @@ def build_tab(ctx: AppContext) -> Tab:
             return Notice("warn", "Включено, но ключа DeepSeek нет — шаблон уйдёт как есть")
         return Notice("ok" if on else "info", "ИИ меняет слова шаблона каждый раз" if on else "Шаблон уходит как есть")
 
+    def common_header() -> list[Row]:
+        return [Row("gap", [Cell("")], selectable=False),
+                Row("common", [Cell("── " + _COMMON, "dim")], selectable=False)]
+
+    def text_style_rows(cfg: Any) -> list[Row]:
+        """Language and letter mixing: saved into config.yaml, so they apply to every project and to both writers."""
+        lang = getattr(cfg.processor, "reply_language", "auto")
+        languages = list(_LANGUAGES)
+        if lang not in dict(languages):
+            languages.append((lang, lang))
+        mix = float(getattr(cfg.processor, "latin_mix_probability", 0.0))
+        levels = list(_MIX_LEVELS)
+        if not any(abs(value - mix) < 1e-9 for value, _ in levels):
+            levels.append((mix, f"{mix:.0%}"))
+        lang_index = [code for code, _ in languages].index(lang)
+        mix_index = next(i for i, (value, _) in enumerate(levels) if abs(value - mix) < 1e-9)
+
+        def set_language(index: int) -> Notice:
+            code = languages[index][0]
+            ctx.update({"processor.reply_language": code})
+            notice = Notice("ok", f"Язык ответов: {languages[index][1]}")
+            c = ctx.cfg()
+            if code != "auto" and any(
+                p.reply_mode == "custom" and not (p.paraphrase_custom and _real_key(c)) for p in ctx.projects()
+            ):
+                notice = Notice("warn", "Шаблоны переводятся только при включённой рандомизации и ключе DeepSeek")
+            return notice
+
+        def set_mix(index: int) -> Notice:
+            value, label = levels[index]
+            ctx.update({"processor.latin_mix_probability": value})
+            return Notice("info", "Смешивание букв выключено") if value == 0 else Notice("ok", f"Смешивание букв: {label}")
+
+        rows = [
+            Row("language", [Cell(icon("reply_to"), "", 3), Cell("язык: " + languages[lang_index][1])],
+                hint="Язык ответов · ←→ значение", values=[label for _, label in languages],
+                value_index=lang_index, on_value=set_language),
+            Row("mix", [Cell(icon("edited"), "", 3), Cell("смешивание букв: " + levels[mix_index][1])],
+                hint="Часть букв слова пишется латиницей (prивет) · ←→ значение", values=[label for _, label in levels],
+                value_index=mix_index, on_value=set_mix),
+        ]
+        if len(ctx.projects()) > 1 and not _needs_key(ctx):
+            rows = common_header() + rows
+        return rows
+
     def key_rows(cfg: Any) -> list[Row]:
         key = _real_key(cfg)
         check = state["check"]
@@ -113,8 +180,7 @@ def build_tab(ctx: AppContext) -> Tab:
         rows = [Row("key", [Cell(icon("key"), "", 3), Cell(_mask(key) if key else "не задан", "" if key else "warn"), Cell(mark)],
                     hint=hint, enter=key_enter, detail=lambda: [[Cell("ключ берут на platform.deepseek.com → API keys")]])]
         if len(ctx.projects()) > 1:  # the key is not the project's: set it apart
-            rows.insert(0, Row("common", [Cell("── " + _COMMON, "dim")], selectable=False))
-            rows.insert(0, Row("gap", [Cell("")], selectable=False))
+            rows = common_header() + rows
         return rows
 
     def build() -> View:
@@ -147,6 +213,7 @@ def build_tab(ctx: AppContext) -> Tab:
             rows += (keys + project_rows) if len(keys) == 1 else (project_rows + keys)
         else:
             rows += project_rows
+        rows += text_style_rows(cfg)
         return View(rows=rows, keys="←→ значение · Enter изменить")
 
     def warn() -> bool:

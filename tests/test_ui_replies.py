@@ -95,6 +95,57 @@ class WriterTest(RepliesTabCase):
         self.assertIn("как есть", self.screen())
 
 
+class TextStyleTest(RepliesTabCase):
+    """Reply language and Latin letter mixing: common to every project, saved into config.yaml, both writers."""
+
+    def test_language_is_picked_with_the_arrows(self):
+        self.assertEqual(self.cfg().processor.reply_language, "auto")
+        self.assertIn("язык: авто", self.screen())
+        self.c.select("language")
+        self.keys("right")
+        self.assertEqual(self.cfg().processor.reply_language, "ru")
+        self.assertIn("Язык ответов: русский", self.screen())
+        self.assertIn("язык: русский", self.screen())
+        self.keys("left")
+        self.assertEqual(self.cfg().processor.reply_language, "auto")
+
+    def test_language_warns_when_templates_cannot_be_translated(self):
+        self.keys("right")  # templates
+        self.ctx.update_project(self.project().id, custom_replies=["Привет"], paraphrase_custom=False)
+        self.c.select("language")
+        self.keys("right")
+        self.assertIn("Шаблоны переводятся только при включённой рандомизации", self.screen())
+
+    def test_mix_level_is_picked_in_both_writers(self):
+        for writer in ("ai", "custom"):
+            self.ctx.update_project(self.project().id, reply_mode=writer, custom_replies=["Привет"])
+            self.ctx.update({"processor.latin_mix_probability": 0.0})
+            self.c.refresh()
+            self.assertIn("смешивание букв: выкл", self.screen())
+            self.c.select("mix")
+            self.keys("right", "right")
+            self.assertEqual(self.cfg().processor.latin_mix_probability, 0.3)
+            self.assertIn("Смешивание букв: иногда · 30%", self.screen())
+            self.assertIn("смешивание букв: иногда · 30%", self.screen())
+            self.keys("left", "left")
+            self.assertEqual(self.cfg().processor.latin_mix_probability, 0.0)
+            self.assertIn("Смешивание букв выключено", self.screen())
+
+    def test_unusual_values_from_the_config_are_shown_as_they_are(self):
+        self.ctx.update({"processor.latin_mix_probability": 0.25, "processor.reply_language": "it"})
+        self.c.refresh()
+        text = self.screen()
+        self.assertIn("смешивание букв: 25%", text)
+        self.assertIn("язык: it", text)
+
+    def test_rows_are_under_the_common_header_with_several_projects(self):
+        self.ctx.db(lambda db: db.create_project("Фитнес", reply_mode="custom", custom_replies=["Класс"]))
+        self.c.refresh()
+        text = self.screen()
+        self.assertIn("── общее для всех проектов", text)
+        self.assertLess(text.index("── общее для всех проектов"), text.index("язык:"))
+
+
 class KeyTest(RepliesTabCase):
     def enter_key(self, key: str) -> None:
         self.c.select("key")
