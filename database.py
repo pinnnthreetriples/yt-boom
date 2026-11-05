@@ -20,6 +20,11 @@ from secret_store import SecretStoreError, protect_secret, reveal_secret
 
 NodeStatus = Literal["idle", "busy", "cooldown", "disabled"]
 PayloadStatus = Literal["pending", "submitted", "validated", "failed"]
+
+# A failed payload whose error starts with this mark is a target YouTube gives no Reply button (replies off for that
+# comment): every account sees the same, so it is skipped by every later run instead of being retried for a minute each.
+REPLY_UNAVAILABLE_MARK = "reply_unavailable"
+REPLY_UNAVAILABLE_TTL_SECONDS = 7 * 24 * 3600.0
 QueueStatus = Literal["queued", "running", "done", "failed"]
 QueueKind = Literal["submit", "validate"]
 ActivityMode = Literal["live", "dry_run"]
@@ -1415,6 +1420,15 @@ class Database:
             rows = await cursor.fetchall()
             await cursor.close()
 
+            cursor = await conn.execute(
+                "SELECT 1 FROM payloads WHERE source_ref = ? AND status = 'failed' AND error LIKE ? AND created_at > ? LIMIT 1",
+                (source_ref, f"{REPLY_UNAVAILABLE_MARK}%", now - REPLY_UNAVAILABLE_TTL_SECONDS),
+            )
+            no_reply_button = await cursor.fetchone()
+            await cursor.close()
+            if no_reply_button is not None:
+                return None
+
             for row in rows:
                 status = row["status"]
                 if status in ("submitted", "validated"):
@@ -1479,7 +1493,41 @@ class Database:
             "SELECT COUNT(*) FROM payloads WHERE source_ref = ? AND status IN ('pending', 'submitted', 'validated')",
             (source_ref,),
         )
+        if count > 0:
+            return True
+        # a target without a Reply button counts as handled too: no account can answer it
+        return await self.is_reply_unavailable(source_ref)
+
+    async def is_reply_unavailable(self, source_ref: str) -> bool:
+        """True when a recent run found that YouTube hides the Reply button on this comment."""
+        count = await self._count(
+            "SELECT COUNT(*) FROM payloads WHERE source_ref = ? AND status = 'failed' AND error LIKE ? AND created_at > ?",
+            (source_ref, f"{REPLY_UNAVAILABLE_MARK}%", time.time() - REPLY_UNAVAILABLE_TTL_SECONDS),
+        )
         return count > 0
+
+    async def mark_reply_unavailable(
+        self,
+        *,
+        node_id: int | None = None,
+        source_ref: str,
+        language: str = "en",
+        source_text: str | None = None,
+        reason: str = "",
+    ) -> None:
+        """Remember a target without a Reply button (a failed payload carrying REPLY_UNAVAILABLE_MARK)."""
+        if not source_ref or not source_ref.strip():
+            raise ValueError("source_ref must not be empty")
+        now = time.time()
+        error = _truncate(f"{REPLY_UNAVAILABLE_MARK}: {reason}".strip(": "))
+        async with self._transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO payloads (node_id, source_ref, source_text, text, language, status, error, created_at, validated_at)
+                VALUES (?, ?, ?, '', ?, 'failed', ?, ?, ?)
+                """,
+                (node_id, source_ref, source_text, language, error, now, now),
+            )
 
     async def list_payloads(self, status: PayloadStatus | None = None, limit: int = 50) -> list[Payload]:
         if limit < 1:

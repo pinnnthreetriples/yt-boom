@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from config import BrowserSettings, TargetSettings
 from modules.interaction_simulator import InteractionSimulator
-from modules.ui_test_runner import SubmissionError, SubmissionResult
+from modules.ui_test_runner import ReplyUnavailableError, SubmissionError, SubmissionResult
 from modules.youtube_runner import YouTubeRunner
 
 
@@ -164,6 +164,47 @@ class TestYouTubeRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(btn, sub_btn)
         # Ensure targeted selector with lc= was queried first
         self.assertTrue(any("lc=target_cid_123" in s for s in queried_selectors))
+
+    async def test_submit_reply_raises_reply_unavailable_when_youtube_hides_the_button(self):
+        """No Reply button and the comment is rendered with `#reply-button-end` hidden: a target problem, not a generic one."""
+        page = MagicMock()
+        page.locator = MagicMock(return_value=MagicMock(count=AsyncMock(return_value=0)))  # not signed out
+        with patch.object(self.runner, "_find_sub_comment_reply_button", AsyncMock(return_value=None)),              patch.object(self.runner, "_reply_disabled_on_target", AsyncMock(return_value=True)):
+            with self.assertRaises(ReplyUnavailableError):
+                await self.runner._submit_reply(page, "text", comment_id="c1")
+
+    async def test_submit_reply_keeps_the_generic_error_when_the_state_is_unknown(self):
+        page = MagicMock()
+        page.locator = MagicMock(return_value=MagicMock(count=AsyncMock(return_value=0)))
+        with patch.object(self.runner, "_find_sub_comment_reply_button", AsyncMock(return_value=None)),              patch.object(self.runner, "_reply_disabled_on_target", AsyncMock(return_value=False)):
+            with self.assertRaises(SubmissionError) as ctx:
+                await self.runner._submit_reply(page, "text", comment_id="c1")
+        self.assertNotIsInstance(ctx.exception, ReplyUnavailableError)
+
+    async def test_run_flags_reply_unavailable_and_does_not_take_a_screenshot(self):
+        page = MagicMock(url="https://www.youtube.com/watch?v=V&lc=c1", is_closed=MagicMock(return_value=False))
+        self.runner._page = page
+        with patch.object(self.runner, "_navigate_youtube", AsyncMock()),              patch.object(self.runner, "_dismiss_consent", AsyncMock()),              patch.object(self.runner, "_render", AsyncMock()),              patch.object(self.runner, "_scroll_to_comments", AsyncMock()),              patch.object(self.runner, "_expand_replies", AsyncMock()),              patch.object(self.runner, "_capture_failure", AsyncMock()) as shot,              patch.object(self.runner, "_submit_reply", AsyncMock(side_effect=ReplyUnavailableError("hidden"))):
+            result = await self.runner.run("text", external_id="V#c1")
+        self.assertFalse(result.success)
+        self.assertTrue(result.reply_unavailable)
+        shot.assert_not_awaited()
+
+    async def test_run_does_not_flag_ordinary_failures(self):
+        page = MagicMock(url="u", is_closed=MagicMock(return_value=False))
+        self.runner._page = page
+        with patch.object(self.runner, "_navigate_youtube", AsyncMock()),              patch.object(self.runner, "_dismiss_consent", AsyncMock()),              patch.object(self.runner, "_render", AsyncMock()),              patch.object(self.runner, "_scroll_to_comments", AsyncMock()),              patch.object(self.runner, "_expand_replies", AsyncMock()),              patch.object(self.runner, "_capture_failure", AsyncMock()),              patch.object(self.runner, "_submit_reply", AsyncMock(side_effect=SubmissionError("boom"))):
+            result = await self.runner.run("text", external_id="V#c1")
+        self.assertFalse(result.success)
+        self.assertFalse(result.reply_unavailable)
+
+    async def test_reply_disabled_on_target_without_comment_id_is_false(self):
+        self.assertFalse(await self.runner._reply_disabled_on_target(MagicMock(), None))
+
+    async def test_reply_disabled_on_target_swallows_driver_errors(self):
+        page = MagicMock()
+        page.locator = MagicMock(side_effect=RuntimeError("page closed"))
+        self.assertFalse(await self.runner._reply_disabled_on_target(page, "c1"))
 
     async def test_first_visible_skips_hidden_duplicate_of_the_comment(self):
         """YouTube keeps a zero-size duplicate of the linked reply ahead of the real one: pick the visible one."""

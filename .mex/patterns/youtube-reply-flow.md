@@ -12,7 +12,7 @@ edges:
   - target: context/conventions.md
     condition: when reviewing selector rules and typography conventions
 grounds_to: []
-last_updated: 2026-11-01
+last_updated: 2026-11-05
 mex:
   id: mx_01M69VC039A3DJ99V5S1GNSRPJ
   type: pattern
@@ -48,6 +48,7 @@ Posting replies under YouTube comments requires driving `modules.youtube_runner.
 - **Multi-lingual UI**: Never match text like `Reply` or `Ответить` because Kyrgyz (`Жооп`), Turkish, or other locales will fail. The same holds for `aria-label`, `title` and placeholders: `tests/test_selector_guard.py` fails on `has-text`, `text=`, `aria-label`, `get_by_text` and friends in `modules/*.py`. Text matching is permitted only for the Google auth speedbump screens in `google_authenticator.py` (see `google-auth-login.md`), never for YouTube UI.
 - **Reply expander**: the visible control of the current layout is `#replies #more-replies-sub-thread button` (verified en/ru, 2026-11-01). `#more-replies` / `#less-replies` live in the collapsed `#expander` and are hidden, so the show control is never confused with the hide control; no label check is needed.
 - **Verified structural handles (en-US, ru-RU; composer in ru, the account language wins over `?hl=`)**: sign-in link `ytd-masthead #buttons a[href*="ServiceLogin"]`, composer `#reply-dialog #contenteditable-root`, submit `#reply-dialog #submit-button button`, cancel `#cancel-button button` (never click it). Selector constants: `EXPAND_REPLIES_SELECTORS`, `REPLY_INPUT_SELECTORS`, `SUBMIT_BUTTON_*` in `youtube_runner.py`.
+- **Reply button hidden by YouTube (not a locale problem)**: for some comments YouTube renders the full action row (`#toolbar`) but sets `hidden` on `ytd-button-renderer#reply-button-end`, so the button exists and is never visible. Verified live 2026-11-05 with a ru-RU and a ky-KG account on `dQw4w9WgXcQ`: the same comments (`@ochkalov`, `@Timeworks`, a verified channel's comment) lack the button for both accounts, while the other 18 of the first 20 have it. `YouTubeRunner._reply_disabled_on_target` detects it by structure only (comment visible + `#toolbar` visible + `#reply-button-end` present + no visible button inside), `_submit_reply` raises `ReplyUnavailableError`, `run()` returns `SubmissionResult(reply_unavailable=True)` without a screenshot. Callers skip the target at once (no pause), do not count it as an account error (`MultiAccountOrchestrator` keeps it out of the 3-errors circuit breaker) and persist it (`Database.mark_reply_unavailable` / a failed payload whose error starts with `REPLY_UNAVAILABLE_MARK`, honoured by `reserve_payload` and `has_replied_to` for 7 days). Single-video and multi-video runs fetch `EXTRA_CANDIDATES` spare comments so skipped targets do not empty the list. If "could not locate Reply button" appears, check the failure screenshot for a missing "Reply" on that comment before suspecting the UI language.
 - **Hidden Duplicate Elements**: YouTube keeps hidden duplicate stubs of permalinked comments in the DOM. Always select the first visible element (`_first_visible`).
 
 ## Verify

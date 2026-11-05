@@ -44,6 +44,7 @@ Then read this file fully before doing anything else in this session.
 - Headful & persistent Camoufox browser execution with hardware fingerprint pinning and SOCKS5 remote DNS
 - Natural mouse movement via cubic Bezier curves, variable scroll pacing, and typo injection
 - Dynamic reply button DOM resolution (`#reply-button-end :is(button, a)`) supporting non-channel accounts
+- Comments YouTube gives no Reply button (`#reply-button-end` hidden) are detected structurally, skipped without blaming the account and remembered for 7 days (`ReplyUnavailableError`, `SubmissionResult.reply_unavailable`)
 - In-situ YouTube channel creation dialog detection and confirmation
 - Automated Google authentication state machine with RFC 6238 TOTP window guard and speedbump dismissal
 - Windows DPAPI credential encryption (`protect_secret` / `reveal_secret`) for SQLite persistence

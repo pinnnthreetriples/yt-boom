@@ -245,6 +245,45 @@ class TestMultiAccountOrchestrator(unittest.IsolatedAsyncioTestCase):
         self.assertIn("failed", statuses)
         self.assertIn("success", statuses)
 
+    async def test_target_without_reply_button_is_skipped_not_blamed_on_the_account(self) -> None:
+        """A comment YouTube gives no Reply button: next candidate is tried, the account gets no error, the target is remembered."""
+        acc = await self.db.upsert_account("acc_birut", str(self.base_dir / "birut"))
+        await self.db.add_video_to_pool("https://www.youtube.com/watch?v=noreply1111", comments_target=1)
+
+        def make_item(cid: str) -> CollectedItem:
+            return CollectedItem(
+                endpoint="youtube:noreply", external_id=f"noreply#root#{cid}", text=f"text {cid}", language="en",
+                confidence=0.95, source_url="https://www.youtube.com/watch?v=noreply", author="u", video_id="noreply", like_count=1,
+            )
+
+        results = {
+            "noreply#root#c_hidden": SubmissionResult(
+                success=False, error="ReplyUnavailableError: hidden", duration_seconds=0.1, reply_unavailable=True
+            ),
+            "noreply#root#c_ok": SubmissionResult(success=True, remote_id="rem_ok", duration_seconds=0.1),
+        }
+
+        def runner_factory(_acc):
+            runner = MagicMock()
+            runner.run = AsyncMock(side_effect=lambda text, external_id=None, **kw: results[external_id])
+            runner.close = AsyncMock()
+            return runner
+
+        collector = MagicMock()
+        collector.fetch_popular_comments = AsyncMock(return_value=[make_item("c_hidden"), make_item("c_ok")])
+        collector.close = AsyncMock()
+        orchestrator = MultiAccountOrchestrator(
+            self.config, db=self.db, concurrency=1, account_mode="share", collector=collector,
+            runner_factory=runner_factory, rng=random.Random(1),
+        )
+        self.assertEqual(await orchestrator.execute_video_pool(max_comments_per_video=1), 1)
+
+        statuses = sorted(log.status for log in await self.db.list_activity_logs())
+        self.assertEqual(statuses, ["failed", "success"])
+        self.assertEqual((await self.db.get_account(acc.id)).consecutive_errors, 0)  # the target was at fault
+        self.assertTrue(await self.db.is_reply_unavailable("noreply#root#c_hidden"))
+        self.assertFalse(await self.db.is_reply_unavailable("noreply#root#c_ok"))
+
     # ------------------------------------------------ End-to-End Video Pool
     async def test_run_video_pool_e2e(self) -> None:
         """run_video_pool loads the videos file and replies with the config accounts."""
