@@ -862,14 +862,16 @@ class TestVisibilityHook(TestLifecyclePacing):
                 await asyncio.wait_for(orchestrator.execute_video_pool(max_comments_per_video=1), timeout=10)
         self.assertFalse(orchestrator._visibility_tasks)
 
-    async def test_gate_message_is_logged_only_in_each_mode(self) -> None:
+    async def test_gate_message_tells_what_happens_to_the_videos_in_each_mode(self) -> None:
         account = await self._account("mature_acc", 100)
-        for mode, expected in (("each", 1), ("share", 0)):
+        for mode, expected in (("each", "stay pending"), ("share", "go to the other accounts")):
             orchestrator, _ = self._orchestrator(lambda *a, **k: None)
             orchestrator._account_mode = mode
             with patch("modules.multi_account_orchestrator.logger") as log:
                 orchestrator._gate_account(account)
-            self.assertEqual(log.info.call_count, expected)
+                orchestrator._gate_account(account)  # a second call changes nothing
+            self.assertEqual(log.info.call_count, 1)
+            self.assertIn(expected, log.info.call_args.args[0])
             self.assertIn(account.id, orchestrator._gated_accounts)
 
     async def test_default_collector_uses_the_search_proxy(self) -> None:
@@ -1039,6 +1041,264 @@ class TestSearchThroughAccounts(unittest.IsolatedAsyncioTestCase):
         result = await self.orchestrator(col).run_search("topic")
         self.assertEqual(tuple(result), (0, 0, 0))
         col.search_videos.assert_not_awaited()
+
+
+
+# ------------------------------------------------------------ mode "share": every video belongs to one account
+
+
+def _vid(n: int, prefix: str = "v") -> str:
+    return f"{prefix}{n:02d}".ljust(11, "x")  # a YouTube video id is 11 characters
+
+
+class TestShareDealsVideosToAccounts(unittest.IsolatedAsyncioTestCase):
+    """«share»: the list is dealt out round-robin (by account id), each video to exactly one account, the start of
+    the circle moves between launches, a stopped account hands its videos over (live runs, no real browsers)."""
+
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+        self.config = _make_test_config(self.base_dir)
+        self.config.browser.accounts = []
+        self.db = Database(self.base_dir / "test.db")
+        await self.db.connect()
+        await self.db.init_schema()
+        self.posted: list[tuple[str, str, str]] = []  # (account, video id, external id)
+        self.closed: list[str] = []
+        self.created: list[str] = []
+        self.failing: set[str] = set()
+
+    async def asyncTearDown(self) -> None:
+        await self.db.close()
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
+
+    async def accounts(self, count: int, *, first: int = 0, replies: dict[str, int] | None = None) -> list:
+        """`count` accounts that were never signed in by the bot (no lifecycle clock: never held back)."""
+        records = []
+        for n in range(first, first + count):
+            name = f"acc_{n}"
+            record = await self.db.upsert_account(name, str(self.base_dir / name))
+            if replies and name in replies:
+                async with self.db._transaction() as conn:
+                    await conn.execute("UPDATE accounts SET total_replies = ? WHERE id = ?", (replies[name], record.id))
+            records.append(record)
+        return records
+
+    async def mature_account(self, name: str):
+        """A signed-in mature account: one comment, then its cooldown refuses the next one."""
+        record = await self.db.upsert_account(name, str(self.base_dir / name))
+        await self.db.mark_account_authenticated(record.id)
+        stamped = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
+        async with self.db._transaction() as conn:
+            await conn.execute("UPDATE accounts SET authenticated_at = ? WHERE id = ?", (stamped, record.id))
+        return record
+
+    async def videos(self, count: int, target: int, prefix: str = "v") -> list[VideoPoolItem]:
+        return [
+            await self.db.add_video_to_pool(f"https://www.youtube.com/watch?v={_vid(n, prefix)}", comments_target=target)
+            for n in range(count)
+        ]
+
+    def orchestrator(self, *, dry_run: bool = False, account_mode: str = "share", concurrency: int = 1):
+        def factory(acc):
+            self.created.append(acc.name)
+            runner = MagicMock()
+
+            async def run(text, external_id=None, payload_id=None, dry_run=False):
+                if acc.name in self.failing:
+                    return SubmissionResult(success=False, error="boom", duration_seconds=0.01)
+                self.posted.append((acc.name, external_id.split("#")[0], external_id))
+                return SubmissionResult(success=True, remote_id=f"r_{len(self.posted)}", duration_seconds=0.01)
+
+            async def close():
+                self.closed.append(acc.name)
+
+            runner.run = AsyncMock(side_effect=run)
+            runner.close = AsyncMock(side_effect=close)
+            return runner
+
+        async def fetch(url, limit=10, target_mode="first_reply"):
+            vid = url.split("v=")[-1]
+            return [_search_item(vid, f"c{n}") for n in range(12)]
+
+        collector = MagicMock()
+        collector.fetch_popular_comments = AsyncMock(side_effect=fetch)
+        collector.close = AsyncMock()
+        return MultiAccountOrchestrator(
+            self.config, db=self.db, concurrency=concurrency, dry_run=dry_run, account_mode=account_mode,
+            collector=collector, runner_factory=factory, rng=random.Random(3),
+        )
+
+    async def run_pool(self, orchestrator, **kwargs) -> int:
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            return await orchestrator.execute_video_pool(**kwargs)
+
+    def by_video(self) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for account, video, _ in self.posted:
+            result.setdefault(video, []).append(account)
+        return result
+
+    def by_account(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for account, _, _ in self.posted:
+            counts[account] = counts.get(account, 0) + 1
+        return counts
+
+    async def test_six_videos_three_accounts_two_videos_each_and_every_video_has_one_author(self) -> None:
+        await self.accounts(3)
+        await self.videos(6, target=3)
+
+        done = await self.run_pool(self.orchestrator(concurrency=3))
+
+        self.assertEqual(done, 18)
+        self.assertEqual(self.by_account(), {"acc_0": 6, "acc_1": 6, "acc_2": 6})  # 2 videos x 3 replies each
+        for video, authors in self.by_video().items():
+            self.assertEqual(len(authors), 3, video)
+            self.assertEqual(len(set(authors)), 1, video)  # one video, one account
+        self.assertEqual(len(await self.db.list_pool_videos(status="completed")), 6)
+        self.assertEqual(await self.db.list_pool_videos(status="pending"), [])
+
+    async def test_videos_are_dealt_round_robin_in_account_id_order(self) -> None:
+        await self.accounts(3)
+        await self.videos(7, target=1)
+
+        await self.run_pool(self.orchestrator())
+
+        owners = {video: authors[0] for video, authors in self.by_video().items()}
+        expected = {_vid(n): f"acc_{n % 3}" for n in range(7)}
+        self.assertEqual(owners, expected)
+
+    async def test_a_new_account_without_replies_does_not_take_the_whole_load(self) -> None:
+        # the old rule «fewest total replies first» would have sent everything to acc_0
+        await self.accounts(3, replies={"acc_1": 18, "acc_2": 18})
+        await self.videos(6, target=3)
+
+        done = await self.run_pool(self.orchestrator(concurrency=3))
+
+        self.assertEqual(done, 18)
+        self.assertEqual(self.by_account(), {"acc_0": 6, "acc_1": 6, "acc_2": 6})
+
+    async def test_fewer_videos_than_accounts_only_that_many_accounts_work(self) -> None:
+        await self.accounts(5)
+        await self.videos(2, target=2)
+
+        done = await self.run_pool(self.orchestrator(concurrency=5))
+
+        self.assertEqual(done, 4)
+        self.assertEqual(self.by_account(), {"acc_0": 2, "acc_1": 2})
+        self.assertEqual(sorted(self.created), ["acc_0", "acc_1"])  # the others open no browser at all
+        self.assertEqual(sorted(self.closed), ["acc_0", "acc_1"])  # an account closes its browser after its queue
+
+    async def test_an_account_writes_no_more_than_the_per_video_limit_under_one_video(self) -> None:
+        await self.accounts(1)
+        await self.videos(2, target=3)
+
+        done = await self.run_pool(self.orchestrator())
+
+        self.assertEqual(done, 6)
+        self.assertEqual({video: len(authors) for video, authors in self.by_video().items()},
+                         {_vid(0): 3, _vid(1): 3})  # twelve comments were available under each
+        self.assertEqual([(v.status, v.comments_done) for v in await self.db.list_pool_videos(status="all")],
+                         [("completed", 3), ("completed", 3)])
+
+    async def test_the_start_of_the_circle_moves_between_launches_and_is_saved(self) -> None:
+        await self.accounts(3)
+        launches = []
+        for run in range(3):
+            self.posted.clear()
+            await self.videos(2, target=1, prefix=f"r{run}")
+            await self.run_pool(self.orchestrator())  # a fresh orchestrator: the offset comes from the database
+            launches.append(sorted(self.by_account()))
+        # 2 videos per launch over 3 accounts: the circle carries on where it stopped
+        self.assertEqual(launches, [["acc_0", "acc_1"], ["acc_0", "acc_2"], ["acc_1", "acc_2"]])
+        self.assertEqual(await self.db.get_setting("share_offset"), "6")
+
+    async def test_a_dry_run_leaves_the_offset_and_the_pool_alone(self) -> None:
+        await self.accounts(3)
+        await self.videos(2, target=1)
+
+        await self.run_pool(self.orchestrator(dry_run=True))
+
+        self.assertIsNone(await self.db.get_setting("share_offset"))
+        self.assertEqual(len(await self.db.list_pool_videos(status="pending")), 2)
+        self.assertEqual(sorted(self.by_account()), ["acc_0", "acc_1"])
+
+    async def test_a_damaged_saved_offset_counts_as_zero(self) -> None:
+        await self.accounts(2)
+        await self.videos(1, target=1)
+        await self.db.set_setting("share_offset", "not a number")
+
+        await self.run_pool(self.orchestrator())
+
+        self.assertEqual(self.by_account(), {"acc_0": 1})
+
+    async def test_an_account_stopped_mid_run_hands_its_videos_to_the_others(self) -> None:
+        await self.mature_account("acc_0")  # one comment, then the cooldown stops it
+        await self.accounts(2, first=1)  # acc_0 is the first account by id: the manual ones follow
+        await self.videos(4, target=2)
+
+        done = await self.run_pool(self.orchestrator())
+
+        # acc_0 owned videos 0 and 3: it wrote one reply under video 0, the others finished both videos
+        self.assertEqual(self.by_account()["acc_0"], 1)
+        self.assertEqual(done, 8)
+        for video, authors in self.by_video().items():
+            self.assertEqual(len(authors), 2, video)
+        self.assertEqual(self.by_video()[_vid(0)].count("acc_0"), 1)  # the remainder was added by another account
+        self.assertEqual(len(set(self.by_video()[_vid(0)])), 2)
+        self.assertEqual(len(await self.db.list_pool_videos(status="completed")), 4)
+        self.assertEqual(self.closed.count("acc_0"), 1)
+
+    async def test_no_account_able_to_comment_leaves_the_video_pending(self) -> None:
+        await self.mature_account("acc_0")
+        await self.videos(3, target=2)
+
+        done = await self.run_pool(self.orchestrator())
+
+        self.assertEqual(done, 1)
+        videos = await self.db.list_pool_videos(status="all")
+        self.assertTrue(all(v.status != "completed" for v in videos))
+        self.assertEqual(len(await self.db.list_pool_videos(status="pending")), 3)
+        self.assertEqual([v.comments_done for v in videos], [1, 0, 0])
+
+    async def test_a_failed_video_stays_pending_and_is_not_handed_over(self) -> None:
+        await self.accounts(2)
+        await self.videos(2, target=1)
+        self.failing = {"acc_0"}
+
+        done = await self.run_pool(self.orchestrator())
+
+        self.assertEqual(done, 1)  # acc_1 finished its video; acc_0's failures do not move its video elsewhere
+        pending = await self.db.list_pool_videos(status="pending")
+        self.assertEqual([v.video_id for v in pending], [_vid(0)])
+
+    async def test_partly_done_video_needs_only_the_rest(self) -> None:
+        await self.accounts(2)
+        video = (await self.videos(1, target=3))[0]
+        await self.db.update_pool_video_progress(video.id, comments_added=2)
+        video = (await self.db.list_pool_videos(status="pending"))[0]
+
+        done = await self.run_pool(self.orchestrator(), videos=[video])
+
+        self.assertEqual(done, 1)
+        self.assertEqual((await self.db.list_pool_videos(status="all"))[0].status, "completed")
+
+    async def test_each_mode_is_unchanged(self) -> None:
+        await self.accounts(2)
+        await self.videos(2, target=2)
+
+        done = await self.run_pool(self.orchestrator(account_mode="each"))
+
+        self.assertEqual(done, 8)  # both accounts pass both videos, 2 replies each
+        self.assertEqual(self.by_account(), {"acc_0": 4, "acc_1": 4})
+        for authors in self.by_video().values():
+            self.assertEqual(sorted(authors), ["acc_0", "acc_0", "acc_1", "acc_1"])
+        self.assertEqual(len(await self.db.list_pool_videos(status="completed")), 2)  # closed once all passed
+        self.assertIsNone(await self.db.get_setting("share_offset"))
 
 
 if __name__ == "__main__":
