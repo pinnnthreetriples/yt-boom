@@ -167,7 +167,8 @@ class LaunchCase(unittest.TestCase):
         c.press("right")
         self.assertEqual(self.raw()["limits"]["account_mode"], "share")
         c.press("space")
-        self.assertIn("2 ответа на всех", self.screen(c))
+        self.assertIn("каждый берёт по 2 видео", self.screen(c))
+        self.assertNotIn("на всех", self.screen(c))
 
     def test_window_toggle(self):
         self.add_accounts("one")

@@ -16,7 +16,7 @@ from modules.ui.tab_projects import daily_text, plan_text
 _SPLIT = [("each", "каждый — весь список"), ("share", "делят список")]
 _SPLIT_EXAMPLE = {
     "each": "3 видео, 2 аккаунта, лимит 2 → каждый пишет по 2 под каждым видео, всего 12",
-    "share": "3 видео, 2 аккаунта, лимит 2 → под каждым видео 2 ответа на всех, всего 6",
+    "share": "6 видео, 3 аккаунта, лимит 3 → каждый берёт по 2 видео, под каждым 3 ответа, всего 18",
 }
 _STATUS = {"success": ("sent", "ok", "отправлен"), "simulated": ("dry", "dim", "пробный"), "failed": ("failed", "err", "ошибка")}
 _NOT_VISIBLE = "not_visible"  # a journal filter, not a status: replies whose visibility is not confirmed

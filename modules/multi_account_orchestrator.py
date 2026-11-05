@@ -39,6 +39,9 @@ from modules.youtube_collector import YouTubeCollector, empty_search_hint, extra
 from modules.youtube_runner import YouTubeRunner
 
 
+SHARE_OFFSET_KEY = "share_offset"  # app_settings: where the round-robin of mode "share" stopped (per project)
+
+
 class SearchRunResult(NamedTuple):
     """Outcome of a topic search run: accounts that could post, videos found, replies posted (or simulated)."""
 
@@ -70,8 +73,8 @@ class ProjectRunResult(NamedTuple):
 class MultiAccountOrchestrator:
     """
     Posts replies under the video pool with several YouTube accounts:
-    `concurrency` accounts (or videos) at a time, account_mode "each" / "share",
-    error isolation per account and video.
+    `concurrency` accounts at a time, account_mode "each" (every account passes the whole list) / "share" (the
+    videos are dealt out, each one to a single account), error isolation per account and video.
     """
 
     _project: ProjectRecord | None = None  # set per instance; the class default keeps a run without projects
@@ -152,7 +155,6 @@ class MultiAccountOrchestrator:
 
         self._pool_mgr = PoolManager(self._db, collector=self._collector, rng=self._rng)
         self._in_flight: dict[int, int] = defaultdict(int)
-        self._account_offset: int = 0
         # Comments taken in this run: parallel accounts must not pick the same one before its payload exists.
         self._claimed: set[str] = claimed if claimed is not None else set()
         self._skipped_logged: set[int] = set()
@@ -409,15 +411,22 @@ class MultiAccountOrchestrator:
         if acc.id in self._gated_accounts:
             return
         self._gated_accounts.add(acc.id)
-        if self._account_mode == "each":  # in "share" mode nothing stops: the next pick takes another account
+        if self._account_mode == "each":
             logger.info(
                 "[LIFECYCLE] Account {} reached its comment limits: a run leaves about one comment per account, "
                 "the remaining videos stay pending for the next run",
                 acc.name,
             )
+        else:  # "share": its unfinished videos go to the accounts that can still comment, else stay pending
+            logger.info(
+                "[LIFECYCLE] Account {} reached its comment limits: its unfinished videos go to the other accounts, "
+                "or stay pending for the next run",
+                acc.name,
+            )
 
     async def _may_comment_now(self, acc: AccountRecord) -> bool:
-        """Re-check an account that was picked earlier (mode "each") against its current counters in the database."""
+        """Re-check an account about to comment (its turn in "each" mode, its video queue in "share") against its
+        current counters in the database."""
         fresh = await self._db.get_account(acc.id)
         if fresh is not None and not fresh.is_active:  # switched off in the wizard while the run was going
             return False
@@ -457,18 +466,6 @@ class MultiAccountOrchestrator:
                 )
         return usable
 
-    async def _pick_account(self) -> AccountRecord | None:
-        """Select next active account with least total replies, rotated round-robin."""
-        accounts = await self._usable_accounts()
-        if not accounts:
-            return None
-        n = len(accounts)
-        start = self._account_offset % n
-        self._account_offset += 1
-        rotated = accounts[start:] + accounts[:start]
-        rotated.sort(key=lambda a: a.total_replies + self._in_flight[a.id])
-        return rotated[0]
-
     async def _count_project_reply(self, acc: AccountRecord) -> None:
         """One more reply of `acc` in the project today. It can never break the recording of a published reply: a
         failure here (a locked database) is only logged, the journal, payloads and pool are still written."""
@@ -492,16 +489,20 @@ class MultiAccountOrchestrator:
         self,
         video: VideoPoolItem,
         target: int,
-        account: AccountRecord | None = None,
+        account: AccountRecord,
+        *,
+        pinned: bool = False,
+        already: int = 0,
     ) -> int:
         """
-        Post up to `target` replies under one pool video.
-        - account=None ("share"): the video's progress counts toward `target`, each reply goes to
-          the least-loaded account.
-        - account given ("each"): that account writes `target` replies of its own; the video is
-          marked completed by execute_video_pool once every account has passed it.
+        Post replies under one pool video with `account` only.
+        - pinned=False ("each"): the account writes `target` replies of its own; the video is marked
+          completed by execute_video_pool once every account has passed it.
+        - pinned=True ("share"): the video belongs to this account, the replies already under it
+          (`video.comments_done` plus `already`, posted earlier in this run) count toward `target`, and the
+          video is marked completed as soon as the target is reached; otherwise it stays pending.
         """
-        needed = target if account is not None else max(0, target - video.comments_done)
+        needed = max(0, target - video.comments_done - already) if pinned else target
         if needed <= 0:
             if not self._dry_run:  # a dry run never changes the pool: a live run takes the same videos
                 await self._db.update_pool_video_progress(video.id, comments_added=0, completed=True)
@@ -552,14 +553,10 @@ class MultiAccountOrchestrator:
                     logger.debug("ИНФО | Пропуск уже обработанного комментария {}", it.external_id)
                     continue
 
-                acc = account or await self._pick_account()
-                if acc is not None and account is not None and not await self._may_comment_now(acc):
+                acc = account
+                if not await self._may_comment_now(acc):
                     self._gate_account(acc)
                     self._claimed.discard(it.external_id)
-                    break
-                if acc is None:
-                    self._claimed.discard(it.external_id)
-                    logger.warning("ИНФО | Нет доступных аккаунтов для комментария")
                     break
 
                 self._in_flight[acc.id] += 1
@@ -709,8 +706,8 @@ class MultiAccountOrchestrator:
                             except Exception as exc:
                                 logger.debug("Payload tracking: {}", exc)
 
-                        is_video_complete = account is None and (
-                            video.comments_done + video_comments_done + 1 >= target
+                        is_video_complete = pinned and (
+                            video.comments_done + already + video_comments_done + 1 >= target
                         )
                         if not self._dry_run:
                             await self._db.update_pool_video_progress(
@@ -760,7 +757,7 @@ class MultiAccountOrchestrator:
                     if not posted:  # a failed comment stays free for another account
                         self._claimed.discard(it.external_id)
                 if posted and video_comments_done < needed and not self._dry_run:
-                    if account is not None and not await self._may_comment_now(acc):
+                    if not await self._may_comment_now(acc):
                         self._gate_account(acc)  # the cooldown refuses the next comment: no point in pausing
                         break
                     await asyncio.sleep(
@@ -802,8 +799,13 @@ class MultiAccountOrchestrator:
         Post replies under the pending videos of the user's own links (or under `videos`) with the active accounts.
         - "each": every account passes the whole list, `concurrency` accounts at a time
           (1 = one account after another).
-        - "share": the videos are spread across the accounts (least replies / round-robin),
-          `concurrency` videos at a time.
+        - "share": the list is dealt out round-robin, in account id order, so every video belongs to exactly one
+          account (20 videos, 5 accounts: 4 each) and gets up to its `comments_target` replies, all from that
+          account; `concurrency` accounts at a time, each closes its browser after its own videos. The circle starts
+          where the previous launch stopped (saved in `app_settings`), so the remainder does not always go to the
+          same accounts. A video is completed when its target is reached. An account that runs out of limits mid-run
+          hands its unfinished videos to the accounts that still can comment (a second pass); with none left they
+          stay pending for the next launch. The account's total replies play no part in the distribution.
         - Error isolation: exceptions in one account/video don't break others.
         """
         await self.ensure_db()
@@ -843,27 +845,146 @@ class MultiAccountOrchestrator:
                     await self._drop_runner(acc.id)  # the account's browser closes when its turn ends
                 return done
 
-        async def _run_video(video: VideoPoolItem) -> int:
-            async with self._semaphore:
-                return await self._process_video(video, target_of(video))
-
         if self._account_mode == "each":
-            tasks = [_run_account(acc) for acc in accounts]
+            try:
+                results = await asyncio.gather(*[_run_account(acc) for acc in accounts], return_exceptions=True)
+            finally:
+                await self._close_runners()
+            if not self._gated_accounts and not self._dry_run:
+                for video in videos:
+                    await self._db.update_pool_video_progress(video.id, comments_added=0, completed=True)
+            total_comments = sum(r for r in results if isinstance(r, int))
         else:
-            tasks = [_run_video(video) for video in videos]
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        finally:
-            await self._close_runners()
-        if self._account_mode == "each" and not self._gated_accounts and not self._dry_run:
-            for video in videos:
-                await self._db.update_pool_video_progress(video.id, comments_added=0, completed=True)
-        total_comments = sum(r for r in results if isinstance(r, int))
+            total_comments = await self._run_shared(accounts, videos, target_of)
         logger.info(
             "ИНФО | Обработка пула видео завершена: успешно отправлено {} ответов",
             total_comments,
         )
         return total_comments
+
+    # ------------------------------------------------------------------ mode "share"
+
+    @staticmethod
+    def _deal(
+        videos: list[VideoPoolItem], accounts: list[AccountRecord], start: int
+    ) -> list[tuple[AccountRecord, list[VideoPoolItem]]]:
+        """Deal `videos` round-robin over `accounts` (by id) from the circle position `start`; an account without
+        a video is left out, so with fewer videos than accounts only that many work."""
+        ordered = sorted(accounts, key=lambda acc: acc.id)
+        queues: dict[int, list[VideoPoolItem]] = {}
+        for index, video in enumerate(videos):
+            queues.setdefault((start + index) % len(ordered), []).append(video)
+        return [(ordered[position], queue) for position, queue in sorted(queues.items())]
+
+    def _share_offset_key(self) -> str:
+        return SHARE_OFFSET_KEY if self._project is None else f"{SHARE_OFFSET_KEY}:{self._project.id}"
+
+    async def _share_offset(self) -> int:
+        """Where the circle of the previous launch stopped (0 for the first one or a damaged value)."""
+        try:
+            return max(0, int(await self._db.get_setting(self._share_offset_key()) or 0))
+        except Exception as exc:  # a damaged value or a failing database: start the circle from the first account
+            logger.debug("[SHARE] Смещение круга не прочитано: {}", exc)
+            return 0
+
+    async def _save_share_offset(self, offset: int) -> None:
+        """Remember the circle position; a dry run changes nothing, so a live run deals the videos the same way."""
+        if self._dry_run:
+            return
+        try:
+            await self._db.set_setting(self._share_offset_key(), str(offset))
+        except Exception as exc:  # never worth stopping a run
+            logger.warning("[SHARE] Смещение круга не сохранено: {}", exc)
+
+    async def _free_accounts(self, accounts: list[AccountRecord]) -> list[AccountRecord]:
+        """The accounts of the run that can still comment now (their counters are re-read from the database)."""
+        free: list[AccountRecord] = []
+        for acc in accounts:
+            if acc.id in self._gated_accounts:
+                continue
+            if await self._may_comment_now(acc):
+                free.append(acc)
+            else:
+                self._gate_account(acc)
+        return free
+
+    async def _run_shared(
+        self,
+        accounts: list[AccountRecord],
+        videos: list[VideoPoolItem],
+        target_of: Callable[[VideoPoolItem], int],
+    ) -> int:
+        """Mode "share": deal the videos out (each one to a single account), run the accounts `concurrency` at a
+        time, then hand the videos of accounts that ran out of limits to the others. Returns replies posted."""
+        todo: list[VideoPoolItem] = []
+        for video in videos:
+            if target_of(video) - video.comments_done > 0:
+                todo.append(video)
+            elif not self._dry_run:  # replied to enough already: closed without taking an account's turn
+                await self._db.update_pool_video_progress(video.id, comments_added=0, completed=True)
+        if not todo:
+            logger.info("ИНФО | Все видео уже набрали нужное число ответов")
+            return 0
+
+        offset = await self._share_offset()
+        cursor = offset + len(todo)  # where the circle goes on: the next launch starts here, so do the hand-overs
+        await self._save_share_offset(cursor)
+        order = {video.id: index for index, video in enumerate(todo)}
+        posted: defaultdict[int, int] = defaultdict(int)  # replies of this run under each video
+        orphans: list[VideoPoolItem] = []  # videos of accounts that were stopped before finishing them
+
+        def remaining(video: VideoPoolItem) -> int:
+            return target_of(video) - video.comments_done - posted[video.id]
+
+        async def _run_queue(acc: AccountRecord, queue: list[VideoPoolItem]) -> None:
+            async with self._semaphore:
+                try:
+                    for index, video in enumerate(queue):
+                        if acc.id in self._gated_accounts:
+                            orphans.extend(queue[index:])  # no comments can be posted any more
+                            break
+                        posted[video.id] += await self._process_video(
+                            video, target_of(video), acc, pinned=True, already=posted[video.id]
+                        )
+                        if acc.id in self._gated_accounts and remaining(video) > 0:
+                            orphans.append(video)
+                finally:
+                    await self._drop_runner(acc.id)  # the account's browser closes when its turn ends
+
+        assignments = self._deal(todo, accounts, offset)
+        logger.info(
+            "ИНФО | Видео розданы по кругу: {}",
+            ", ".join(f"{acc.name} — {len(queue)}" for acc, queue in assignments),
+        )
+        try:
+            while assignments:
+                orphans.clear()
+                results = await asyncio.gather(
+                    *[_run_queue(acc, queue) for acc, queue in assignments], return_exceptions=True
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        logger.error("ОШИБКА | Сбой аккаунта при обработке видео: {}", result)
+                if not orphans:
+                    break
+                helpers = await self._free_accounts(accounts)
+                if not helpers:
+                    logger.warning(
+                        "ИНФО | Нет аккаунтов, которые могут отвечать сейчас: видео без ответов остаются в очереди ({})",
+                        len(orphans),
+                    )
+                    break
+                handed = sorted(orphans, key=lambda video: order[video.id])
+                assignments = self._deal(handed, helpers, cursor)  # the circle goes on: no skew to the lowest id
+                cursor += len(handed)
+                await self._save_share_offset(cursor)
+                logger.info(
+                    "ИНФО | Видео аккаунтов без лимита переданы другим: {}",
+                    ", ".join(f"{acc.name} — {len(queue)}" for acc, queue in assignments),
+                )
+        finally:
+            await self._close_runners()
+        return sum(posted.values())
 
     async def run_video_pool(self, videos_file: str | Path | None = None) -> int:
         """Load videos_file (if given) into the video pool, then run execute_video_pool; returns replies posted."""
