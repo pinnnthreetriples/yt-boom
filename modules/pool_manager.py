@@ -83,9 +83,10 @@ class PoolManager:
         self,
         file_path: str | Path,
         comments_target: int = 2,
+        project_id: int | None = None,
     ) -> list[VideoPoolItem]:
         """
-        Load video URLs or IDs from a text file into the video pool.
+        Load video URLs or IDs from a text file into a project's video pool (None: the fallback project).
         Skips comments (#), empty lines, and duplicates.
         """
         path = Path(file_path).expanduser()
@@ -95,28 +96,35 @@ class PoolManager:
         if comments_target < 1:
             raise ValueError("comments_target must be positive")
 
-        result = await self.add_videos_from_text(path.read_text(encoding="utf-8"), comments_target)
+        result = await self.add_videos_from_text(path.read_text(encoding="utf-8"), comments_target, project_id)
         logger.info("Loaded {} unique video(s) into pool from {}", len(result.items), path.name)
         return result.items
 
-    async def add_videos_from_text(self, text: str, comments_target: int = 2) -> PoolAddResult:
-        """Add pasted video links / IDs (one per line) to the pool; counts new, existing and invalid."""
+    async def add_videos_from_text(
+        self, text: str, comments_target: int = 2, project_id: int | None = None
+    ) -> PoolAddResult:
+        """Add pasted video links / IDs (one per line) to a project's pool (None: the fallback project); counts new,
+        existing (already own links of that project) and invalid."""
         if comments_target < 1:
             raise ValueError("comments_target must be positive")
         urls, invalid = parse_video_text(text)
-        known = {v.video_url for v in await self._db.list_pool_videos(status="all")}
+        if project_id is None:
+            project_id = await self._db.default_project_id()
+        known = {v.video_url for v in await self._db.list_pool_videos(status="all", source="links", project_id=project_id)}
         result = PoolAddResult(invalid=invalid)
         for url in urls:
             if url in known:
                 result.existing += 1
             else:
                 result.added += 1
-            result.items.append(await self._db.add_video_to_pool(video_url=url, comments_target=comments_target))
+            result.items.append(
+                await self._db.add_video_to_pool(video_url=url, comments_target=comments_target, project_id=project_id)
+            )
         return result
 
-    async def get_next_video_task(self) -> VideoPoolItem | None:
-        """Fetch next pending or in-progress video requiring comments from the pool."""
-        return await self._db.get_next_pool_video()
+    async def get_next_video_task(self, project_id: int | None = None) -> VideoPoolItem | None:
+        """Fetch next pending or in-progress video requiring comments from the pool (of one project, or of any)."""
+        return await self._db.get_next_pool_video(project_id)
 
     async def record_video_progress(
         self,

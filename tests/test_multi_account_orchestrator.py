@@ -245,6 +245,45 @@ class TestMultiAccountOrchestrator(unittest.IsolatedAsyncioTestCase):
         self.assertIn("failed", statuses)
         self.assertIn("success", statuses)
 
+    async def test_target_without_reply_button_is_skipped_not_blamed_on_the_account(self) -> None:
+        """A comment YouTube gives no Reply button: next candidate is tried, the account gets no error, the target is remembered."""
+        acc = await self.db.upsert_account("acc_birut", str(self.base_dir / "birut"))
+        await self.db.add_video_to_pool("https://www.youtube.com/watch?v=noreply1111", comments_target=1)
+
+        def make_item(cid: str) -> CollectedItem:
+            return CollectedItem(
+                endpoint="youtube:noreply", external_id=f"noreply#root#{cid}", text=f"text {cid}", language="en",
+                confidence=0.95, source_url="https://www.youtube.com/watch?v=noreply", author="u", video_id="noreply", like_count=1,
+            )
+
+        results = {
+            "noreply#root#c_hidden": SubmissionResult(
+                success=False, error="ReplyUnavailableError: hidden", duration_seconds=0.1, reply_unavailable=True
+            ),
+            "noreply#root#c_ok": SubmissionResult(success=True, remote_id="rem_ok", duration_seconds=0.1),
+        }
+
+        def runner_factory(_acc):
+            runner = MagicMock()
+            runner.run = AsyncMock(side_effect=lambda text, external_id=None, **kw: results[external_id])
+            runner.close = AsyncMock()
+            return runner
+
+        collector = MagicMock()
+        collector.fetch_popular_comments = AsyncMock(return_value=[make_item("c_hidden"), make_item("c_ok")])
+        collector.close = AsyncMock()
+        orchestrator = MultiAccountOrchestrator(
+            self.config, db=self.db, concurrency=1, account_mode="share", collector=collector,
+            runner_factory=runner_factory, rng=random.Random(1),
+        )
+        self.assertEqual(await orchestrator.execute_video_pool(max_comments_per_video=1), 1)
+
+        statuses = sorted(log.status for log in await self.db.list_activity_logs())
+        self.assertEqual(statuses, ["failed", "success"])
+        self.assertEqual((await self.db.get_account(acc.id)).consecutive_errors, 0)  # the target was at fault
+        self.assertTrue(await self.db.is_reply_unavailable("noreply#root#c_hidden"))
+        self.assertFalse(await self.db.is_reply_unavailable("noreply#root#c_ok"))
+
     # ------------------------------------------------ End-to-End Video Pool
     async def test_run_video_pool_e2e(self) -> None:
         """run_video_pool loads the videos file and replies with the config accounts."""
@@ -425,7 +464,9 @@ class TestMultiAccountOrchestrator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order, ["acc_a", "acc_a", "acc_b", "acc_b"])
         comments = [cid for kind, _, cid in events if kind == "start"]
         self.assertEqual(len(comments), len(set(comments)))
-        self.assertEqual(await self.db.list_pool_videos(status="pending"), [])
+        # a dry run leaves the pool as it was: a live run takes the same videos
+        self.assertEqual([(v.status, v.comments_done) for v in await self.db.list_pool_videos(status="all")],
+                         [("pending", 0), ("pending", 0)])
 
     async def test_each_mode_two_threads_runs_accounts_together(self) -> None:
         """«each», 2 threads: both accounts work at the same time, still on different comments."""
@@ -746,6 +787,25 @@ class TestVisibilityHook(TestLifecyclePacing):
         self.assertEqual(checker.watch.await_args_list[0].args, ("lifevid1111", "Ugx.r1", "manual_acc"))
         self.assertEqual((await self.db.get_account(account.id)).consecutive_errors, 0)  # a miss is not an error
 
+    async def test_the_result_is_written_to_the_journal_record_of_that_reply(self) -> None:
+        account = await self._account("manual_acc", None)
+        results = iter([True, False, None])
+
+        async def watch(video_id, comment_id, account_name):
+            return next(results)
+
+        checker = MagicMock(watch=AsyncMock(side_effect=watch))
+        orchestrator = self._watched(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="Ugx.r1", duration_seconds=0.1), checker
+        )
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            await orchestrator._process_video(self.video, 3, account)
+        await orchestrator._finish_visibility_checks()
+        rows = sorted(await self.db.list_activity_logs(), key=lambda r: r.id)
+        self.assertEqual([(r.status, r.visibility) for r in rows],
+                         [("success", "seen"), ("success", "unseen"), ("success", "unknown")])
+        self.assertEqual((await self.db.get_account(account.id)).consecutive_errors, 0)
+
     async def test_dry_run_failed_submit_and_missing_remote_id_are_not_checked(self) -> None:
         account = await self._account("manual_acc", None)
         cases = (
@@ -768,6 +828,9 @@ class TestVisibilityHook(TestLifecyclePacing):
         real = MultiAccountOrchestrator(self.config, db=self.db, collector=MagicMock())
         self.assertIsNotNone(real._visibility)
         self.config.limits.visibility_check_delay_seconds = 0
+        self.assertIsNone(MultiAccountOrchestrator(self.config, db=self.db, collector=MagicMock())._visibility)
+        self.config.limits.visibility_check_delay_seconds = 45
+        self.config.limits.visibility_check_enabled = False  # the switch of the «Запуск» tab
         self.assertIsNone(MultiAccountOrchestrator(self.config, db=self.db, collector=MagicMock())._visibility)
 
     async def test_pool_run_waits_for_pending_checks_before_returning(self) -> None:
@@ -809,14 +872,173 @@ class TestVisibilityHook(TestLifecyclePacing):
             self.assertEqual(log.info.call_count, expected)
             self.assertIn(account.id, orchestrator._gated_accounts)
 
-    async def test_default_collector_uses_the_global_proxy(self) -> None:
-        """Without an injected collector the pool collects through `browser.proxy`; no proxy means direct."""
-        for proxy in ("socks5://1.2.3.4:1080", None):
-            with self.subTest(proxy=proxy):
-                self.config.browser.proxy = proxy
-                with patch("modules.multi_account_orchestrator.YouTubeCollector") as collector_cls:
-                    MultiAccountOrchestrator(self.config, db=self.db, processor=MagicMock())
-                collector_cls.assert_called_once_with(self.config.collector, proxy)
+    async def test_default_collector_uses_the_search_proxy(self) -> None:
+        """Without an injected collector the pool collects through the library's search proxy (set in `ensure_db`);
+        a leftover `browser.proxy` is ignored and no search proxy means direct."""
+        record, _ = await self.db.add_proxy_url("socks5://1.2.3.4:1080")
+        for search_id, expected in ((record.id, "socks5://1.2.3.4:1080"), (None, None)):
+            with self.subTest(search=expected):
+                await self.db.set_search_proxy(search_id)
+                self.config.browser.proxy = "http://9.9.9.9:9"
+                collector = MagicMock(set_proxy=AsyncMock(), close=AsyncMock())
+                with patch("modules.multi_account_orchestrator.YouTubeCollector", return_value=collector) as collector_cls:
+                    orchestrator = MultiAccountOrchestrator(self.config, db=self.db, processor=MagicMock())
+                collector_cls.assert_called_once_with(self.config.collector, None)
+                await orchestrator.ensure_db()
+                collector.set_proxy.assert_awaited_once_with(expected)
+
+
+# ------------------------------------------------------------ topic search through the accounts
+
+
+def _search_item(vid: str, cid: str) -> CollectedItem:
+    return CollectedItem(
+        endpoint=f"youtube:{vid}",
+        external_id=f"{vid}#root#{cid}",
+        text=f"Comment {cid} about the video",
+        language="en",
+        confidence=0.95,
+        source_url=f"https://www.youtube.com/watch?v={vid}",
+        author=f"user_{cid}",
+        video_id=vid,
+        like_count=10,
+    )
+
+
+def _found(*vids: str) -> list[dict]:
+    return [{"video_id": v, "url": f"https://www.youtube.com/watch?v={v}", "title": v, "view_count": 20_000} for v in vids]
+
+
+class TestSearchThroughAccounts(unittest.IsolatedAsyncioTestCase):
+    """run_search: search → found videos into the pool (source 'search') → the accounts, as the own links."""
+
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+        self.config = _make_test_config(self.base_dir)
+        self.config.browser.accounts = []
+        self.db = Database(self.base_dir / "test.db")
+        await self.db.connect()
+        await self.db.init_schema()
+        self.posted: list[tuple[str, str]] = []  # (account, external_id)
+
+    async def asyncTearDown(self) -> None:
+        await self.db.close()
+        self.temp_dir.cleanup()
+
+    def collector(self, found: list[dict], comments: dict[str, list[CollectedItem]]) -> MagicMock:
+        col = MagicMock()
+        col.search_videos = AsyncMock(return_value=found)
+
+        async def fetch(url, limit=10, target_mode="first_reply"):
+            return list(comments.get(url.split("v=")[-1], []))
+
+        col.fetch_popular_comments = AsyncMock(side_effect=fetch)
+        col.close = AsyncMock()
+        return col
+
+    def orchestrator(self, col, *, dry_run=True, account_mode="each", concurrency=2) -> MultiAccountOrchestrator:
+        def factory(acc):
+            runner = MagicMock()
+
+            async def run(text, external_id=None, payload_id=None, dry_run=False):
+                self.posted.append((acc.name, external_id))
+                return SubmissionResult(success=True, remote_id=f"r_{len(self.posted)}", duration_seconds=0.01)
+
+            runner.run = AsyncMock(side_effect=run)
+            runner.close = AsyncMock()
+            return runner
+
+        return MultiAccountOrchestrator(
+            self.config, db=self.db, concurrency=concurrency, dry_run=dry_run, account_mode=account_mode,
+            collector=col, runner_factory=factory, rng=random.Random(1),
+        )
+
+    async def test_found_videos_go_through_every_account_without_taking_a_comment_twice(self) -> None:
+        await self.db.upsert_account("acc_a", str(self.base_dir / "a"))
+        await self.db.upsert_account("acc_b", str(self.base_dir / "b"))
+        comments = {v: [_search_item(v, f"{v}_c{n}") for n in range(4)] for v in ("srch_vid_01", "srch_vid_02")}
+        col = self.collector(_found("srch_vid_01", "srch_vid_02"), comments)
+        orch = self.orchestrator(col)
+
+        result = await orch.run_search("iphone 17", min_views=10_000, max_views=500_000, max_videos=2, comments_per_video=1)
+
+        self.assertEqual(tuple(result), (2, 2, 4))  # "each": both accounts write 1 reply under both videos
+        col.search_videos.assert_awaited_once_with(
+            query="iphone 17", min_views=10_000, max_views=500_000, limit=2, max_age_hours=None,
+        )
+        self.assertEqual({name for name, _ in self.posted}, {"acc_a", "acc_b"})
+        ids = [ext for _, ext in self.posted]
+        self.assertEqual(len(ids), len(set(ids)))  # a dry run never takes the same comment twice
+        self.assertEqual(len(await self.db.list_pool_videos(status="all", source="search")), 2)
+        self.assertEqual(await self.db.list_pool_videos(status="all", source="links"), [])
+
+    async def test_share_mode_splits_the_found_videos(self) -> None:
+        await self.db.upsert_account("acc_a", str(self.base_dir / "a"))
+        await self.db.upsert_account("acc_b", str(self.base_dir / "b"))
+        comments = {v: [_search_item(v, f"{v}_c{n}") for n in range(4)] for v in ("srch_vid_01", "srch_vid_02")}
+        orch = self.orchestrator(self.collector(_found("srch_vid_01", "srch_vid_02"), comments), account_mode="share")
+
+        result = await orch.run_search("iphone 17", max_videos=2, comments_per_video=1)
+
+        self.assertEqual(tuple(result), (2, 2, 2))  # "share": one reply per video for all accounts together
+
+    async def test_a_video_found_again_is_taken_again_and_answered_comments_are_skipped(self) -> None:
+        await self.db.upsert_account("acc_a", str(self.base_dir / "a"))
+        vid = "again_vid01"
+        comments = {vid: [_search_item(vid, "c1"), _search_item(vid, "c2")]}
+
+        for _ in range(2):
+            orch = self.orchestrator(self.collector(_found(vid), comments), dry_run=False, account_mode="share")
+            result = await orch.run_search("topic", max_videos=1, comments_per_video=1)
+            self.assertEqual(tuple(result), (1, 1, 1))
+
+        self.assertEqual([ext for _, ext in self.posted], [f"{vid}#root#c1", f"{vid}#root#c2"])
+        self.assertEqual(len(await self.db.list_pool_videos(status="all")), 1)  # UNIQUE video_url: one record
+
+    async def test_an_own_link_found_by_the_search_keeps_its_record(self) -> None:
+        url = "https://www.youtube.com/watch?v=own_link_01"
+        own = await self.db.add_video_to_pool(url, comments_target=3)
+        await self.db.update_pool_video_progress(own.id, comments_added=3)
+
+        item = await self.db.queue_search_video(url, comments_target=1)
+
+        self.assertEqual((item.status, item.comments_done, item.comments_target), ("pending", 0, 1))  # for this run
+        stored = (await self.db.list_pool_videos(status="all"))[0]
+        self.assertEqual((stored.source, stored.status, stored.comments_done), ("links", "completed", 3))
+
+    async def test_search_finds_are_not_part_of_the_own_links_run(self) -> None:
+        await self.db.queue_search_video("https://www.youtube.com/watch?v=found_vid01", comments_target=1)
+        await self.db.add_video_to_pool("https://www.youtube.com/watch?v=own_link_02", comments_target=1)
+        pending = await self.db.list_pool_videos(status="pending", source="links")
+        self.assertEqual([v.video_id for v in pending], ["own_link_02"])
+
+    async def test_a_pasted_link_found_by_the_search_before_becomes_an_own_link(self) -> None:
+        from modules.pool_manager import PoolManager
+
+        url = "https://www.youtube.com/watch?v=found_vid02"
+        found = await self.db.queue_search_video(url, comments_target=1)
+        await self.db.update_pool_video_progress(found.id, comments_added=1)
+
+        added = await PoolManager(self.db).add_videos_from_text(url, comments_target=2)
+
+        self.assertEqual((added.added, added.existing), (1, 0))  # new to the user's own list
+        stored = (await self.db.list_pool_videos(status="all"))[0]
+        self.assertEqual((stored.source, stored.status, stored.comments_done, stored.comments_target), ("links", "pending", 0, 2))
+        self.assertEqual((await self.db.get_next_pool_video()).video_id, "found_vid02")
+
+    async def test_nothing_found_opens_no_browser(self) -> None:
+        await self.db.upsert_account("acc_a", str(self.base_dir / "a"))
+        orch = self.orchestrator(self.collector([], {}))
+        result = await orch.run_search("nothing", max_views=100, max_videos=3)
+        self.assertEqual(tuple(result), (1, 0, 0))
+        self.assertEqual(self.posted, [])
+
+    async def test_without_accounts_able_to_post_there_is_no_search(self) -> None:
+        col = self.collector(_found("srch_vid_01"), {})
+        result = await self.orchestrator(col).run_search("topic")
+        self.assertEqual(tuple(result), (0, 0, 0))
+        col.search_videos.assert_not_awaited()
 
 
 if __name__ == "__main__":

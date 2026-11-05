@@ -1,6 +1,6 @@
 ---
 name: channel-profile
-description: Changing an account's YouTube channel nickname, description and avatar through the wizard card and the Studio editor.
+description: Changing an account's YouTube channel nickname, description and avatar through the «Профиль канала» screen and the Studio editor.
 triggers:
   - "avatar"
   - "channel name"
@@ -13,7 +13,7 @@ edges:
   - target: patterns/google-auth-login.md
     condition: when the account is not signed in yet
 grounds_to: []
-last_updated: 2026-11-01
+last_updated: 2026-11-03
 ---
 
 # Pattern: Channel Profile (nickname, description, avatar)
@@ -22,7 +22,7 @@ last_updated: 2026-11-01
 Only the **YouTube channel** is changed (Studio → Customization → Profile). Per YouTube's help page the channel name and picture are independent of the Google Account, which is never touched. The @handle is not changed.
 
 ## Flow
-1. Wizard stage 1 «Аккаунты» → `9` «Профиль канала» → pick an account (Space/Enter) → the card: current values plus rows «Изменить никнейм» / «Добавить|Изменить описание» / «Добавить|Изменить аватарку» / «Применить на YouTube».
+1. «Аккаунты» tab → Enter on the account → «Профиль канала» → the screen: current values plus rows «Изменить никнейм» / «Добавить|Изменить описание» / «Добавить|Изменить аватарку» / «Применить на YouTube».
 2. Each edit is saved at once as a **draft** in `accounts.profile_name|description|avatar` (no browser). Description: lines until a blank line, a lone `-` clears it. Avatar: a path (drag the file into the window); it is validated (`validate_avatar`: png/jpg/gif/bmp, ≤ 4 MB, real file signature) and copied to `profiles/avatars/<account>-<hash>.<ext>` (git-ignored), so a different picture is a different path.
 3. «Применить» (or `--apply-profile <name>`) runs `ProfileEditor.apply`: one browser session through `YouTubeRunner` (the account's proxy, fingerprint and persistent profile) → youtube.com (`ytcfg` proves the sign-in and gives `CHANNEL_ID`) → `studio.youtube.com/channel/<id>/editing/profile` → types only the fields that differ from the live channel → PUBLISH → reload and compare. Success stores the snapshot in `accounts.profile_applied`.
 

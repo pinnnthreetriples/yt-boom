@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import re
+import unicodedata
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -88,7 +89,7 @@ def build_search_params(sort_by: str = "views", video_only: bool = True, upload_
     if upload_date is not None:
         sort_code = {"views": 3, "view_count": 3, "popularity": 3, "popular": 3,
                      "date": 2, "upload_date": 2, "newest": 2, "rating": 1, "likes": 1}.get(s, 0)
-        filters = bytes([0x08, upload_date]) + (b"" if video_only else b"")
+        filters = bytes([0x08, upload_date]) + (b"\x10\x01" if video_only else b"")
         raw = (bytes([0x08, sort_code]) if sort_code else b"") + bytes([0x12, len(filters)]) + filters
         return base64.b64encode(raw).decode("ascii")
     if video_only:
@@ -108,9 +109,48 @@ def build_search_params(sort_by: str = "views", video_only: bool = True, upload_
         return ""
 
 
+def next_page_token(data: Any) -> str | None:
+    """Token of the next search results page: the `continuationItemRenderer` at the end of the results.
+
+    Not any `continuationCommand`: from page 2 on the filter chips of the header come first in the response,
+    and their tokens reload the results instead of continuing them.
+    """
+    for node in _find_keys(data, "continuationItemRenderer"):
+        if not isinstance(node, dict):
+            continue
+        command = (node.get("continuationEndpoint") or {}).get("continuationCommand") or {}
+        token = command.get("token")
+        if token:
+            return str(token)
+    return None
+
+
+def _views_text(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " млн"
+    if n >= 1000:
+        return f"{n / 1000:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " тыс"
+    return str(n)
+
+
+def empty_search_hint(min_views: int = 0, max_views: int | None = None, max_age_hours: int | None = None) -> str:
+    """What to loosen when a topic search found no video within the filters, e.g.
+    'шире свежесть (до 24 ч), шире просмотры (10 тыс – 500 тыс) или другая тема'."""
+    tips = []
+    if max_age_hours:
+        tips.append(f"шире свежесть (до {max_age_hours} ч)")
+    if min_views and max_views:
+        tips.append(f"шире просмотры ({_views_text(min_views)} – {_views_text(max_views)})")
+    elif min_views:
+        tips.append(f"меньше просмотров (от {_views_text(min_views)})")
+    elif max_views:
+        tips.append(f"больше просмотров (до {_views_text(max_views)})")
+    return (", ".join(tips) + " или другая тема") if tips else "другая тема"
+
+
 # "5 hours ago", "Streamed 2 days ago", "3 дня назад" -> hours per unit (matched by prefix).
 _AGE_REGEX = re.compile(
-    r"(\d+)\s*(second|sec|minute|min|hour|day|week|month|year|сек|мин|час|дн|ден|недел|месяц|год|лет)",
+    r"(\d+)\s*(second|sec|minute|min|hour|day|week|month|mo(?![a-zа-я])|year|сек|мин|час|дн|ден|недел|месяц|год|лет)",
     re.IGNORECASE,
 )
 _AGE_UNIT_HOURS: dict[str, float] = {
@@ -119,7 +159,7 @@ _AGE_UNIT_HOURS: dict[str, float] = {
     "hour": 1, "час": 1,
     "day": 24, "дн": 24, "ден": 24,
     "week": 168, "недел": 168,
-    "month": 720, "месяц": 720,
+    "month": 720, "mo": 720, "месяц": 720,
     "year": 8760, "год": 8760, "лет": 8760,
 }
 
@@ -245,6 +285,134 @@ def parse_like_count(like_val: Any) -> int:
     return _parse_compact_number(raw_text)
 
 
+def _video_entry(vid: str, title: str, views: int, views_text: str, channel: str, published: str) -> dict[str, Any]:
+    return {
+        "video_id": vid,
+        "title": title or f"Video {vid}",
+        "url": f"https://www.youtube.com/watch?v={vid}",
+        "view_count": views,
+        "views_text": views_text,
+        "channel": channel,
+        "published_time": published,
+    }
+
+
+def video_from_renderer(vr: Any) -> dict[str, Any] | None:
+    """A video of a `videoRenderer` (search) or `compactVideoRenderer` (watch page recommendations)."""
+    if not isinstance(vr, dict) or not vr.get("videoId"):
+        return None
+    view_node = vr.get("viewCountText") or vr.get("shortViewCountText")
+    return _video_entry(
+        str(vr["videoId"]),
+        _extract_text_from_node(vr.get("title")).strip(),
+        parse_view_count(view_node),
+        _extract_text_from_node(view_node).strip(),
+        _extract_text_from_node(vr.get("ownerText") or vr.get("longBylineText") or vr.get("shortBylineText")).strip(),
+        _extract_text_from_node(vr.get("publishedTimeText")).strip(),
+    )
+
+
+def video_from_lockup(lu: Any) -> dict[str, Any] | None:
+    """A video of a `lockupViewModel` (the newer layout of search results and recommendations)."""
+    if not isinstance(lu, dict) or lu.get("contentType") != "LOCKUP_CONTENT_TYPE_VIDEO" or not lu.get("contentId"):
+        return None
+    meta = lu.get("metadata", {}).get("lockupMetadataViewModel", {})
+    title = _extract_text_from_node(meta.get("title")).strip()
+    views_text, views, channel, published = "", 0, "", ""
+    # the rows sit under metadata.contentMetadataViewModel (an older layout had them on the model itself); a part's
+    # accessibility label is the full text («4.6 million views», «5 months ago») where the shown one is «4.6M», «5mo»
+    rows = meta.get("metadata", {}).get("contentMetadataViewModel", {}).get("metadataRows") or meta.get("metadataRows") or []
+    for row in rows:
+        for part in row.get("metadataParts", []) if isinstance(row, dict) else []:
+            text = _extract_text_from_node(part.get("text")).strip()
+            label = str(part.get("accessibilityLabel") or text).strip()
+            lowered = label.lower()
+            if "view" in lowered or "просмотр" in lowered:
+                views_text, views = text or label, parse_view_count(label)
+            elif parse_age_hours(label) is not None:
+                published = label
+            elif not channel:
+                channel = text
+            elif not published:
+                published = label
+    return _video_entry(str(lu["contentId"]), title, views, views_text, channel, published)
+
+
+def video_matches(video: dict[str, Any], min_views: int = 0, max_views: int | None = None,
+                  max_age_hours: int | None = None) -> bool:
+    """Views within [min_views, max_views] and, with max_age_hours, a known publish time not older than that."""
+    views = int(video.get("view_count") or 0)
+    if views < min_views or (max_views is not None and views > max_views):
+        return False
+    if max_age_hours:
+        age = parse_age_hours(str(video.get("published_time") or ""))
+        return age is not None and age <= max_age_hours
+    return True
+
+
+# Words a title query does without: function words and the usual video wrapping (ru / en).
+_TITLE_STOP_WORDS = frozenset(
+    """
+    a an the and or but nor of to in on at for with by from into onto about over under than then so as is are was
+    were be been being am it its this that these those there here i me my you your he him his she her we us our they
+    them their what which who whom whose why how when where all any each some no not only just very too can will
+    would should could do does did done has have had vs feat ft official video videos clip music lyrics lyric audio
+    full hd uhd fhd hdr live stream streaming shorts short episode ep part pt new top best trailer teaser compilation
+    subscribe channel watch now today vlog edit remix version ver mv pv tv
+    и в во не что он она оно они на я с со как а то все всё так его её ее но да ты к у же вы за бы по только мне было
+    вот от меня еще ещё нет о об из ему теперь когда даже ну ли если уже или ни быть был была были него до вас нибудь
+    опять уж вам ведь там потом себя ничего ей может тут где есть надо ней для мы тебя их чем сам чтоб чтобы без
+    будто чего раз тоже себе под будет ж тогда кто этот того потому этого какой совсем ним здесь этом один почти мой
+    тем нее сейчас куда зачем всех никогда можно при наконец два об другой хоть после над больше тот через эти нас
+    про всего них какая много разве три эту моя впрочем хорошо свою этой перед иногда лучше чуть том нельзя такой им
+    более всегда конечно всю между это эта эти весь вся всё какие каких каждый очень просто вообще почему зачем
+    видео клип официальный официальное официальная выпуск серия часть шортс стрим трансляция прямой новый новое
+    новая новые лучшие лучший топ смотреть подпишись подписывайтесь канал сегодня
+    """.split()
+)
+_TITLE_JUNK = re.compile(r"(?:https?://\S+|www\.\S+|[#@][\w\-]+)", re.UNICODE)
+_TITLE_BRACKETS = re.compile(r"[\[(【（「{][^\])】）」}]*[\])】）」}]")
+_TITLE_TECH_NUMBER = re.compile(r"^\d+(?:k|p|fps|hz|x|х|гб|gb|mb|мб)$", re.IGNORECASE)
+TITLE_KEYWORDS_MAX = 6
+
+
+def _title_tokens(text: str) -> list[str]:
+    """Words and numbers of a title: every other character (emoji, punctuation, |, brackets) separates them."""
+    cleaned = "".join(ch if ch.isalnum() or ch in "-'" else " " for ch in unicodedata.normalize("NFKC", text))
+    return [token.strip("-'") for token in cleaned.split() if token.strip("-'")]
+
+
+def _keyword_tokens(text: str) -> list[str]:
+    words: list[str] = []
+    seen: set[str] = set()
+    for token in _title_tokens(text):
+        lowered = token.casefold()
+        if lowered in seen or lowered in _TITLE_STOP_WORDS or _TITLE_TECH_NUMBER.match(token):
+            continue
+        if token.isdigit():
+            # a number stays only right after a kept word ("iphone 16", "windows 11"), never as a list counter
+            if not words or words[-1].isdigit() or len(token) > 4:
+                continue
+        elif len(token) < 2 or not any(ch.isalpha() for ch in token):
+            continue
+        seen.add(lowered)
+        words.append(token)
+    return words
+
+
+def title_keywords(title: str | None) -> str:
+    """A search query from a video title: links, hashtags, @handles, emoji, bracketed tags («[4K]», «(Official
+    Video)»), separators and ru / en function words removed; numbers kept only after a word; at most 6 significant
+    words in title order. "" when nothing meaningful is left (the reference is skipped then)."""
+    text = _TITLE_JUNK.sub(" ", str(title or ""))
+    words = _keyword_tokens(_TITLE_BRACKETS.sub(" ", text))
+    if not any(not word.isdigit() for word in words):
+        words = _keyword_tokens(text)  # the brackets held the whole title
+    if not any(not word.isdigit() for word in words):
+        return ""
+    return " ".join(words[:TITLE_KEYWORDS_MAX])
+
+
 class YouTubeCollector:
     """Fetches YouTube comments and nested replies (comments under comments) via InnerTube and HTTP."""
 
@@ -256,6 +424,7 @@ class YouTubeCollector:
         self._detector = self._build_detector(settings.languages)
         self._api_key: str | None = None
         self._client_version: str | None = None
+        self._watch_next_cache: dict[str, Any] = {}  # video id -> InnerTube `next` response (a run asks twice)
 
     @staticmethod
     def _build_detector(codes: list[str]) -> Any:
@@ -283,6 +452,17 @@ class YouTubeCollector:
             },
         )
         logger.debug("YouTube collector HTTP session opened")
+
+    @property
+    def proxy(self) -> str | None:
+        return self._proxy
+
+    async def set_proxy(self, proxy: str | None) -> None:
+        """Use `proxy` (None: direct) from the next request on; an open session with another proxy is closed."""
+        if proxy == self._proxy:
+            return
+        await self.close()
+        self._proxy = proxy
 
     async def close(self) -> None:
         session, self._session = self._session, None
@@ -658,21 +838,25 @@ class YouTubeCollector:
         *,
         min_views: int = 0,
         max_views: int | None = None,
-        sort_by: str = "views",
+        sort_by: str | None = None,
         limit: int = 10,
-        max_pages: int = 3,
+        max_pages: int = 10,
         max_age_hours: int | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Search YouTube videos via InnerTube, sorted by views (or other sort_by)
-        and filtered by min_views / max_views thresholds.
+        Search YouTube videos via InnerTube and keep those within min_views / max_views.
 
+        sort_by None picks the order: by views without an upper view limit, else by relevance
+        (sorted by views, the first pages hold only the most viewed videos, all above a low max_views).
         max_age_hours keeps only videos published at most that many hours ago: YouTube's
         upload date filter narrows the search, the publish time text gives the exact cut.
+        Up to max_pages result pages are read until `limit` videos match.
         """
         await self.open()
         assert self._session is not None
 
+        if sort_by is None:
+            sort_by = "views" if max_views is None else "relevance"
         api_key, client_version = await self._ensure_innertube_credentials()
         search_url = f"https://www.youtube.com/youtubei/v1/search?key={api_key}"
         params_token = build_search_params(
@@ -680,12 +864,6 @@ class YouTubeCollector:
             video_only=True,
             upload_date=upload_date_filter(max_age_hours) if max_age_hours else None,
         )
-
-        def too_old(published: str) -> bool:
-            if not max_age_hours:
-                return False
-            age = parse_age_hours(published)
-            return age is None or age > max_age_hours
 
         payload: dict[str, Any] = {
             "context": {
@@ -733,95 +911,15 @@ class YouTubeCollector:
                 logger.debug("No videoRenderer or lockupViewModel items found on search page {}", page + 1)
                 break
 
-            for vr in renderers:
-                if not isinstance(vr, dict):
-                    continue
-                vid = vr.get("videoId")
-                if not vid:
-                    continue
-
-                title_node = vr.get("title")
-                title = _extract_text_from_node(title_node).strip()
-
-                view_node = vr.get("viewCountText") or vr.get("shortViewCountText")
-                views_text = _extract_text_from_node(view_node).strip()
-                views = parse_view_count(view_node)
-
-                byline = vr.get("ownerText") or vr.get("longBylineText")
-                channel = _extract_text_from_node(byline).strip()
-
-                published = _extract_text_from_node(vr.get("publishedTimeText")).strip()
-
-                if views < min_views or too_old(published):
-                    continue
-                if max_views is not None and views > max_views:
-                    continue
-
-                video_entry = {
-                    "video_id": vid,
-                    "title": title or f"Video {vid}",
-                    "url": f"https://www.youtube.com/watch?v={vid}",
-                    "view_count": views,
-                    "views_text": views_text,
-                    "channel": channel,
-                    "published_time": published,
-                }
-                matched_videos.append(video_entry)
+            for video in [video_from_renderer(vr) for vr in renderers] + [video_from_lockup(lu) for lu in lockups]:
                 if len(matched_videos) >= limit:
                     break
+                if video is None or any(v["video_id"] == video["video_id"] for v in matched_videos):
+                    continue
+                if video_matches(video, min_views, max_views, max_age_hours):
+                    matched_videos.append(video)
 
-            if len(matched_videos) < limit:
-                for lu in lockups:
-                    if not isinstance(lu, dict):
-                        continue
-                    if lu.get("contentType") != "LOCKUP_CONTENT_TYPE_VIDEO":
-                        continue
-                    vid = lu.get("contentId")
-                    if not vid or any(v["video_id"] == vid for v in matched_videos):
-                        continue
-                    meta = lu.get("metadata", {}).get("lockupMetadataViewModel", {})
-                    title = _extract_text_from_node(meta.get("title")).strip()
-                    rows = meta.get("metadataRows", [])
-                    views_text = ""
-                    views = 0
-                    channel = ""
-                    published = ""
-                    for row in rows:
-                        parts = row.get("metadataParts", [])
-                        for part in parts:
-                            part_text = _extract_text_from_node(part.get("text")).strip()
-                            if "view" in part_text.lower() or "просмотр" in part_text.lower():
-                                views_text = part_text
-                                views = parse_view_count(part_text)
-                            elif not channel:
-                                channel = part_text
-                            else:
-                                published = part_text
-                    if views < min_views or too_old(published):
-                        continue
-                    if max_views is not None and views > max_views:
-                        continue
-                    matched_videos.append({
-                        "video_id": vid,
-                        "title": title or f"Video {vid}",
-                        "url": f"https://www.youtube.com/watch?v={vid}",
-                        "view_count": views,
-                        "views_text": views_text,
-                        "channel": channel,
-                        "published_time": published,
-                    })
-                    if len(matched_videos) >= limit:
-                        break
-
-            commands = _find_keys(data, "continuationCommand")
-            continuation_token = None
-            for cmd in commands:
-                if isinstance(cmd, dict) and "token" in cmd:
-                    continuation_token = str(cmd["token"])
-                    break
-            if not continuation_token:
-                tokens = _find_keys(data, "token")
-                continuation_token = str(tokens[0]) if tokens else None
+            continuation_token = next_page_token(data)
             if not continuation_token:
                 break
 
@@ -834,6 +932,75 @@ class YouTubeCollector:
             max_age_hours or "∞",
         )
         return matched_videos[:limit]
+
+    async def _watch_next(self, video_id: str) -> Any | None:
+        """The InnerTube `next` response of a watch page (title, recommendations); None when it cannot be read."""
+        if video_id in self._watch_next_cache:
+            return self._watch_next_cache[video_id]
+        await self.open()
+        assert self._session is not None
+        api_key, client_version = await self._ensure_innertube_credentials()
+        payload = {
+            "context": {"client": {"clientName": "WEB", "clientVersion": client_version, "hl": "en", "gl": "US"}},
+            "videoId": video_id,
+        }
+        try:
+            resp = await self._session.post(
+                f"https://www.youtube.com/youtubei/v1/next?key={api_key}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            if resp.status_code != 200:
+                logger.warning("Страница видео {} не прочитана: HTTP {}", video_id, resp.status_code)
+                return None
+            data = resp.json()
+        except (RequestException, ValueError) as exc:
+            logger.warning("Страница видео {} не прочитана: {}", video_id, exc)
+            return None
+        if len(self._watch_next_cache) >= 32:
+            self._watch_next_cache.pop(next(iter(self._watch_next_cache)))
+        self._watch_next_cache[video_id] = data
+        return data
+
+    async def video_title(self, video_url_or_id: str) -> str:
+        """The title of a video from its watch page ("" when it cannot be read)."""
+        video_id = extract_video_id(video_url_or_id)
+        data = await self._watch_next(video_id) if video_id else None
+        for node in _find_keys(data, "videoPrimaryInfoRenderer") if data is not None else []:
+            title = _extract_text_from_node(node.get("title") if isinstance(node, dict) else None).strip()
+            if title:
+                return title
+        return ""
+
+    async def related_videos(
+        self,
+        video_url_or_id: str,
+        *,
+        limit: int = 10,
+        min_views: int = 0,
+        max_views: int | None = None,
+        max_age_hours: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Videos YouTube recommends next to a video (InnerTube `next` → `secondaryResults`: `compactVideoRenderer` /
+        `lockupViewModel`), through the search proxy, kept within the views and age filters like `search_videos`.
+        The video itself and duplicates are left out; [] when the page cannot be read."""
+        video_id = extract_video_id(video_url_or_id)
+        data = await self._watch_next(video_id) if video_id else None
+        if data is None:
+            return []
+        secondary = _find_keys(data, "secondaryResults")
+        candidates = [video_from_renderer(node) for node in _find_keys(secondary, "compactVideoRenderer")]
+        candidates += [video_from_lockup(node) for node in _find_keys(secondary, "lockupViewModel")]
+        related: list[dict[str, Any]] = []
+        for video in candidates:
+            if len(related) >= limit:
+                break
+            if video is None or video["video_id"] == video_id or any(v["video_id"] == video["video_id"] for v in related):
+                continue
+            if video_matches(video, min_views, max_views, max_age_hours):
+                related.append(video)
+        logger.info("Похожие на {}: {} видео в пределах фильтров", video_id, len(related))
+        return related
 
     async def fetch_popular_comments(
         self,
@@ -1117,6 +1284,7 @@ class YouTubeCollector:
 
 
 __all__ = [
+    "TITLE_KEYWORDS_MAX",
     "YouTubeCollector",
     "YouTubeSubComment",
     "build_search_params",
@@ -1125,4 +1293,8 @@ __all__ = [
     "extract_video_id",
     "parse_like_count",
     "parse_view_count",
+    "title_keywords",
+    "video_from_lockup",
+    "video_from_renderer",
+    "video_matches",
 ]

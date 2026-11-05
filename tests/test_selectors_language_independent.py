@@ -30,6 +30,7 @@ STRINGS = {
     "en": ("Sign in", "Reply", "663 replies", "Hide replies", "Add a reply...", "Cancel", "Next", "Email or phone"),
     "ru": ("Войти", "Ответить", "663 ответа", "Скрыть ответы", "Введите ответ", "Отмена", "Далее", "Телефон или электронный адрес"),
     "pl": ("Zaloguj się", "Odpowiedz", "663 odpowiedzi", "Ukryj odpowiedzi", "Dodaj odpowiedź...", "Anuluj", "Dalej", "Adres e-mail lub telefon"),
+    "ky": ("Кирүү", "Жооп", "663 жооп", "Жоопторду жашыруу", "Жооп кошуу...", "Жокко чыгаруу", "Кийинки", "Электрондук почта же телефон"),
 }
 
 YOUTUBE = """
@@ -58,6 +59,29 @@ YOUTUBE = """
   <div id="cancel-button"><button aria-label="{cancel}">{cancel}</button></div>
   <ytd-button-renderer id="submit-button"><button aria-label="{reply}">{reply}</button></ytd-button-renderer>
 </ytd-commentbox></div></ytd-comment-reply-dialog-renderer>
+"""
+
+# Captured live 2026-11-05 (ru-RU and ky-KG accounts see the same): for some comments YouTube renders the whole action row
+# but sets `hidden` on `ytd-button-renderer#reply-button-end`, so the Reply button exists and is never visible.
+ACTION_ROWS = """
+<ytd-comment-thread-renderer><ytd-comment-view-model>
+  <a href="/watch?v=V1&lc=CAN.reply">1 day</a>
+  <div id="toolbar"><span id="vote-count-middle">5</span>
+    <ytd-button-renderer id="reply-button-end"><yt-button-shape><button aria-label="{reply}">{reply}</button></yt-button-shape></ytd-button-renderer></div>
+</ytd-comment-view-model></ytd-comment-thread-renderer>
+<ytd-comment-thread-renderer><ytd-comment-view-model>
+  <a href="/watch?v=V1&lc=NO.reply">2 days</a>
+  <div id="toolbar"><span id="vote-count-middle">9</span>
+    <ytd-button-renderer id="reply-button-end" hidden><yt-button-shape><button aria-label="{reply}">{reply}</button></yt-button-shape></ytd-button-renderer></div>
+</ytd-comment-view-model></ytd-comment-thread-renderer>
+<ytd-comment-thread-renderer><ytd-comment-view-model>
+  <a href="/watch?v=V1&lc=RENDERING.reply">3 days</a>
+  <div id="toolbar" hidden><ytd-button-renderer id="reply-button-end" hidden><button>{reply}</button></ytd-button-renderer></div>
+</ytd-comment-view-model></ytd-comment-thread-renderer>
+<ytd-comment-thread-renderer><ytd-comment-view-model>
+  <a href="/watch?v=V1&lc=BARE.reply">4 days</a>
+  <div id="toolbar"><span id="vote-count-middle">1</span></div>
+</ytd-comment-view-model></ytd-comment-thread-renderer>
 """
 
 GOOGLE = """
@@ -163,6 +187,26 @@ class TestYouTubeSelectors(_BrowserCase):
                 owner = await button.evaluate("e => e.closest('ytd-comment-view-model').querySelector('a[href*=\"lc=\"]').href")
                 self.assertTrue(owner.endswith("lc=TARGET.sub"), owner)
 
+    async def _check_reply_button_hidden_by_youtube(self) -> None:
+        """A comment YouTube gives no Reply button is told apart by structure, in every UI language."""
+        for lang, (signin, reply, *_rest) in STRINGS.items():
+            with self.subTest(lang=lang):
+                await self.page.set_content(ACTION_ROWS.format(reply=reply))
+                runner = SimpleNamespace(_first_visible=YouTubeRunner._first_visible)
+                disabled = {
+                    cid: await YouTubeRunner._reply_disabled_on_target(runner, self.page, cid)
+                    for cid in ("CAN.reply", "NO.reply", "RENDERING.reply", "BARE.reply", "MISSING.reply")
+                }
+                self.assertEqual(
+                    disabled,
+                    {"CAN.reply": False, "NO.reply": True, "RENDERING.reply": False, "BARE.reply": False, "MISSING.reply": False},
+                )
+                # the finder agrees: no visible button for the hidden one, one for the normal one
+                found = await YouTubeRunner._find_sub_comment_reply_button(runner, self.page, comment_id="CAN.reply", timeout_seconds=1.0)
+                self.assertIsNotNone(found)
+                missing = await YouTubeRunner._find_sub_comment_reply_button(runner, self.page, comment_id="NO.reply", timeout_seconds=0.6)
+                self.assertIsNone(missing)
+
     async def _check_consent_forms_told_apart_by_the_hidden_flag(self) -> None:
         for (variant, hl), (reject_label, accept_label) in CONSENT_PAGES.items():
             with self.subTest(variant=variant, hl=hl):
@@ -180,6 +224,7 @@ class TestYouTubeSelectors(_BrowserCase):
         # one browser start for all three checks (a Camoufox launch costs seconds)
         await self._check_thread_expander_and_composer()
         await self._check_reply_button_of_the_linked_comment()
+        await self._check_reply_button_hidden_by_youtube()
         await self._check_consent_forms_told_apart_by_the_hidden_flag()
 
 
