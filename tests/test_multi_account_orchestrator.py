@@ -787,6 +787,25 @@ class TestVisibilityHook(TestLifecyclePacing):
         self.assertEqual(checker.watch.await_args_list[0].args, ("lifevid1111", "Ugx.r1", "manual_acc"))
         self.assertEqual((await self.db.get_account(account.id)).consecutive_errors, 0)  # a miss is not an error
 
+    async def test_the_result_is_written_to_the_journal_record_of_that_reply(self) -> None:
+        account = await self._account("manual_acc", None)
+        results = iter([True, False, None])
+
+        async def watch(video_id, comment_id, account_name):
+            return next(results)
+
+        checker = MagicMock(watch=AsyncMock(side_effect=watch))
+        orchestrator = self._watched(
+            lambda *a, **k: SubmissionResult(success=True, remote_id="Ugx.r1", duration_seconds=0.1), checker
+        )
+        with patch("modules.multi_account_orchestrator.asyncio.sleep", AsyncMock()):
+            await orchestrator._process_video(self.video, 3, account)
+        await orchestrator._finish_visibility_checks()
+        rows = sorted(await self.db.list_activity_logs(), key=lambda r: r.id)
+        self.assertEqual([(r.status, r.visibility) for r in rows],
+                         [("success", "seen"), ("success", "unseen"), ("success", "unknown")])
+        self.assertEqual((await self.db.get_account(account.id)).consecutive_errors, 0)
+
     async def test_dry_run_failed_submit_and_missing_remote_id_are_not_checked(self) -> None:
         account = await self._account("manual_acc", None)
         cases = (
@@ -809,6 +828,9 @@ class TestVisibilityHook(TestLifecyclePacing):
         real = MultiAccountOrchestrator(self.config, db=self.db, collector=MagicMock())
         self.assertIsNotNone(real._visibility)
         self.config.limits.visibility_check_delay_seconds = 0
+        self.assertIsNone(MultiAccountOrchestrator(self.config, db=self.db, collector=MagicMock())._visibility)
+        self.config.limits.visibility_check_delay_seconds = 45
+        self.config.limits.visibility_check_enabled = False  # the switch of the «Запуск» tab
         self.assertIsNone(MultiAccountOrchestrator(self.config, db=self.db, collector=MagicMock())._visibility)
 
     async def test_pool_run_waits_for_pending_checks_before_returning(self) -> None:

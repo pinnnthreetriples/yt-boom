@@ -19,11 +19,14 @@ _SPLIT_EXAMPLE = {
     "share": "3 видео, 2 аккаунта, лимит 2 → под каждым видео 2 ответа на всех, всего 6",
 }
 _STATUS = {"success": ("sent", "ok", "отправлен"), "simulated": ("dry", "dim", "пробный"), "failed": ("failed", "err", "ошибка")}
-_FILTERS = [(None, "все"), ("success", "отправленные"), ("simulated", "пробные"), ("failed", "ошибки")]
+_NOT_VISIBLE = "not_visible"  # a journal filter, not a status: replies whose visibility is not confirmed
+_FILTERS = [(None, "все"), ("success", "отправленные"), ("simulated", "пробные"), ("failed", "ошибки"),
+            (_NOT_VISIBLE, "не видны")]
+_UNCONFIRMED = ("unseen", "unknown")
 _PAGE = 10
 _LOG_SELECT = (
     "SELECT l.id, l.created_at, l.status, l.mode, l.reply_text, l.error, l.target_author, l.video_url, l.video_id,"
-    " l.video_title, l.target_text, l.project_id, p.name, a.name"
+    " l.video_title, l.target_text, l.project_id, p.name, a.name, l.visibility"
     " FROM activity_log l LEFT JOIN projects p ON p.id = l.project_id LEFT JOIN accounts a ON a.id = l.account_id"
 )
 # Where a problem of a project is fixed: (tab, its icon, words of the «Чтобы начать» row of a single project).
@@ -69,9 +72,19 @@ def _today_counts(ctx: AppContext) -> dict[str, int]:
     return {str(status): int(n) for status, n in rows}
 
 
+def _today_visibility(ctx: AppContext) -> tuple[int, int]:
+    """Today's replies: (seen by anonymous visitors, not confirmed = unseen + unknown)."""
+    rows = ctx.query("SELECT visibility, COUNT(*) FROM activity_log WHERE created_at >= ? AND visibility IS NOT NULL"
+                     " GROUP BY visibility", (_today(ctx),))
+    counts = {str(v): int(n) for v, n in rows}
+    return counts.get("seen", 0), sum(counts.get(v, 0) for v in _UNCONFIRMED)
+
+
 def _where(status: str | None, project: int | None) -> tuple[str, tuple[Any, ...]]:
     clauses, params = [], []
-    if status:
+    if status == _NOT_VISIBLE:
+        clauses.append("l.visibility IN ('unseen', 'unknown')")
+    elif status:
         clauses.append("l.status = ?")
         params.append(status)
     if project is not None:
@@ -97,14 +110,27 @@ def _project_name(rec: tuple[Any, ...]) -> str:
     return str(name) if name else ("удалён" if project_id is not None else "—")
 
 
+def _visibility_marker(status: Any, visibility: Any) -> Cell:
+    """The mark of a published reply: green = seen by anonymous visitors, yellow = not confirmed, «—» = not checked;
+    only a sent reply has one."""
+    if status != "success":
+        return Cell("", "", 3)
+    if visibility == "seen":
+        return Cell(icon("seen"), "ok", 3)
+    if visibility in _UNCONFIRMED:
+        return Cell(icon("unseen"), "warn", 3)
+    return Cell("—", "dim", 3)
+
+
 def _record_cells(rec: tuple[Any, ...], with_date: bool = False) -> list[Cell]:
     _, created, status, _, reply, error, *_ = rec
     name, style, _ = _STATUS.get(str(status), ("dry", "dim", str(status)))
     text = (error if status == "failed" else reply) or ""
     return [
         Cell(icon(name), "", 3),
+        _visibility_marker(status, rec[14] if len(rec) > 14 else None),
         Cell(_time(created, with_date), "dim", 12 if with_date else 6),
-        Cell(" ".join(str(text).split()), "err" if status == "failed" else "dim", 46, grow=True),
+        Cell(" ".join(str(text).split()), "err" if status == "failed" else "dim", 43, grow=True),
     ]
 
 
@@ -228,6 +254,9 @@ def build_tab(ctx: AppContext) -> Tab:
         today = _today_counts(ctx)
         summary = [Cell(f"{icon('sent')} {today.get('success', 0)}", "", 7), Cell(f"{icon('dry')} {today.get('simulated', 0)}", "", 7),
                    Cell(f"{icon('failed')} {today.get('failed', 0)}", "err" if today.get("failed") else "", 7)]
+        seen_n, unconfirmed_n = _today_visibility(ctx)
+        summary += [Cell(f"{icon('seen')} {seen_n}", "ok" if seen_n else "", 7),
+                    Cell(f"{icon('unseen')} {unconfirmed_n}", "warn" if unconfirmed_n else "", 7)]
         waiting = sum(p.links_waiting for p in projects if p.enabled)
         if waiting:
             summary.append(Cell(f"{icon('videos')} {waiting}", "", 7))
@@ -270,6 +299,18 @@ def build_tab(ctx: AppContext) -> Tab:
             "window", [Cell(icon("window_off" if headless else "window_on"), "", 3), Cell("скрыто" if headless else "показывать", "dim")],
             hint="Окно браузера скрыто" if headless else "Окно браузера видно", values=["показывать", "скрыть"],
             value_index=int(headless), on_value=lambda i: ctx.update({"browser.headless": i == 1}),
+        ))
+
+        check_on = bool(cfg.limits.visibility_check_enabled)
+        delay = float(cfg.limits.visibility_check_delay_seconds)
+        check_hint = f"После ответа бот через ~{delay:.0f} с смотрит, виден ли он другим зрителям"
+        if check_on and delay <= 0:
+            check_hint = "Проверка выключена задержкой limits.visibility_check_delay_seconds = 0"
+        rows.append(Row(
+            "visibility", [Cell(icon("seen"), "", 3), Cell("Проверка видимости:", "dim"),
+                           Cell("включена" if check_on else "выключена", "ok" if check_on else "dim")],
+            hint=check_hint, values=["включена", "выключена"], value_index=0 if check_on else 1,
+            on_value=lambda i: ctx.update({"limits.visibility_check_enabled": i == 0}),
         ))
 
         total = ctx.query("SELECT COUNT(*) FROM activity_log")
@@ -398,6 +439,13 @@ def journal_view(ctx: AppContext, state: dict[str, Any]) -> View:
     count_where, count_params = _where(None, project)
     counts = {str(s): int(n) for s, n in ctx.query(f"SELECT l.status, COUNT(*) FROM activity_log l{count_where} GROUP BY l.status",
                                                    count_params)}
+    seen_n, unconfirmed_n = 0, 0
+    for mark, n in ctx.query(f"SELECT l.visibility, COUNT(*) FROM activity_log l{count_where} GROUP BY l.visibility",
+                             count_params):
+        if mark == "seen":
+            seen_n += int(n)
+        elif mark in _UNCONFIRMED:
+            unconfirmed_n += int(n)
     rows = []
     if several:
         rows.append(Row("project", [Cell("проект", "dim", 10), Cell(choices[state["project"]][1])], hint="Журнал проекта",
@@ -409,7 +457,7 @@ def journal_view(ctx: AppContext, state: dict[str, Any]) -> View:
     for rec in _recent(ctx, _PAGE, status, state["page"] * _PAGE, project):
         who = [Cell(fit(_project_name(rec), 11), "", 12), Cell(fit(str(rec[13] or "—"), 11), "", 12)] if several \
             else [Cell(str(rec[6] or "—"), "", 14)]
-        rows.append(Row(f"r{rec[0]}", _record_cells(rec, with_date=True)[:2] + who + [_record_cells(rec)[2]],
+        rows.append(Row(f"r{rec[0]}", _record_cells(rec, with_date=True)[:3] + who + [_record_cells(rec)[3]],
                         hint=_STATUS.get(str(rec[2]), ("", "", str(rec[2])))[2] + " · Enter — подробно",
                         enter=lambda rid=rec[0]: Screen(lambda: record_view(ctx, rid))))
     if total_n == 0:
@@ -430,6 +478,8 @@ def journal_view(ctx: AppContext, state: dict[str, Any]) -> View:
 
     top = [[Cell(f"{icon('sent')} {counts.get('success', 0)}", "", 8), Cell(f"{icon('dry')} {counts.get('simulated', 0)}", "", 8),
             Cell(f"{icon('failed')} {counts.get('failed', 0)}", "err" if counts.get("failed") else "", 8),
+            Cell(f"{icon('seen')} {seen_n}", "ok" if seen_n else "", 8),
+            Cell(f"{icon('unseen')} {unconfirmed_n}", "warn" if unconfirmed_n else "", 8),
             Cell(f"стр. {state['page'] + 1}/{pages}", "dim")]]
     return View(
         rows=rows, top=top, title=[Cell(f"{icon('journal')} журнал")],
@@ -438,22 +488,46 @@ def journal_view(ctx: AppContext, state: dict[str, Any]) -> View:
     )
 
 
+_VISIBILITY_WORDS = {
+    "seen": ("seen", "ok", "видна всем зрителям", ""),
+    "unseen": ("unseen", "warn", "не найдена в анонимной выдаче", "возможно, скрыта YouTube: виден только автору"),
+    "unknown": ("unseen", "warn", "не удалось проверить", "YouTube не отдал список комментариев или сеть недоступна"),
+}
+
+
+def _visibility_rows(status: str, visibility: Any) -> list[Row]:
+    """The record's «видимость» lines: what the anonymous check found, or why there was no check."""
+    if visibility in _VISIBILITY_WORDS:
+        icon_name, style, words, more = _VISIBILITY_WORDS[visibility]
+    else:
+        icon_name, style, more = "clock", "dim", ""
+        words = {"simulated": "не проверялась (пробный режим: ничего не опубликовано)",
+                 "failed": "не проверялась (ответ не отправлен)"}.get(status, "не проверялась")
+    rows = [Row("visibility", [Cell(icon(icon_name), "", 3), Cell("видимость:", "dim"), Cell(fit(words, 56), style)],
+                selectable=False)]
+    if more:
+        rows.append(Row("visibility-more", [Cell("", "", 3), Cell(fit(more, 60), "dim")], selectable=False))
+    return rows
+
+
 def record_view(ctx: AppContext, record_id: int) -> View:
     rows = ctx.query(
         "SELECT l.status, l.created_at, l.target_author, l.target_text, l.reply_text, l.error, l.video_url, l.video_id,"
-        " l.video_title, l.duration_sec, l.mode, l.project_id, p.name, a.name"
+        " l.video_title, l.duration_sec, l.mode, l.project_id, p.name, a.name, l.visibility"
         " FROM activity_log l LEFT JOIN projects p ON p.id = l.project_id LEFT JOIN accounts a ON a.id = l.account_id"
         " WHERE l.id = ?", (record_id,),
     )
     if not rows:
         return View(rows=[Row("none", [Cell("Запись не найдена", "warn")], selectable=False)])
-    status, created, author, target, reply, error, url, video_id, title, duration, mode, project_id, project, account = rows[0]
+    (status, created, author, target, reply, error, url, video_id, title, duration, mode, project_id, project, account,
+     visibility) = rows[0]
     name, style, word = _STATUS.get(str(status), ("dry", "dim", str(status)))
     link = url or (f"https://www.youtube.com/watch?v={video_id}" if video_id else "")
     project_text = project or ("удалён" if project_id is not None else "—")
     lines = [
         Row("head", [Cell(icon(name), "", 3), Cell(f"{word} · {_time(created, True)} · {mode or '—'} · {float(duration or 0):.1f} с", style)], selectable=False),
         Row("who", [Cell(icon("project"), "", 3), Cell(f"проект {project_text} · аккаунт {account or '—'}", "dim")], selectable=False),
+        *_visibility_rows(str(status), visibility),
         Row("gap", [Cell("")], selectable=False),
         Row("target", [Cell(icon("reply_to"), "", 3), Cell(fit(f"{author or '—'}: «{' '.join(str(target or '—').split())}»", 70), "dim")], selectable=False),
         Row("reply", [Cell(icon("templates"), "", 3), Cell(fit(f"«{' '.join(str(reply or '—').split())}»", 70))], selectable=False),

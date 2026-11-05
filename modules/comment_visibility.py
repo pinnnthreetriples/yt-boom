@@ -64,25 +64,141 @@ class CommentVisibilityChecker:
             return None
 
     async def watch(self, video_id: str, comment_id: str, account_name: str) -> bool | None:
-        """Wait, check once and log a miss; the caller runs it in the background."""
+        """Wait, check once and log the outcome; the caller runs it in the background."""
         await asyncio.sleep(self._delay)
         try:
             seen = await self.is_visible(video_id, comment_id)
         except Exception as exc:  # a background task: nothing may escape as "exception was never retrieved"
             logger.debug("Проверка видимости комментария {} прервана: {}", comment_id, exc)
-            return None
-        if seen is False:
+            seen = None
+        if seen is True:
+            logger.success(
+                "[ВИДИМОСТЬ] Ответ {} аккаунта {!r} под видео {} виден всем зрителям",
+                comment_id,
+                account_name,
+                video_id,
+            )
+        elif seen is False:
             logger.warning(
-                "[ВИДИМОСТЬ] Комментарий {} аккаунта {!r} под видео {} не найден в анонимной выдаче через {:.0f}с "
+                "[ВИДИМОСТЬ] Ответ {} аккаунта {!r} под видео {} не найден в анонимной выдаче через {:.0f}с "
                 "(не обязательно скрыт: возможна задержка или ошибка проверки)",
                 comment_id,
                 account_name,
                 video_id,
                 self._delay,
             )
-        elif seen:
-            logger.debug("Комментарий {} виден в анонимной выдаче", comment_id)
+        else:
+            logger.warning(
+                "[ВИДИМОСТЬ] Ответ {} аккаунта {!r} под видео {}: не удалось проверить (YouTube не отдал список "
+                "комментариев или сеть недоступна)",
+                comment_id,
+                account_name,
+                video_id,
+            )
         return seen
 
 
-__all__ = ["CommentVisibilityChecker"]
+_STATE_BY_RESULT: dict[bool | None, str] = {True: "seen", False: "unseen", None: "unknown"}
+
+
+def visibility_enabled(cfg: Any) -> bool:
+    """The check is on when the switch is on and the delay is above 0 (0 keeps meaning «off» for old configs)."""
+    limits = cfg.limits
+    return bool(limits.visibility_check_enabled) and limits.visibility_check_delay_seconds > 0
+
+
+def make_visibility_checker(cfg: Any, collector: Any) -> CommentVisibilityChecker | None:
+    """A checker for `collector` when the config enables the check, else None; the one place with the condition."""
+    if not visibility_enabled(cfg):
+        return None
+    return CommentVisibilityChecker(collector, cfg.limits.visibility_check_delay_seconds)
+
+
+async def watch_and_record(
+    checker: CommentVisibilityChecker,
+    db: Any,
+    log_id: int,
+    video_id: str,
+    remote_id: str,
+    account_name: str,
+) -> str | None:
+    """Run the check and store seen / unseen / unknown in the journal record `log_id`; never raises."""
+    try:
+        result = await checker.watch(video_id, remote_id, account_name)
+        state = _STATE_BY_RESULT[result if result is None else bool(result)]
+        await db.set_activity_visibility(log_id, state)
+        return state
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # a background task: nothing may escape as "exception was never retrieved"
+        logger.debug("Результат проверки видимости {} не записан: {}", remote_id, exc)
+        return None
+
+
+class VisibilityWatcher:
+    """Background checks of one run: schedules `watch_and_record`, waits for them (bounded) or cancels them.
+
+    Shared by the CLI loops of `youtube_bot.py`; the orchestrator keeps its own task set with the same helpers.
+    """
+
+    def __init__(self, checker: CommentVisibilityChecker | None, db: Any) -> None:
+        self._checker = checker
+        self._db = db
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    @property
+    def tasks(self) -> set[asyncio.Task[Any]]:
+        return self._tasks
+
+    def schedule(
+        self,
+        log_id: int | None,
+        video_id: str,
+        remote_id: str | None,
+        account_name: str,
+        *,
+        dry_run: bool = False,
+    ) -> asyncio.Task[Any] | None:
+        """Start a background check after a live reply; None (and one debug line) when it must not run."""
+        if self._checker is None:
+            logger.debug("[ВИДИМОСТЬ] Проверка выключена: ответ не проверяется")
+            return None
+        if dry_run:
+            logger.debug("[ВИДИМОСТЬ] Пробный режим: ничего не опубликовано, проверять нечего")
+            return None
+        if not remote_id or log_id is None:
+            logger.debug("[ВИДИМОСТЬ] У ответа нет id комментария: проверка пропущена")
+            return None
+        task = asyncio.create_task(watch_and_record(self._checker, self._db, log_id, video_id, remote_id, account_name))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def finish(self) -> None:
+        """Wait for the pending checks (never forever); call before the collector and the database are closed."""
+        tasks = list(self._tasks)
+        if not tasks:
+            return
+        logger.info("[ВИДИМОСТЬ] Ожидание проверки видимости ответов: {}", len(tasks))
+        limit = (self._checker._delay if self._checker is not None else 0.0) + 60.0
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=limit)
+        except asyncio.TimeoutError:
+            logger.warning("[ВИДИМОСТЬ] Проверка не уложилась в {:.0f}с и отменена", limit)
+            await self.cancel()
+
+    async def cancel(self) -> None:
+        """Drop the pending checks without waiting for their delay (Ctrl+C, a crash)."""
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+__all__ = [
+    "CommentVisibilityChecker",
+    "VisibilityWatcher",
+    "make_visibility_checker",
+    "visibility_enabled",
+    "watch_and_record",
+]

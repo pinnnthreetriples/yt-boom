@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import os
 import random
 import sys
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from database import (
     RecordNotFoundError,
 )
 from modules.collector import CollectorError
+from modules.comment_visibility import VisibilityWatcher, make_visibility_checker
 from modules.account_parser import looks_like_credentials, parse_account_line
 from modules.account_menu_logic import format_profile_summary, profile_pending_fields
 from modules.account_warmer import AccountWarmer, WarmUpResult
@@ -1526,6 +1528,7 @@ async def run_reply_bot(
         return
     await log_proxy_routes(db, [owner.name] if owner is not None else [])
     collector = YouTubeCollector(cfg.collector, search_proxy)
+    visibility = VisibilityWatcher(make_visibility_checker(cfg, collector), db)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
@@ -1705,7 +1708,7 @@ async def run_reply_bot(
                     if acc_record is not None:
                         await db.increment_account_stats(acc_record.id, replies=1)
                     await db.mark_payload_submitted(payload.id, sub_res.remote_id)
-                    await db.log_activity(
+                    log_entry = await db.log_activity(
                         ActivityLogCreate(
                             video_id=video_id,
                             video_title=None,
@@ -1723,6 +1726,9 @@ async def run_reply_bot(
                         )
                     )
                     logger.success("Ответ успешно опубликован и сохранен в базе (ID={})", sub_res.remote_id)
+                    visibility.schedule(
+                        log_entry.id, video_id, sub_res.remote_id, owner.name if owner is not None else "default"
+                    )
                     processed += 1
                 else:
                     no_reply_button = bool(getattr(sub_res, "reply_unavailable", False))
@@ -1758,12 +1764,18 @@ async def run_reply_bot(
                 await asyncio.sleep(pause)
 
         logger.info("Обработка видео завершена: отправлено {} ответов.", processed)
+    except BaseException:
+        await visibility.cancel()  # Ctrl+C / a crash: do not wait out the check delay
+        raise
     finally:
-        await runner.close()
-        await collector.close()
-        if processor is not None:
-            await processor.close()
-        await db.close()
+        try:
+            await visibility.finish()  # the checks use the collector and the database: wait before closing them
+        finally:
+            await runner.close()
+            await collector.close()
+            if processor is not None:
+                await processor.close()
+            await db.close()
 
 
 async def run_multi_video_pipeline(
@@ -1872,6 +1884,7 @@ async def run_multi_video_pipeline(
         return
     await log_proxy_routes(db, [owner.name] if owner is not None else [])
     collector = YouTubeCollector(cfg.collector, search_proxy)
+    visibility = VisibilityWatcher(make_visibility_checker(cfg, collector), db)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
@@ -2096,7 +2109,7 @@ async def run_multi_video_pipeline(
                         if acc_record is not None:
                             await db.increment_account_stats(acc_record.id, replies=1)
                         await db.mark_payload_submitted(payload.id, sub_res.remote_id)
-                        await db.log_activity(
+                        log_entry = await db.log_activity(
                             ActivityLogCreate(
                                 video_id=vid_id,
                                 video_title=vid_title,
@@ -2114,6 +2127,9 @@ async def run_multi_video_pipeline(
                             )
                         )
                         logger.success("Ответ успешно опубликован и сохранен в базе (ID={})", sub_res.remote_id)
+                        visibility.schedule(
+                            log_entry.id, vid_id, sub_res.remote_id, owner.name if owner is not None else "default"
+                        )
                         processed_for_video += 1
                         total_replies += 1
                     else:
@@ -2164,12 +2180,32 @@ async def run_multi_video_pipeline(
             total_replies,
             len(videos),
         )
+    except BaseException:
+        await visibility.cancel()  # Ctrl+C / a crash: do not wait out the check delay
+        raise
     finally:
-        await runner.close()
-        await collector.close()
-        if processor is not None:
-            await processor.close()
-        await db.close()
+        try:
+            await visibility.finish()  # the checks use the collector and the database: wait before closing them
+        finally:
+            await runner.close()
+            await collector.close()
+            if processor is not None:
+                await processor.close()
+            await db.close()
+
+
+_HISTORY_WIDTH = 120
+_VISIBILITY_TEXT = {"seen": ("виден", "32"), "unseen": ("НЕ ВИДЕН", "33"), "unknown": ("?", "33")}
+
+
+def history_visibility_cell(state: str | None, width: int = 8, color: bool | None = None) -> str:
+    """The «Видим.» column of the history table: виден / НЕ ВИДЕН / ? / —, coloured (green / yellow) only on a
+    terminal that wants colour (a tty and no NO_COLOR)."""
+    if color is None:
+        color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    word, code = _VISIBILITY_TEXT.get(state or "", ("—", ""))
+    cell = word.ljust(width)
+    return f"\033[{code}m{cell}\033[0m" if color and code else cell
 
 
 async def print_activity_history(
@@ -2185,25 +2221,25 @@ async def print_activity_history(
     try:
         entries = await db.list_activity_logs(page=1, page_size=limit, status_filter=status_filter)
         project_names = {p.id: p.name for p in await db.list_projects()}
-        print("\n" + "=" * 90)
+        print("\n" + "=" * _HISTORY_WIDTH)
         print("                        ЖУРНАЛ ОТРАБОТОК (ACTIVITY AUDIT LOG)")
-        print("=" * 90)
+        print("=" * _HISTORY_WIDTH)
         if not entries:
             print(" Журнал отработок пуст.")
-            print("=" * 90 + "\n")
+            print("=" * _HISTORY_WIDTH + "\n")
             return
 
-        header = f"{'ID':<5} | {'Время (UTC)':<19} | {'Статус':<9} | {'Режим':<7} | {'Проект':<12} | {'Автор':<15} | {'Видео':<12} | {'Ответ (фрагмент)'}"
+        header = f"{'ID':<5} | {'Время (UTC)':<19} | {'Статус':<9} | {'Видим.':<8} | {'Режим':<7} | {'Проект':<12} | {'Автор':<15} | {'Видео':<12} | {'Ответ (фрагмент)'}"
         print(header)
-        print("-" * 90)
+        print("-" * _HISTORY_WIDTH)
         for e in entries:
             t = e.created_at[:19].replace("T", " ") if e.created_at else "---"
             project = "—" if e.project_id is None else project_names.get(e.project_id, "удалён")
             author = (e.target_author or "@unknown")[:14]
             vid = (e.video_title or e.video_id)[:11]
             reply = (e.reply_text or e.error or "")[:25].replace("\n", " ")
-            print(f"{e.id:<5} | {t:<19} | {e.status:<9} | {e.mode:<7} | {project[:12]:<12} | {author:<15} | {vid:<12} | {reply}...")
-        print("=" * 90 + "\n")
+            print(f"{e.id:<5} | {t:<19} | {e.status:<9} | {history_visibility_cell(e.visibility)} | {e.mode:<7} | {project[:12]:<12} | {author:<15} | {vid:<12} | {reply}...")
+        print("=" * _HISTORY_WIDTH + "\n")
     finally:
         await db.close()
 

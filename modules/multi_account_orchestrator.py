@@ -20,7 +20,7 @@ from database import (
     VideoPoolItem,
 )
 from modules.account_warmer import AccountWarmer
-from modules.comment_visibility import CommentVisibilityChecker
+from modules.comment_visibility import CommentVisibilityChecker, make_visibility_checker, watch_and_record
 from modules.geo_guard import warn_if_exit_mismatch
 from modules.interaction_simulator import InteractionSimulator
 from modules.lifecycle_engine import AccountLifecycleEngine, explain_block
@@ -153,9 +153,8 @@ class MultiAccountOrchestrator:
         self._gated_accounts: set[int] = set()  # accounts held back by their lifecycle limits during this run
         self._warmup_slot = asyncio.Semaphore(1)  # one warm-up browser at a time
         # An injected runner_factory means no real YouTube behind the runners (tests): nothing to look for then.
-        delay = self._cfg.limits.visibility_check_delay_seconds
         self._visibility = visibility_checker or (
-            CommentVisibilityChecker(self._collector, delay) if runner_factory is None and delay > 0 else None
+            make_visibility_checker(self._cfg, self._collector) if runner_factory is None else None
         )
         self._visibility_tasks: set[asyncio.Task[Any]] = set()
 
@@ -355,11 +354,23 @@ class MultiAccountOrchestrator:
             logger.info("[LIFECYCLE] Waiting for {} warm-up session(s) to finish", len(tasks))
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _watch_visibility(self, acc: AccountRecord, video: VideoPoolItem, remote_id: str | None) -> None:
-        """Check in the background that a live reply shows up for anonymous visitors; never blocks the next comment."""
-        if self._visibility is None or self._dry_run or not remote_id:
+    def _watch_visibility(
+        self, acc: AccountRecord, video: VideoPoolItem, remote_id: str | None, log_id: int | None = None
+    ) -> None:
+        """Check in the background that a live reply shows up for anonymous visitors and store the result in the
+        journal record `log_id`; never blocks the next comment."""
+        if self._visibility is None:
+            logger.debug("[ВИДИМОСТЬ] Проверка выключена: ответ не проверяется")
             return
-        task = asyncio.create_task(self._visibility.watch(video.video_id, remote_id, acc.name))
+        if self._dry_run:
+            logger.debug("[ВИДИМОСТЬ] Пробный режим: ничего не опубликовано, проверять нечего")
+            return
+        if not remote_id or log_id is None:
+            logger.debug("[ВИДИМОСТЬ] У ответа нет id комментария: проверка пропущена")
+            return
+        task = asyncio.create_task(
+            watch_and_record(self._visibility, self._db, log_id, video.video_id, remote_id, acc.name)
+        )
         self._visibility_tasks.add(task)
         task.add_done_callback(self._visibility_tasks.discard)
 
@@ -635,7 +646,7 @@ class MultiAccountOrchestrator:
                         if (self._dry_run and sub_res.success)
                         else ("success" if sub_res.success else "failed")
                     )
-                    await self._db.log_activity(
+                    log_entry = await self._db.log_activity(
                         ActivityLogCreate(
                             video_id=video.video_id,
                             video_url=video.video_url,
@@ -691,7 +702,7 @@ class MultiAccountOrchestrator:
                         )
                         video_comments_done += 1
                         posted = True
-                        self._watch_visibility(acc, video, sub_res.remote_id)
+                        self._watch_visibility(acc, video, sub_res.remote_id, getattr(log_entry, "id", None))
                     elif getattr(sub_res, "reply_unavailable", False):
                         logger.warning(
                             "ИНФО | Комментарий {} к видео {} пропущен: ответить на него нельзя (кнопку скрыл YouTube)",
