@@ -136,6 +136,26 @@ class LaunchCase(unittest.TestCase):
         c.press("enter")
         self.assertIsInstance(c.pending_run, Run)
 
+    def test_the_projects_per_video_limit_is_shown_and_skipped_by_the_cursor(self):
+        self.add_accounts("one", "two")
+        c = self.controller()
+        out = self.screen(c)
+        project = self.ctx.project()
+        self.assertIn(f"ответов на видео: {project.comments_per_video}", out)
+        self.assertIn(f"видео на тему: {project.max_videos}", out)
+        self.assertIn("лимит без своего лимита", out)
+        c.press("down")
+        self.assertEqual(c.current_id(), "threads")  # the line is read-only: the cursor goes past it
+
+    def test_per_video_text_follows_the_way_accounts_share(self):
+        from types import SimpleNamespace
+
+        from modules.ui.tab_launch import per_video_text
+
+        project = SimpleNamespace(comments_per_video=3)
+        self.assertEqual(per_video_text(project, "share"), "«делят список»: под каждым видео 3 ответов на всех аккаунтов проекта вместе")
+        self.assertIn("каждый аккаунт проекта до 3 ответов", per_video_text(project, "each"))
+
     def test_threads_and_split_rows_with_two_accounts(self):
         self.add_accounts("one", "two")
         c = self.controller()

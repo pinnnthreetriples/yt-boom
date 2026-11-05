@@ -11,7 +11,7 @@ from modules.ui import shell
 from modules.ui.app import AppContext
 from modules.ui.icons import icon
 from modules.ui.shell import Cell, Confirm, GoTab, Hotkey, Menu, Notice, Row, Run, Screen, Step, Tab, View, fit
-from modules.ui.tab_projects import plan_text
+from modules.ui.tab_projects import daily_text, plan_text
 
 _SPLIT = [("each", "каждый — весь список"), ("share", "делят список")]
 _SPLIT_EXAMPLE = {
@@ -37,6 +37,14 @@ _FIX = {
     "нет шаблонов": ("Ответы", "tab_replies", "ключ DeepSeek или свои шаблоны"),
     "нет ключа DeepSeek": ("Ответы", "tab_replies", "ключ DeepSeek или свои шаблоны"),
 }
+
+
+def per_video_text(project: Any, account_mode: str) -> str:
+    """What «ответов на видео» means for the way the accounts share the list (the numbers of the project only)."""
+    n = project.comments_per_video
+    if account_mode == "share":
+        return f"«делят список»: под каждым видео {n} ответов на всех аккаунтов проекта вместе"
+    return f"«каждый — весь список»: каждый аккаунт проекта до {n} ответов под каждым видео"
 
 
 def _active_count(ctx: AppContext) -> int:
@@ -222,8 +230,21 @@ def build_tab(ctx: AppContext) -> Tab:
              Cell(f"{icon('links')} {project.links_waiting}", "", 6), Cell(f"{icon('sent')} {sent}", "dim")],
             hint=(", ".join(problems) + " · " if problems else "") + "←→ в запуске / пропуск · Пробел — план · Enter — действия",
             values=["в запуске", "пропуск"], value_index=0 if project.enabled else 1, on_value=set_enabled,
-            detail=lambda: [[Cell(fit(plan_text(project), max(40, shell.WIDTH - 8)))]],
+            detail=lambda: [[Cell(fit(plan_text(project), max(40, shell.WIDTH - 8)))],
+                            [Cell(fit(limit_text(project), max(40, shell.WIDTH - 8)))]],
             enter=lambda: project_menu(project),
+        )
+
+    def limit_text(project: Any) -> str:
+        return (f"ответов на видео: {project.comments_per_video} · видео на тему: {project.max_videos} · "
+                f"лимит {daily_text(project)}")
+
+    def limit_row(project: Any) -> Row:
+        """The project's own limits of a launch (set in «Цель»), a line that is only read: the arrow keys skip it."""
+        return Row(
+            "limits", [Cell(icon("videos"), "", 3), Cell(f"ответов на видео: {project.comments_per_video}"),
+                       Cell(f"· видео на тему: {project.max_videos} · лимит {daily_text(project)}", "dim")],
+            selectable=False,
         )
 
     def project_menu(project: Any) -> Menu:
@@ -277,6 +298,8 @@ def build_tab(ctx: AppContext) -> Tab:
         if several:
             sent = _today_by_project(ctx)
             rows += [project_row(p, sent.get(p.id, {}).get("success", 0)) for p in projects]
+        elif projects:
+            rows.append(limit_row(projects[0]))
 
         if active >= 2:
             counts = [str(n) for n in range(1, active + 1)]
