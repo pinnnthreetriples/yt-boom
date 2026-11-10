@@ -325,6 +325,7 @@ _SCHEMA_ATTEMPTS = 6
 
 PROJECTS_SEEDED_KEY = "projects_seeded"  # app_settings flag: the first project was created (never seeded again)
 UI_PROJECT_KEY = "ui_project"  # app_settings: the project open in «Цель» / «Ответы»
+ACCOUNTS_REMOVED_KEY = "accounts_removed"  # app_settings flag: an account was deleted (config accounts are never seeded back)
 DEFAULT_PROJECT_NAME = "Основной"
 PROJECT_NAME_MAX = 40
 PROJECT_TOPICS_MAX = 20
@@ -2505,6 +2506,28 @@ class Database:
                 row = await (await conn.execute(_ACCOUNT_SELECT + " WHERE accounts.id = ?", (row["id"],))).fetchone()
         account = self._account_from_row(row)
         logger.debug("Renamed account {!r} -> {!r} (id={})", old_name, account.name, account.id)
+        return account
+
+    async def delete_account(self, name: str) -> AccountRecord:
+        """Remove the account (its encrypted credentials, project membership, template deck) for good.
+
+        The journal keeps its rows (`activity_log.account_id` becomes NULL). The `accounts_removed` flag stops the
+        config.yaml accounts (or the implicit «default») from being seeded back into an emptied table. The session
+        folder and config.yaml are the caller's job.
+        """
+        async with self._transaction() as conn:
+            row = await (await conn.execute(_ACCOUNT_SELECT + " WHERE accounts.name = ?", (name,))).fetchone()
+            if row is None:
+                raise RecordNotFoundError(f"account {name!r} not found")
+            await conn.execute("DELETE FROM accounts WHERE id = ?", (row["id"],))
+            await conn.execute("DELETE FROM reply_deck WHERE account = ?", (name,))
+            await conn.execute("DELETE FROM reply_deck_state WHERE account = ?", (name,))
+            await conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (ACCOUNTS_REMOVED_KEY, datetime.now(timezone.utc).isoformat()),
+            )
+        account = self._account_from_row(row)
+        logger.debug("Deleted account {!r} (id={})", account.name, account.id)
         return account
 
     # ------------------------------------------------------------- reply deck

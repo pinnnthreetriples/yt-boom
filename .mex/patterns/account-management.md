@@ -12,7 +12,7 @@ edges:
   - target: context/decisions.md
     condition: when reviewing DPAPI and fingerprint persistence decisions
 grounds_to: []
-last_updated: 2026-10-31
+last_updated: 2026-11-10
 mex:
   id: mx_01M69VBZR243QKWN4X78PQXWDC
   type: pattern
@@ -40,7 +40,10 @@ Accounts are stored in the `accounts` table of `test_metrics.db`. To safeguard a
 4. **Pin Hardware Fingerprint**: When the account session directory is first created, invoke `get_or_create_fingerprint(session_dir)` to generate and atomically store the account session fingerprint file.
 5. **Session Verification**: Use `youtube_bot.py --auth-account <name>` to perform automated headful authentication and store browser cookies.
 
+6. **Delete an Account**: «Аккаунты» → account → «вход» → «выйти» calls `wizard._setup_delete_account`: session folder first (a locked folder aborts, the account stays), then `Database.delete_account` (row with its DPAPI secrets, project membership, reply deck; journal rows keep `account_id = NULL`), then the `config.yaml` entries (`accounts` and `browser.accounts`).
+
 ## Gotchas
+- **Deleted accounts stay deleted**: `Database.delete_account` sets `app_settings.accounts_removed`; `wizard.seed_config_accounts` then never re-seeds an empty table from `config.yaml` (otherwise the implicit «default» of an empty config would come back on the next start).
 - **Windows User Binding**: DPAPI ciphertext is bound to the current Windows user login. Moving `test_metrics.db` to another user account or machine causes `SecretStoreError`.
 - **Expected country and locale**: `expected_country` (ISO, from the seller or the recovery phone code) makes a sign-in refuse to start when the proxy's exit country (`modules.geo_guard`, same GeoIP source as Camoufox) differs or is unknown; already authenticated accounts only get a warning. `locale` overrides `browser.locale` for that account's browser and heartbeat headers. Google's `Country version` is stored as ISO in `geo_country` and only warned about.
 - **Proxy Invariants**: Ensure proxy strings include valid schemes (`socks5://` or `http://`) and credentials where needed.
