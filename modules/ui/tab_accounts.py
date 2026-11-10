@@ -455,7 +455,7 @@ def login_menu(ctx: AppContext, account_id: int) -> Step:
         Row("l-check", [Cell(icon("check"), "", 3), Cell("проверить вход")],
             hint="Есть ли сохранённая сессия YouTube", enter=lambda: check_login(acc)),
         Row("l-logout", [Cell(icon("no_login"), "", 3), Cell("выйти")],
-            hint="Удалить сохранённую сессию", enter=lambda: logout(ctx, account_id)),
+            hint="Удалить аккаунт вместе с сохранённой сессией", enter=lambda: logout(ctx, account_id)),
     ])
 
 
@@ -472,12 +472,12 @@ def logout(ctx: AppContext, account_id: int) -> Step:
     def pick(i: int) -> Step:
         if i != 1:
             return None
-        from modules.wizard import _setup_clear_session
+        from modules.wizard import _setup_delete_account
 
-        ok, msg = _setup_clear_session(Path(ctx.cfg().browser.session_root), acc)
+        ok, msg = _setup_delete_account(ctx.config_path, acc)
         return Notice("ok" if ok else "err", msg)
 
-    return Confirm([Cell(f"Выйти из «{acc.name}»? Сессия удалится", "warn")], ["Нет", "Выйти"], pick)
+    return Confirm([Cell(f"Выйти из «{acc.name}»? Аккаунт и его сессия удалятся", "warn")], ["Нет", "Выйти"], pick)
 
 
 def _auth_work(ctx: AppContext, name: str) -> Callable[[], Notice]:

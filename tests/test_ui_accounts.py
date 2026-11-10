@@ -155,6 +155,66 @@ class TestMenu(AccountsTabCase):
         self.assertIsNotNone(self.account("neo"))
         self.assertIn("Переименован", self.screen(c))
 
+    def logout(self, c: Controller, *, confirm: bool = True) -> None:
+        """First account → «вход» → «выйти» → the question (`confirm`: «Выйти», else «Нет»)."""
+        c.press("enter")
+        for _ in range(6):
+            c.press("down")
+        c.press("enter")  # «вход»
+        for _ in range(4):
+            c.press("down")
+        c.press("enter")  # «выйти»
+        if confirm:
+            c.press("right")
+        c.press("enter")
+
+    def test_logout_deletes_the_account_and_its_session(self):
+        from modules.wizard import load_accounts
+
+        self.add("work")
+        self.add("other")
+        c = self.shell()
+        self.logout(c)
+        screen = self.screen(c)
+        self.assertIn("Аккаунт «work» удалён", screen)
+        self.assertIsNone(self.account("work"))
+        self.assertFalse((self.root / "sessions" / "work").exists())
+        self.assertEqual([a.name for a in load_accounts(self.config_path)], ["other"])
+        self.assertIn("other", screen)  # the list is redrawn with the remaining account only
+
+    def test_logout_removes_the_account_from_config_yaml(self):
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        entry = {"name": "work", "session_path": str(self.root / "sessions" / "work"), "is_active": True}
+        raw["browser"]["accounts"] = [entry]
+        self.config_path.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+        self.add("work")
+        self.logout(self.shell())
+        after = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(after["browser"]["accounts"], [])
+
+    def test_logout_of_the_last_account_does_not_bring_default_back(self):
+        from modules.wizard import load_accounts
+
+        self.add("work")
+        self.logout(self.shell())
+        self.assertEqual(load_accounts(self.config_path), [])
+        self.assertEqual(load_accounts(self.config_path), [])  # a second start seeds nothing either
+
+    def test_logout_declined_keeps_everything(self):
+        self.add("work")
+        self.logout(c := self.shell(), confirm=False)
+        self.assertIsNotNone(self.account("work"))
+        self.assertTrue((self.root / "sessions" / "work").exists())
+        self.assertNotIn("удалён", self.screen(c))
+
+    def test_logout_keeps_the_account_when_the_session_folder_is_locked(self):
+        self.add("work")
+        with patch("modules.wizard.shutil.rmtree", side_effect=PermissionError("locked")):
+            c = self.shell()
+            self.logout(c)
+        self.assertIn("Не удалось удалить сессию", self.screen(c))
+        self.assertIsNotNone(self.account("work"))
+
     def test_profile_draft_is_marked(self):
         self.add("work")
         c = self.shell()

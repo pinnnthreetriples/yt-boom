@@ -292,18 +292,41 @@ def _setup_rename_in_config(config_path: Path, acc: Any, new_name: str) -> None:
     config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
-def _setup_clear_session(session_root: Path, account: Any) -> tuple[bool, str]:
-    """Delete an account's session folder; the main profile (session_root/youtube) keeps the old reset."""
-    path = Path(account.session_path) if account else session_root / "youtube"
-    if path.resolve() == (session_root / "youtube").resolve():
-        return clear_youtube_session(session_root)
-    if not path.exists():
-        return True, "Сессия уже отсутствует"
+def _setup_delete_account(config_path: Path, account: Any) -> tuple[bool, str]:
+    """«Выйти»: delete the session folder, the DB row and the config.yaml entries of `account`.
+
+    The folder goes first: when a browser window still holds it, nothing else is touched and the account stays.
+    """
+    path = Path(account.session_path)
+    if path.exists():
+        try:
+            shutil.rmtree(path)
+        except Exception as exc:
+            return False, f"Не удалось удалить сессию (закройте окно браузера): {exc}"
     try:
-        shutil.rmtree(path)
-        return True, f"Сессия «{account.name}» удалена"
+        _pools_db(config_path, lambda db: db.delete_account(account.name))
     except Exception as exc:
-        return False, f"Не удалось удалить сессию (закройте окно браузера): {exc}"
+        return False, f"Сессия удалена, но аккаунт «{account.name}» из базы не удалён: {exc}"
+    try:
+        _setup_remove_from_config(config_path, account.name)
+    except Exception as exc:
+        return False, f"Аккаунт «{account.name}» удалён из базы, но config.yaml не обновлён: {exc}"
+    return True, f"Аккаунт «{account.name}» удалён"
+
+
+def _setup_remove_from_config(config_path: Path, name: str) -> None:
+    """Drop the account named `name` from config.yaml (both `accounts` and `browser.accounts`)."""
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    changed = False
+    for holder in (raw, raw.get("browser")):
+        lst = holder.get("accounts") if isinstance(holder, dict) else None
+        if isinstance(lst, list):
+            kept = [item for item in lst if not (isinstance(item, dict) and item.get("name") == name)]
+            if len(kept) != len(lst):
+                holder["accounts"] = kept
+                changed = True
+    if changed:
+        config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
 def _setup_register(config_path: Path, lines: list[str], default_mode: str | None = None) -> Any:
@@ -408,8 +431,10 @@ def load_accounts(config_path: Path) -> list[Any]:
 async def seed_config_accounts(db: Any, cfg: Any) -> list[Any]:
     """The accounts of the database; an empty one gets the accounts of config.yaml (a fresh config: «default»).
     In the start that created «Основной» they join it (`Database.adopt_config_accounts`), else they stay without one."""
+    from database import ACCOUNTS_REMOVED_KEY
+
     accounts = await db.list_accounts()
-    if not accounts and hasattr(cfg.browser, "accounts"):
+    if not accounts and hasattr(cfg.browser, "accounts") and not await db.get_setting(ACCOUNTS_REMOVED_KEY):
         created = [
             (await db.upsert_account(name=acc.name, session_path=acc.session_path, proxy_url=acc.proxy_url,
                                      is_active=acc.is_active)).id
