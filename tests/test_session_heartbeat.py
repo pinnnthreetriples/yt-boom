@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from database import AccountRecord
+from modules.geo_guard import NetworkGuardError
 from modules.session_heartbeat import (
     HeartbeatStatus,
     check_account_heartbeat,
@@ -28,6 +29,9 @@ class TestSessionHeartbeat(unittest.IsolatedAsyncioTestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.session_path = Path(self.temp_dir.name)
         self.db_path = self.session_path / "cookies.sqlite"
+        guard = patch("modules.session_heartbeat.ensure_network_ready", new_callable=AsyncMock, return_value=None)
+        self.guard = guard.start()  # the network guard asks the internet: never in these tests
+        self.addCleanup(guard.stop)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -292,7 +296,60 @@ class TestSessionHeartbeat(unittest.IsolatedAsyncioTestCase):
                 timeout=15.0,
                 locale="en-US",
                 engine="camoufox",
+                require_proxy=False,
             )
+            await check_account_heartbeat(acc, require_proxy=True)
+            self.assertTrue(mock_check.call_args.kwargs["require_proxy"])
+
+    async def test_camoufox_check_stops_when_the_network_guard_refuses(self) -> None:
+        self._create_mock_cookies_db([(".youtube.com", "LOGIN_INFO", "t", int(time.time() + 86400 * 30))])
+        self.guard.side_effect = NetworkGuardError("прокси не отвечает")
+        with patch("modules.session_heartbeat.AsyncSession", side_effect=AssertionError("network used")) as session_cls:
+            res = await check_session_heartbeat(self.session_path, proxy="http://1.2.3.4:80")
+        session_cls.assert_not_called()
+        self.assertFalse(res.is_alive)
+        self.assertEqual(res.details, "сеть: прокси не отвечает")
+        self.guard.assert_awaited_once_with("http://1.2.3.4:80", require_proxy=False)
+
+    async def test_require_proxy_without_a_proxy_sends_nothing(self) -> None:
+        self._create_mock_cookies_db([(".youtube.com", "LOGIN_INFO", "t", int(time.time() + 86400 * 30))])
+        self.guard.side_effect = NetworkGuardError("прокси обязателен")
+        with patch("modules.session_heartbeat.AsyncSession", side_effect=AssertionError("network used")) as session_cls:
+            res = await check_session_heartbeat(self.session_path, require_proxy=True)
+        session_cls.assert_not_called()
+        self.assertFalse(res.is_alive)
+        self.assertTrue(res.details.startswith("сеть:"))
+        self.guard.assert_awaited_once_with(None, require_proxy=True)
+
+    async def test_no_proxy_and_no_require_proxy_asks_no_guard_and_goes_out_directly(self) -> None:
+        self._create_mock_cookies_db([(".youtube.com", "LOGIN_INFO", "t", int(time.time() + 86400 * 30))])
+        mock_session = AsyncMock()
+        mock_session.get.return_value = MagicMock(status_code=200, text='{"LOGGED_IN": true}')
+        mock_session.__aenter__.return_value = mock_session
+        with patch("modules.session_heartbeat.AsyncSession", return_value=mock_session) as session_cls:
+            res = await check_session_heartbeat(self.session_path)
+        self.assertTrue(res.is_alive)
+        self.guard.assert_not_awaited()
+        self.assertIsNone(session_cls.call_args.kwargs["proxy"])
+        self.assertFalse(session_cls.call_args.kwargs["trust_env"])
+
+    async def test_an_unexpected_guard_error_sends_nothing_either(self) -> None:
+        self._create_mock_cookies_db([(".youtube.com", "LOGIN_INFO", "t", int(time.time() + 86400 * 30))])
+        self.guard.side_effect = RuntimeError("boom user:SECRETPW@1.2.3.4")
+        with patch("modules.session_heartbeat.AsyncSession", side_effect=AssertionError("network used")) as session_cls:
+            res = await check_session_heartbeat(self.session_path, proxy="http://user:SECRETPW@1.2.3.4:80")
+        session_cls.assert_not_called()
+        self.assertFalse(res.is_alive)
+        self.assertNotIn("SECRETPW", res.details)
+
+    async def test_the_proxy_reaches_the_guard_and_curl_and_is_scrubbed_from_errors(self) -> None:
+        self._create_mock_cookies_db([(".youtube.com", "LOGIN_INFO", "t", int(time.time() + 86400 * 30))])
+        proxy = "http://user:SECRETPW@1.2.3.4:80"
+        with patch("modules.session_heartbeat.AsyncSession", side_effect=OSError(f"cannot reach {proxy}")):
+            res = await check_session_heartbeat(self.session_path, proxy=proxy)
+        self.assertFalse(res.is_alive)
+        self.assertNotIn("SECRETPW", res.details)
+        self.guard.assert_awaited_once_with(proxy, require_proxy=False)
 
 
 if __name__ == "__main__":

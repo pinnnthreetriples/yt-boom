@@ -221,7 +221,7 @@ class AccountWarmer:
 
     async def _press(self, page: Any, key: str) -> None:
         try:
-            await page.keyboard.press(key)
+            await page.keyboard.press(key, delay=random.uniform(40, 110))  # a held key, not a 0 ms keydown/keyup
         except Exception as exc:
             logger.debug("Клавиша {} не нажата: {}", key, exc)
 

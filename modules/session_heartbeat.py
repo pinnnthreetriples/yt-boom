@@ -14,8 +14,15 @@ from loguru import logger
 
 from config import parse_proxy, resolve_account_proxy
 from database import AccountRecord
-from modules.chrome_session import chrome_login_info_expiry, load_chrome_heartbeat_state
+from modules.chrome_session import (
+    chrome_login_info_expiry,
+    chrome_major_from_user_agent,
+    chrome_platform_from_user_agent,
+    load_chrome_client_hints,
+    load_chrome_heartbeat_state,
+)
 from modules.fingerprint_manager import load_fingerprint
+from modules.geo_guard import NetworkGuardError, ensure_network_ready
 
 # Camoufox sessions (Firefox): the request must look like Firefox, not like a Chrome replaying the cookies.
 HEARTBEAT_IMPERSONATE = "firefox155"  # closest curl_cffi TLS profile to the installed Firefox 156
@@ -189,7 +196,11 @@ def fingerprint_headers(session_dir: str | Path, locale: str = "en-US") -> dict[
 
 
 def chrome_impersonate_profile(user_agent: str | None = None) -> str:
-    """curl_cffi TLS profile for a Chrome session: the newest `chromeNNN` not above the UA's major, else the newest known."""
+    """curl_cffi TLS profile for a Chrome session: the newest `chromeNNN` not above the UA's major, else the nearest known.
+
+    A UA newer than every profile gets the newest one, a UA older than every profile the oldest. Variants such as
+    `chrome133a` or `chrome151_macos` are never picked (the pattern wants digits only).
+    """
     versions: list[int] = []
     try:
         from curl_cffi.requests import BrowserType
@@ -199,36 +210,91 @@ def chrome_impersonate_profile(user_agent: str | None = None) -> str:
         logger.debug("Could not list curl_cffi browser profiles: {}", exc)
     if not versions:
         return CHROME_IMPERSONATE_FALLBACK
-    match = re.search(r"Chrome/(\d+)", user_agent or "")
-    if match:
-        not_above = [v for v in versions if v <= int(match.group(1))]
-        if not_above:
-            return f"chrome{not_above[-1]}"
+    major = chrome_major_from_user_agent(user_agent)
+    if major is not None:
+        not_above = [v for v in versions if v <= major]
+        return f"chrome{not_above[-1] if not_above else versions[0]}"
     return f"chrome{versions[-1]}"
 
 
-def chrome_client_hints(user_agent: str) -> dict[str, str]:
-    """`sec-ch-ua*` headers matching a Chrome user agent; empty when the UA is not Chrome's."""
-    match = re.search(r"Chrome/(\d+)", user_agent)
-    if not match:
-        return {}
-    major = match.group(1)
-    platform = "Windows" if "Windows" in user_agent else "macOS" if "Macintosh" in user_agent else "Linux"
+# Chromium derives the GREASE brand of `sec-ch-ua` and the order of the list from the major version (as remembered from
+# Chromium's user_agent_utils, not read from its source here). The formula reproduces curl_cffi's captured `sec-ch-ua`
+# of every digits-only chromeNNN profile from 107 to 152; older profiles use another, older scheme.
+_GREASE_CHARS = (" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_")
+_GREASE_VERSIONS = ("8", "99", "24")
+_BRAND_SLOTS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))  # slots of GREASE, Chromium, Google Chrome
+
+
+def chrome_brands_for_major(major: int) -> list[tuple[str, str]]:
+    """The `sec-ch-ua` brand list a real Chrome of this major version sends (derived, not read off a browser)."""
+    grease = (f"Not{_GREASE_CHARS[major % 11]}A{_GREASE_CHARS[(major + 1) % 11]}Brand", _GREASE_VERSIONS[major % 3])
+    slots: list[tuple[str, str]] = [grease, grease, grease]
+    for slot, brand in zip(_BRAND_SLOTS[major % 6], (grease, ("Chromium", str(major)), ("Google Chrome", str(major)))):
+        slots[slot] = brand
+    return slots
+
+
+def _real_brand_list(brands: list[dict[str, str]]) -> list[tuple[str, str]]:
+    """Brands read off the browser, order kept; `HeadlessChrome` is sent as `Google Chrome` (HTTP never says headless)."""
+    result: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in brands:
+        name = "Google Chrome" if item["brand"] == "HeadlessChrome" else item["brand"]
+        if name not in seen:
+            seen.add(name)
+            result.append((name, item["version"]))
+    return result
+
+
+def chrome_client_hints(user_agent: str, client_hints: dict[str, Any] | None = None) -> dict[str, str]:
+    """`sec-ch-ua*` headers of a Chrome session; empty when neither the saved hints nor the UA say it is Chrome.
+
+    `sec-ch-ua` comes from the browser's real brands when saved, else from the UA's major version. The mobile flag is
+    always `?0` (a desktop profile); the platform follows the saved hints, else the UA.
+    """
+    hints = client_hints or {}
+    brand_list = _real_brand_list(hints.get("brands") or [])
+    if not brand_list:
+        major = chrome_major_from_user_agent(user_agent)
+        if major is None:
+            return {}
+        brand_list = chrome_brands_for_major(major)
+    platform = str(hints.get("platform") or "") or chrome_platform_from_user_agent(user_agent)
     return {
-        "sec-ch-ua": f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not.A/Brand";v="24"',
+        "sec-ch-ua": ", ".join(f'"{brand}";v="{version}"' for brand, version in brand_list),
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": f'"{platform}"',
     }
 
 
-def chrome_headers(user_agent: str | None, locale: str) -> dict[str, str]:
-    """Headers a Chrome page of this account sends to YouTube: the UA cached at its launch, client hints, Origin."""
-    headers: dict[str, str] = {"Accept-Language": _camoufox_accept_language(locale), "Origin": "https://www.youtube.com"}
+def chrome_headers(user_agent: str | None, locale: str, client_hints: dict[str, Any] | None = None) -> dict[str, str]:
+    """Headers a Chrome page of this account sends on a YouTube navigation: the UA cached at its launch and client hints.
+
+    No `Origin`: a browser does not send it on a top-level GET navigation (`Sec-Fetch-Mode: navigate`).
+    """
+    headers: dict[str, str] = {"Accept-Language": _camoufox_accept_language(locale)}
     if user_agent:
         user_agent = user_agent.replace("HeadlessChrome/", "Chrome/")  # a headless run caches the headless UA; HTTP never says so
         headers["User-Agent"] = user_agent
-        headers.update(chrome_client_hints(user_agent))
+        headers.update(chrome_client_hints(user_agent, client_hints))
     return headers
+
+
+def _reduced_chrome_user_agent(impersonate: str) -> str:
+    """Windows desktop UA of the impersonated profile's major version (Chrome's reduced UA: `Chrome/NNN.0.0.0`).
+
+    Used only when no UA was saved: curl_cffi's own default for a Chrome profile is a macOS one.
+    """
+    major = impersonate.removeprefix("chrome")
+    return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+
+
+def _scrub(text: str, *secrets: str | None) -> str:
+    """`text` without the proxy strings (they may hold a password) that a library error could echo."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
 
 
 async def check_session_heartbeat(
@@ -238,11 +304,15 @@ async def check_session_heartbeat(
     timeout: float = 15.0,
     locale: str = "en-US",
     engine: str = "camoufox",
+    require_proxy: bool = False,
 ) -> HeartbeatStatus:
     """Send lightweight HTTP request to YouTube to verify session validity without launching a browser.
 
     Cookies are only read from the profile (Camoufox: `cookies.sqlite`; Chrome: the `heartbeat_state.bin` the runner
     saved); rotated Set-Cookie values are not written back (the browser owns the profile).
+
+    Fail closed: an unusable proxy string, a failed network guard, or `require_proxy` without a proxy end the check with
+    a dead status and no request at all; the request never falls back to the host's own address.
     """
     has_login_info, expires_at_str, days_left = _login_info_metadata(session_dir, engine)
     if not has_login_info:
@@ -251,7 +321,9 @@ async def check_session_heartbeat(
     if engine == "chrome":
         cookies, cached_user_agent = load_chrome_heartbeat_state(session_dir)
         impersonate = chrome_impersonate_profile(cached_user_agent)
-        headers = chrome_headers(cached_user_agent, locale)
+        headers = chrome_headers(
+            cached_user_agent or _reduced_chrome_user_agent(impersonate), locale, load_chrome_client_hints(session_dir)
+        )
     else:
         cookies = read_youtube_cookies(session_dir)
         impersonate = HEARTBEAT_IMPERSONATE
@@ -264,12 +336,43 @@ async def check_session_heartbeat(
             details="LOGIN_INFO not present in youtube cookies",
         )
 
+    def blocked(details: str) -> HeartbeatStatus:
+        return HeartbeatStatus(
+            account_name=account_name,
+            is_alive=False,
+            login_info_present=True,
+            expires_at=expires_at_str,
+            days_remaining=days_left,
+            details=details,
+        )
+
+    try:
+        proxy_url = curl_proxy_url(proxy)
+    except ValueError as exc:  # parse_proxy never echoes the proxy string
+        logger.warning("Heartbeat {!r}: прокси аккаунта не разобран, запрос не отправлен ({})", account_name, exc)
+        return blocked(f"Invalid account proxy, request not sent: {exc}")
+    if proxy and proxy_url is None:  # cannot happen with parse_proxy; kept so a future change cannot open a direct request
+        return blocked("Invalid account proxy, request not sent")
+    if proxy_url is not None or require_proxy:
+        try:
+            await ensure_network_ready(proxy, require_proxy=require_proxy)
+        except NetworkGuardError as exc:
+            message = _scrub(str(exc), proxy, proxy_url)
+            logger.warning("Heartbeat {!r}: сеть не готова, запрос не отправлен ({})", account_name, message)
+            return blocked(f"сеть: {message}")
+        except Exception as exc:  # whatever else the guard raises: still no request
+            logger.warning("Heartbeat {!r}: проверка сети не удалась, запрос не отправлен ({})", account_name, type(exc).__name__)
+            return blocked(f"сеть: проверка прокси не удалась ({type(exc).__name__})")
+    else:
+        logger.debug("Heartbeat {!r}: у аккаунта нет прокси, запрос идёт напрямую с IP хоста", account_name)
+
     try:
         async with AsyncSession(
             impersonate=impersonate,
-            proxy=curl_proxy_url(proxy),
+            proxy=proxy_url,
             timeout=timeout,
             headers=headers,
+            trust_env=False,  # HTTP(S)_PROXY / NO_PROXY of the host must neither add a proxy nor bypass the account's
         ) as session:
             resp = await session.get("https://www.youtube.com/", cookies=cookies)
             if resp.status_code != 200:
@@ -306,15 +409,9 @@ async def check_session_heartbeat(
                     details="YouTube returned LOGGED_IN: false (session expired or revoked)",
                 )
     except Exception as exc:
-        logger.warning("Heartbeat check failed for {!r}: {}", account_name, exc)
-        return HeartbeatStatus(
-            account_name=account_name,
-            is_alive=False,
-            login_info_present=True,
-            expires_at=expires_at_str,
-            days_remaining=days_left,
-            details=f"Network/Connection error: {exc}",
-        )
+        message = _scrub(str(exc), proxy, proxy_url)
+        logger.warning("Heartbeat check failed for {!r}: {}", account_name, message)
+        return blocked(f"Network/Connection error: {message}")
 
 
 async def check_account_heartbeat(
@@ -322,6 +419,7 @@ async def check_account_heartbeat(
     default_proxy: str | None = None,
     timeout: float = 15.0,
     locale: str = "en-US",
+    require_proxy: bool = False,
 ) -> HeartbeatStatus:
     proxy = resolve_account_proxy(account.proxy_url, default_proxy)
     return await check_session_heartbeat(
@@ -331,4 +429,5 @@ async def check_account_heartbeat(
         timeout=timeout,
         locale=account.locale or locale,
         engine=account.engine,
+        require_proxy=require_proxy,
     )

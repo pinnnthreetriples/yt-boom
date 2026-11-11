@@ -1,15 +1,21 @@
 """Google Chrome (patchright) next to Camoufox: paths, proxy rule, profile prep, heartbeat state, runner, DB, UI helpers."""
 
+import asyncio
+import asyncio
 import json
 import re
+import socket
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import yaml
+from loguru import logger
 from pydantic import ValidationError
 
 from config import (
@@ -20,29 +26,40 @@ from config import (
     get_account_session_path,
     validate_proxy_for_engine,
 )
-from database import Database, RecordNotFoundError
+from database import AccountRecord, Database, RecordNotFoundError
 from modules import chrome_launcher
 from modules.chrome_launcher import (
     COUNTRY_TO_TIMEZONE,
+    ChromeGeo,
+    accept_languages_for,
+    city_geolocation,
     ensure_chrome_executable,
     get_chrome_args,
+    get_window_size,
     prepare_chrome_profile,
+    resolve_chrome_geo,
     resolve_geo_timezone,
+    socks5_host_resolver_rule,
 )
 from modules.chrome_session import (
     HEARTBEAT_STATE_FILE,
     chrome_login_info_expiry,
+    load_chrome_client_hints,
     load_chrome_heartbeat_state,
     save_chrome_heartbeat_state,
 )
+from modules.geo_guard import ExitGeo, GeoLockError, NetworkGuardError
 from modules.session_heartbeat import (
+    check_account_heartbeat,
     check_session_heartbeat,
     check_session_offline,
+    chrome_brands_for_major,
     chrome_client_hints,
     chrome_headers,
     chrome_impersonate_profile,
 )
 from modules.youtube_runner import YouTubeRunner
+from secret_store import protect_secret
 
 CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -139,7 +156,61 @@ class TestPrepareChromeProfile(unittest.TestCase):
         self.assertEqual(prefs["profile"]["exit_type"], "Normal")
         self.assertEqual(prefs["signin"]["keep_me"], 1)
         self.assertFalse(prefs["signin"]["allowed"])
-        self.assertEqual(prefs["intl"], {"selected_languages": "pl,en"})
+        self.assertEqual(prefs["intl"]["selected_languages"], "pl,en")  # a foreign key of the section stays
+        self.assertEqual(prefs["intl"]["accept_languages"], "en-US,en")
+
+    def test_languages_follow_the_locale(self):
+        for locale, accept in (
+            ("ru-RU", "ru-RU,ru,en-US,en"), ("en-GB", "en-GB,en"), ("en-US", "en-US,en"), ("de-DE", "de-DE,de,en-US,en"),
+        ):
+            with self.subTest(locale=locale):
+                self.assertEqual(accept_languages_for(locale), accept)
+                prepare_chrome_profile(self.profile, locale)
+                prefs = json.loads((self.profile / "Default" / "Preferences").read_text(encoding="utf-8"))
+                self.assertEqual(prefs["intl"]["accept_languages"], accept)
+                self.assertEqual(prefs["spellcheck"]["dictionaries"], [locale])
+                self.assertNotIn(" spellcheck", prefs)  # no key with a typo
+                self.assertEqual([key for key in prefs if key != key.strip() or " " in key], [])
+
+    def test_default_locale_and_underscore_form(self):
+        prepare_chrome_profile(self.profile)
+        prefs = json.loads((self.profile / "Default" / "Preferences").read_text(encoding="utf-8"))
+        self.assertEqual(prefs["intl"]["accept_languages"], "en-US,en")
+        self.assertEqual(accept_languages_for("pl_PL"), "pl-PL,pl,en-US,en")
+        self.assertEqual(accept_languages_for("en"), "en")
+
+    def test_a_stale_system_language_is_overwritten_and_wrong_types_are_replaced(self):
+        default = self.profile / "Default"
+        default.mkdir(parents=True)
+        (default / "Preferences").write_text(json.dumps({
+            "intl": {"accept_languages": "ru-RU,ru", "other": 1},
+            "spellcheck": ["not", "a", "dict"],
+            "webrtc": "broken",
+            "net": 5,
+            "dns_prefetching": None,
+        }), encoding="utf-8")
+        prepare_chrome_profile(self.profile, "de-DE")
+        prefs = json.loads((default / "Preferences").read_text(encoding="utf-8"))
+        self.assertEqual(prefs["intl"], {"accept_languages": "de-DE,de,en-US,en", "other": 1})
+        self.assertEqual(prefs["spellcheck"], {"dictionaries": ["de-DE"]})
+        self.assertIsInstance(prefs["webrtc"], dict)
+        self.assertIsInstance(prefs["net"], dict)
+        self.assertIsInstance(prefs["dns_prefetching"], dict)
+
+    def test_webrtc_and_dns_are_locked_in_the_profile_too(self):
+        default = self.profile / "Default"
+        default.mkdir(parents=True)
+        (default / "Preferences").write_text(json.dumps({
+            "webrtc": {"keep_me": 1, "ip_handling_policy": "default"}, "net": {"keep_me": 2},
+        }), encoding="utf-8")
+        prepare_chrome_profile(self.profile)
+        prefs = json.loads((default / "Preferences").read_text(encoding="utf-8"))
+        self.assertEqual(prefs["webrtc"], {
+            "keep_me": 1, "ip_handling_policy": "disable_non_proxied_udp",
+            "multiple_routes_enabled": False, "nonproxied_udp_enabled": False,
+        })
+        self.assertEqual(prefs["net"], {"keep_me": 2, "network_prediction_options": 2})
+        self.assertEqual(prefs["dns_prefetching"], {"enabled": False})
 
     def test_damaged_preferences_are_rebuilt(self):
         default = self.profile / "Default"
@@ -160,13 +231,62 @@ class TestPrepareChromeProfile(unittest.TestCase):
         self.assertIn("WinError 32", str(caught.exception))
         self.assertIn(str(self.profile), str(caught.exception))
 
+    def _warnings_of(self, action):
+        messages: list[str] = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="WARNING")
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                action()
+        finally:
+            logger.remove(sink_id)
+        return messages, caught.exception
+
+    def test_a_busy_lock_logs_a_warning_before_the_error(self):
+        self.profile.mkdir(parents=True)
+        (self.profile / "lockfile").write_text("x")
+        with patch.object(Path, "unlink", side_effect=PermissionError(32, "in use")):
+            messages, error = self._warnings_of(lambda: prepare_chrome_profile(self.profile))
+        self.assertEqual(len(messages), 1)
+        self.assertIn("занят живым процессом Chrome", messages[0])
+        self.assertIn(str(self.profile), messages[0])
+        self.assertIn("lockfile", messages[0])
+        self.assertIsInstance(error, RuntimeError)
+
+    def test_a_busy_preferences_file_logs_a_warning_and_leaves_no_tmp_file(self):
+        with patch("modules.chrome_launcher.os.replace", side_effect=PermissionError(32, "in use")):
+            messages, error = self._warnings_of(lambda: prepare_chrome_profile(self.profile))
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Preferences", messages[0])
+        self.assertIn("WinError 32", str(error))
+        self.assertFalse((self.profile / "Default" / "Preferences.tmp").exists())
+
     def test_chrome_args(self):
         args = get_chrome_args("de-DE")
         self.assertIn("--hide-crash-restore-bubble", args)
         self.assertIn("--lang=de-DE", args)
-        self.assertIn("--disable-quic", args)
-        self.assertIn("--webrtc-ip-handling-policy=disable_non_proxied_udp", args)
         self.assertIn("--lang=en-US", get_chrome_args())
+        for flag in (
+            "--disable-quic", "--webrtc-ip-handling-policy=disable_non_proxied_udp", "--enforce-webrtc-ip-permission-check",
+            "--dns-prefetch-disable", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
+        ):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, args)
+
+    def test_there_is_exactly_one_disable_features_switch(self):
+        switches = [arg for arg in get_chrome_args("de-DE", "alice", "socks5://10.0.0.1:1080") if arg.startswith("--disable-features=")]
+        self.assertEqual(len(switches), 1)  # a second one would replace the first in Chrome
+        features = switches[0].split("=", 1)[1].split(",")
+        self.assertNotIn("WebAuthentication", features)  # without it window.PublicKeyCredential stays
+        for feature in ("IdentityConsistency", "SigninInterceptBubbleV2", "SyncPromo", "OptimizationHints",
+                        "PasskeyUnlockManager", "CalculateNativeWinOcclusion"):
+            self.assertIn(feature, features)
+        self.assertEqual(len(features), len(set(features)))
+
+    def test_no_resolver_rule_without_a_socks5_proxy(self):
+        for proxy in (None, "http://u:p@10.0.0.1:8080", "10.0.0.1:8080:u:p", "https://10.0.0.1:443"):
+            with self.subTest(proxy=proxy):
+                self.assertFalse([arg for arg in get_chrome_args(proxy_url=proxy) if arg.startswith("--host-resolver-rules")])
 
 
 class TestEnsureChromeExecutable(unittest.TestCase):
@@ -194,28 +314,37 @@ class TestEnsureChromeExecutable(unittest.TestCase):
         self.assertIn("установите Google Chrome вручную", str(caught.exception))
 
 
+def _exit_geo_patch(geo: ExitGeo | None):
+    """Patch of the exit-IP lookup (`create=True`: the function is written in geo_guard in parallel)."""
+    return patch("modules.geo_guard.resolve_exit_geo", AsyncMock(return_value=geo), create=True)
+
+
+def _exit_geo(country=None, timezone=None, latitude=None, longitude=None) -> ExitGeo:
+    return ExitGeo(ip="203.0.113.7", country=country, timezone=timezone, latitude=latitude, longitude=longitude)
+
+
 class TestResolveGeoTimezone(unittest.IsolatedAsyncioTestCase):
     async def test_exit_country_gives_timezone_and_locale(self):
         for country, timezone_id, locale in (
             ("US", "America/New_York", "en-US"), ("DE", "Europe/Berlin", "de-DE"), ("GB", "Europe/London", "en-GB"),
             ("FR", "Europe/Paris", "fr-FR"), ("RU", "Europe/Moscow", "ru-RU"), ("TR", "Europe/Istanbul", "tr-TR"),
         ):
-            with self.subTest(country=country), patch("modules.geo_guard.resolve_exit_country", AsyncMock(return_value=country)):
+            with self.subTest(country=country), _exit_geo_patch(_exit_geo(country)):
                 self.assertEqual(await resolve_geo_timezone("http://p:1"), (timezone_id, locale))
 
     async def test_account_country_and_locale_are_the_fallback(self):
-        with patch("modules.geo_guard.resolve_exit_country", AsyncMock(return_value=None)):
+        with _exit_geo_patch(None):
             self.assertEqual(await resolve_geo_timezone(None, "Turkey"), ("Europe/Istanbul", "tr-TR"))
             self.assertEqual(await resolve_geo_timezone(None, "TR", "en-GB"), ("Europe/Istanbul", "en-GB"))
 
     async def test_explicit_locale_wins_over_the_country_default(self):
-        with patch("modules.geo_guard.resolve_exit_country", AsyncMock(return_value="DE")):
+        with _exit_geo_patch(_exit_geo("DE")):
             self.assertEqual(await resolve_geo_timezone(None, None, "pl-PL"), ("Europe/Berlin", "pl-PL"))
 
     async def test_unknown_country_keeps_the_system_timezone(self):
-        with patch("modules.geo_guard.resolve_exit_country", AsyncMock(return_value=None)):
+        with _exit_geo_patch(None):
             self.assertEqual(await resolve_geo_timezone(None), (None, "en-US"))
-        with patch("modules.geo_guard.resolve_exit_country", AsyncMock(return_value="ZW")):
+        with _exit_geo_patch(_exit_geo("ZW")):
             self.assertEqual(await resolve_geo_timezone(None), (None, "en-US"))
 
     def test_table_covers_the_named_countries(self):
@@ -274,6 +403,61 @@ class TestChromeHeartbeatState(unittest.IsolatedAsyncioTestCase):
         (self.profile / HEARTBEAT_STATE_FILE).write_bytes(b"\xff\xfe not a state")
         self.assertEqual(load_chrome_heartbeat_state(self.profile), ({}, None))
         self.assertEqual(chrome_login_info_expiry(self.profile), (False, None))
+        self.assertIsNone(load_chrome_client_hints(self.profile))
+
+    async def test_real_client_hints_are_saved_and_loaded(self):
+        context = _context([_cookie("LOGIN_INFO", "v", ".youtube.com")])
+        hints = {"brands": [{"brand": "Not_A Brand", "version": "99"}, {"brand": "Chromium", "version": "131"},
+                            {"brand": "Google Chrome", "version": "131"}], "mobile": False, "platform": "Windows"}
+        self.assertTrue(await save_chrome_heartbeat_state(self.profile, context, CHROME_UA, hints))
+        loaded = load_chrome_client_hints(self.profile)
+        self.assertEqual(loaded["brands"], hints["brands"])
+        self.assertEqual((loaded["mobile"], loaded["platform"], loaded["major"], loaded["source"]), (False, "Windows", 131, "browser"))
+        # the cookie and UA API is unchanged by the hints
+        self.assertEqual(load_chrome_heartbeat_state(self.profile), ({"LOGIN_INFO": "v"}, CHROME_UA))
+        if sys.platform == "win32":
+            self.assertNotIn(b"Not_A Brand", (self.profile / HEARTBEAT_STATE_FILE).read_bytes())
+
+    async def test_without_hints_the_user_agent_major_is_stored(self):
+        await save_chrome_heartbeat_state(self.profile, _context([_cookie("LOGIN_INFO", "v", ".youtube.com")]), CHROME_UA)
+        loaded = load_chrome_client_hints(self.profile)
+        self.assertEqual(loaded, {"brands": [], "mobile": False, "platform": "Windows", "major": 131, "source": "user_agent"})
+        await save_chrome_heartbeat_state(self.profile, _context([_cookie("LOGIN_INFO", "v", ".youtube.com")]), None)
+        self.assertEqual(load_chrome_client_hints(self.profile), loaded)  # a save with nothing new changes nothing
+
+    async def test_neither_user_agent_nor_hints_stores_no_hints(self):
+        await save_chrome_heartbeat_state(self.profile, _context([_cookie("LOGIN_INFO", "v", ".youtube.com")]), None)
+        self.assertIsNone(load_chrome_client_hints(self.profile))
+
+    async def test_a_later_save_keeps_the_real_hints_while_they_match_the_user_agent(self):
+        context = _context([_cookie("LOGIN_INFO", "v", ".youtube.com")])
+        hints = {"brands": [{"brand": "Chromium", "version": "131"}, {"brand": "Google Chrome", "version": "131"}],
+                 "mobile": False, "platform": "Windows"}
+        await save_chrome_heartbeat_state(self.profile, context, CHROME_UA, hints)
+        await save_chrome_heartbeat_state(self.profile, context, None)  # nothing new: everything stays
+        await save_chrome_heartbeat_state(self.profile, context, CHROME_UA)  # same UA, no hints: still the real ones
+        kept = load_chrome_client_hints(self.profile)
+        self.assertEqual((kept["source"], kept["brands"]), ("browser", hints["brands"]))
+        # the browser updated: hints of the old version must not outlive their user agent
+        await save_chrome_heartbeat_state(self.profile, context, CHROME_UA.replace("131", "134"))
+        replaced = load_chrome_client_hints(self.profile)
+        self.assertEqual((replaced["source"], replaced["brands"], replaced["major"]), ("user_agent", [], 134))
+
+    async def test_unusable_hints_are_ignored(self):
+        context = _context([_cookie("LOGIN_INFO", "v", ".youtube.com")])
+        for bad in ({"brands": []}, {"brands": "Chromium"}, {"brands": [{"brand": "", "version": "1"}]}, ["x"], {}):
+            with self.subTest(bad=bad):
+                await save_chrome_heartbeat_state(self.profile, context, CHROME_UA, bad)
+                self.assertEqual(load_chrome_client_hints(self.profile)["source"], "user_agent")
+
+    def test_a_state_file_from_before_the_hints_is_still_read(self):
+        self.profile.mkdir(parents=True)
+        old = {"cookies": [{"name": "LOGIN_INFO", "value": "v", "domain": ".youtube.com", "expires": 4102444800}],
+               "user_agent": CHROME_UA, "updated_at": "2026-01-01T00:00:00+00:00"}
+        (self.profile / HEARTBEAT_STATE_FILE).write_bytes(protect_secret(json.dumps(old)).encode("utf-8"))
+        self.assertEqual(load_chrome_heartbeat_state(self.profile), ({"LOGIN_INFO": "v"}, CHROME_UA))
+        self.assertIsNone(load_chrome_client_hints(self.profile))
+        self.assertEqual(chrome_login_info_expiry(self.profile), (True, 4102444800.0))
 
 
 class TestChromeHeartbeatCheck(unittest.IsolatedAsyncioTestCase):
@@ -281,10 +465,13 @@ class TestChromeHeartbeatCheck(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.profile = Path(self.temp.name) / "chrome" / "alice"
+        guard = patch("modules.session_heartbeat.ensure_network_ready", new_callable=AsyncMock, return_value=None)
+        self.guard = guard.start()  # the network guard asks the internet: never in these tests
+        self.addCleanup(guard.stop)
 
-    async def _save(self, cookies=None):
+    async def _save(self, cookies=None, user_agent=CHROME_UA, client_hints=None):
         cookies = cookies or [_cookie("LOGIN_INFO", "v", ".youtube.com", 4102444800)]
-        await save_chrome_heartbeat_state(self.profile, _context(cookies), CHROME_UA)
+        await save_chrome_heartbeat_state(self.profile, _context(cookies), user_agent, client_hints)
 
     def _session(self, text='"LOGGED_IN":true'):
         response = MagicMock(status_code=200, text=text)
@@ -304,7 +491,7 @@ class TestChromeHeartbeatCheck(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(kwargs["impersonate"], r"^chrome\d+$")
         headers = kwargs["headers"]
         self.assertEqual(headers["User-Agent"], CHROME_UA)
-        self.assertEqual(headers["Origin"], "https://www.youtube.com")
+        self.assertNotIn("Origin", headers)  # a top-level GET navigation carries none
         self.assertEqual(headers["Accept-Language"], "de-DE,de;q=0.9")
         self.assertIn('"Google Chrome";v="131"', headers["sec-ch-ua"])
         self.assertEqual(headers["sec-ch-ua-platform"], '"Windows"')
@@ -355,6 +542,199 @@ class TestChromeHeartbeatCheck(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["User-Agent"], CHROME_UA)
         self.assertIn('"Google Chrome";v="131"', headers["sec-ch-ua"])
 
+    # --- sec-ch-ua follows the browser's version -------------------------------------------------------------
+
+    def test_the_brand_list_of_a_major_matches_what_curl_cffi_captured_from_real_chrome(self):
+        captured = {  # curl_cffi's default `sec-ch-ua` of these profiles, read off its fingerprint data
+            120: '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            124: '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            131: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            133: '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+            142: '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+            146: '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            150: '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+        }
+        for major, header in captured.items():
+            with self.subTest(major=major):
+                ua = CHROME_UA.replace("131", str(major))
+                self.assertEqual(chrome_client_hints(ua)["sec-ch-ua"], header)
+                self.assertEqual(len(chrome_brands_for_major(major)), 3)
+
+    def test_real_brands_make_the_exact_header_in_their_own_order(self):
+        hints = {"brands": [{"brand": "Chromium", "version": "134"}, {"brand": "Not:A-Brand", "version": "24"},
+                            {"brand": "Google Chrome", "version": "134"}], "mobile": False, "platform": "Windows"}
+        result = chrome_client_hints(CHROME_UA.replace("131", "134"), hints)
+        self.assertEqual(result["sec-ch-ua"], '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"')
+        self.assertEqual(result["sec-ch-ua-mobile"], "?0")
+        self.assertEqual(result["sec-ch-ua-platform"], '"Windows"')
+
+    def test_headless_brands_never_reach_http(self):
+        hints = {"brands": [{"brand": "HeadlessChrome", "version": "134"}, {"brand": "Chromium", "version": "134"},
+                            {"brand": "Not.A/Brand", "version": "24"}], "mobile": True, "platform": "Windows"}
+        header = chrome_client_hints(CHROME_UA.replace("131", "134"), hints)
+        self.assertEqual(header["sec-ch-ua"], '"Google Chrome";v="134", "Chromium";v="134", "Not.A/Brand";v="24"')
+        self.assertNotIn("Headless", " ".join(header.values()))
+        self.assertEqual(header["sec-ch-ua-mobile"], "?0")  # a desktop profile, whatever the flag says
+
+    def test_the_platform_follows_the_hints_then_the_user_agent(self):
+        linux_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+        self.assertEqual(chrome_client_hints(linux_ua)["sec-ch-ua-platform"], '"Linux"')
+        hints = {"brands": [{"brand": "Chromium", "version": "134"}], "platform": "Windows"}
+        self.assertEqual(chrome_client_hints(linux_ua, hints)["sec-ch-ua-platform"], '"Windows"')
+
+    async def test_the_request_header_carries_the_major_of_the_saved_user_agent(self):
+        await self._save(user_agent=CHROME_UA.replace("131", "134"))
+        session = self._session()
+        with patch("modules.session_heartbeat.AsyncSession", return_value=session) as factory:
+            await check_session_heartbeat(self.profile, "alice", engine="chrome")
+        headers = factory.call_args.kwargs["headers"]
+        self.assertEqual(re.findall(r'v="(\d+)"', headers["sec-ch-ua"]).count("134"), 2)
+        self.assertNotIn("131", headers["sec-ch-ua"])
+        self.assertEqual(headers["sec-ch-ua-mobile"], "?0")
+
+    async def test_the_request_header_uses_the_saved_real_brands(self):
+        hints = {"brands": [{"brand": "Chromium", "version": "134"}, {"brand": "Not:A-Brand", "version": "24"},
+                            {"brand": "HeadlessChrome", "version": "134"}], "mobile": False, "platform": "Windows"}
+        await self._save(user_agent=CHROME_UA.replace("131", "134").replace("Chrome/", "HeadlessChrome/"), client_hints=hints)
+        session = self._session()
+        with patch("modules.session_heartbeat.AsyncSession", return_value=session) as factory:
+            await check_session_heartbeat(self.profile, "alice", engine="chrome")
+        headers = factory.call_args.kwargs["headers"]
+        self.assertEqual(headers["sec-ch-ua"], '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"')
+        self.assertNotIn("Headless", " ".join(headers.values()))
+
+    async def test_a_state_without_a_user_agent_still_sends_a_windows_chrome(self):
+        await self._save(user_agent=None)
+        session = self._session()
+        with patch("modules.session_heartbeat.AsyncSession", return_value=session) as factory:
+            await check_session_heartbeat(self.profile, "alice", engine="chrome")
+        kwargs = factory.call_args.kwargs
+        major = kwargs["impersonate"].removeprefix("chrome")
+        self.assertIn(f"Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0", kwargs["headers"]["User-Agent"])
+        self.assertEqual(kwargs["headers"]["sec-ch-ua-platform"], '"Windows"')
+        self.assertIn(f'"Google Chrome";v="{major}"', kwargs["headers"]["sec-ch-ua"])
+
+    def test_tls_profile_edge_cases(self):
+        def profile(ua):
+            return int(re.fullmatch(r"chrome(\d+)", chrome_impersonate_profile(ua)).group(1))
+
+        from curl_cffi.requests import BrowserType
+        known = sorted(int(m.group(1)) for v in BrowserType if (m := re.fullmatch(r"chrome(\d+)", str(v.value))))
+        self.assertEqual(profile("Chrome/999.0.0.0"), known[-1])  # newer than every profile: the newest
+        self.assertEqual(profile("Chrome/1.0.0.0"), known[0])  # older than every profile: the oldest
+        self.assertEqual(profile(f"Chrome/{known[-1]}.0.0.0"), known[-1])
+        self.assertEqual(profile(f"Chrome/{known[-1] - 1}.0.0.0"), known[-2])
+        self.assertEqual(profile("Mozilla/5.0 Firefox/130.0"), known[-1])  # not Chrome: the newest
+        self.assertEqual(profile("Chrome/134.0.0.0"), max(v for v in known if v <= 134))  # 133a is never picked
+
+    # --- the request never leaves without the account's proxy ------------------------------------------------
+
+    async def test_the_account_proxy_is_what_curl_gets_and_the_guard_checks(self):
+        await self._save()
+        session = self._session()
+        with patch("modules.session_heartbeat.AsyncSession", return_value=session) as factory:
+            await check_session_heartbeat(self.profile, "alice", "socks5://u:p@1.2.3.4:1080", engine="chrome")
+        self.assertEqual(factory.call_args.kwargs["proxy"], "socks5h://u:p@1.2.3.4:1080")
+        self.assertFalse(factory.call_args.kwargs["trust_env"])
+        self.guard.assert_awaited_once_with("socks5://u:p@1.2.3.4:1080", require_proxy=False)
+
+    async def test_an_invalid_account_proxy_sends_no_request(self):
+        await self._save()
+        with patch("modules.session_heartbeat.AsyncSession", side_effect=AssertionError("network used")) as factory:
+            status = await check_session_heartbeat(self.profile, "alice", "socks5://user:SECRETPW@nohost", engine="chrome")
+        factory.assert_not_called()
+        self.guard.assert_not_awaited()
+        self.assertFalse(status.is_alive)
+        self.assertTrue(status.login_info_present)
+        self.assertIn("request not sent", status.details)
+        self.assertNotIn("SECRETPW", status.details)
+
+    async def test_chrome_account_proxy_chain_own_then_global(self):
+        await self._save()
+        account = AccountRecord(id=1, name="alice", session_path=str(self.profile), created_at="now", engine="chrome",
+                                proxy_url="http://own:80")
+        for own, global_proxy, expected in (("http://own:80", "http://global:80", "http://own:80"),
+                                            (None, "http://global:80", "http://global:80")):
+            with self.subTest(own=own):
+                session = self._session()
+                with patch("modules.session_heartbeat.AsyncSession", return_value=session) as factory:
+                    status = await check_account_heartbeat(account.model_copy(update={"proxy_url": own}), global_proxy)
+                self.assertTrue(status.is_alive)
+                self.assertEqual(factory.call_args.kwargs["proxy"], expected)
+        with patch("modules.session_heartbeat.AsyncSession", side_effect=AssertionError("network used")) as factory:
+            bad = await check_account_heartbeat(account.model_copy(update={"proxy_url": "not a proxy"}), "http://global:80")
+        factory.assert_not_called()  # the account's own broken proxy does not fall back to the global one or to direct
+        self.assertFalse(bad.is_alive)
+
+    async def test_chrome_check_stops_when_the_guard_refuses_or_a_proxy_is_required(self):
+        await self._save()
+        for proxy, require, message in (("http://1.2.3.4:80", False, "IP совпадает с IP хоста"), (None, True, "нужен прокси")):
+            with self.subTest(proxy=proxy):
+                self.guard.reset_mock()
+                self.guard.side_effect = NetworkGuardError(message)
+                with patch("modules.session_heartbeat.AsyncSession", side_effect=AssertionError("network used")) as factory:
+                    status = await check_session_heartbeat(self.profile, "alice", proxy, engine="chrome", require_proxy=require)
+                factory.assert_not_called()
+                self.assertFalse(status.is_alive)
+                self.assertEqual(status.details, f"сеть: {message}")
+                self.guard.assert_awaited_once_with(proxy, require_proxy=require)
+
+    async def test_chrome_without_any_proxy_goes_out_directly_without_a_guard(self):
+        await self._save()
+        session = self._session()
+        with patch("modules.session_heartbeat.AsyncSession", return_value=session) as factory:
+            status = await check_session_heartbeat(self.profile, "alice", engine="chrome")
+        self.assertTrue(status.is_alive)
+        self.assertIsNone(factory.call_args.kwargs["proxy"])
+        self.guard.assert_not_awaited()
+
+    async def test_chrome_heartbeat_reads_neither_cookies_sqlite_nor_the_camoufox_fingerprint(self):
+        await self._save()
+        (self.profile / "cookies.sqlite").write_bytes(b"not a database")
+        session = self._session()
+        with patch("modules.session_heartbeat.AsyncSession", return_value=session), \
+             patch("modules.session_heartbeat.read_youtube_cookies", side_effect=AssertionError("cookies.sqlite read")), \
+             patch("modules.session_heartbeat.read_login_info_metadata", side_effect=AssertionError("cookies.sqlite read")), \
+             patch("modules.session_heartbeat.fingerprint_headers", side_effect=AssertionError("camoufox headers")):
+            status = await check_session_heartbeat(self.profile, "alice", engine="chrome")
+        self.assertTrue(status.is_alive)
+
+    async def test_a_local_server_sees_one_sec_ch_ua_and_it_is_ours(self):
+        """Real curl_cffi against 127.0.0.1 (no internet): our headers replace the impersonation defaults, not duplicate them."""
+        from curl_cffi.requests import AsyncSession
+
+        captured: list[str] = []
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+
+        def serve():
+            conn, _ = server.accept()
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+            captured.append(data.decode("latin1"))
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            conn.close()
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        self.addCleanup(server.close)
+        hints = {"brands": [{"brand": "Chromium", "version": "134"}, {"brand": "Not:A-Brand", "version": "24"},
+                            {"brand": "Google Chrome", "version": "134"}], "mobile": False, "platform": "Windows"}
+        user_agent = CHROME_UA.replace("131", "134")
+        headers = chrome_headers(user_agent, "de-DE", hints)
+        async with AsyncSession(impersonate=chrome_impersonate_profile(user_agent), headers=headers, trust_env=False) as session:
+            await session.get(f"http://127.0.0.1:{server.getsockname()[1]}/", cookies={"LOGIN_INFO": "v"})
+        await asyncio.to_thread(thread.join, 5)
+        lines = captured[0].split("\r\n")
+        for name in ("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "user-agent", "accept-language"):
+            self.assertEqual(sum(line.lower().startswith(name + ":") for line in lines), 1, name)
+        self.assertIn('sec-ch-ua: "Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"', lines)
+        self.assertIn('sec-ch-ua-platform: "Windows"', lines)
+        self.assertIn(f"User-Agent: {user_agent}", lines)
+        self.assertFalse(any(line.lower().startswith("origin:") for line in lines))
+
 
 def _browser_settings(root: Path, **extra) -> BrowserSettings:
     target = TargetSettings(
@@ -374,10 +754,56 @@ class TestYouTubeRunnerChrome(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.cfg = _browser_settings(self.root)
         self.session_dir = self.root / "chrome" / "alice"
+        # The launcher and the network guard are tested elsewhere: here only how the runner calls them
+        self.prepare = self._start_patch("modules.youtube_runner.prepare_chrome_profile")
+        self.chrome_args = self._start_patch(
+            "modules.youtube_runner.get_chrome_args", return_value=["--lang=de-DE", "--hide-crash-restore-bubble"]
+        )
+        self.network = self._start_patch("modules.youtube_runner.ensure_network_ready", new_callable=AsyncMock, return_value=None)
+        self.geo_lock = self._start_patch("modules.youtube_runner.check_geo_lock")
+        self.read_geo = self._start_patch("modules.youtube_runner.read_session_geo", return_value=None)
+        self.write_geo = self._start_patch("modules.youtube_runner.write_session_geo")
+
+    def _start_patch(self, target, **kwargs):
+        patcher = patch(target, **kwargs)
+        mock = patcher.start()
+        self.addCleanup(patcher.stop)
+        return mock
+
+    @staticmethod
+    def _geo(timezone="Europe/Berlin", locale="de-DE", country="DE", geolocation=None):
+        return SimpleNamespace(timezone=timezone, locale=locale, country=country, geolocation=geolocation)
+
+    @staticmethod
+    def _page_fake():
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=CHROME_UA)
+        page.close = AsyncMock()
+        page.set_default_timeout = MagicMock()
+        page.set_default_navigation_timeout = MagicMock()
+        page.is_closed = MagicMock(return_value=False)
+        return page
+
+    @staticmethod
+    def _identity_evaluate(user_agent=CHROME_UA, hints=None):
+        """`page.evaluate` that answers the userAgent read and the userAgentData read apart."""
+        async def evaluate(script):
+            if "userAgentData" in script:
+                if isinstance(hints, Exception):
+                    raise hints
+                return hints
+            return user_agent
+        return evaluate
+
+    async def _started_runner(self, **kwargs):
+        runner = self._runner(proxy=None, **kwargs)
+        await runner.start()
+        return runner
 
     def _fake_patchright(self, launch=None):
         self.page = MagicMock()
         self.page.evaluate = AsyncMock(return_value=CHROME_UA)
+        self.page.close = AsyncMock()
         self.page.set_default_timeout = MagicMock()
         self.page.set_default_navigation_timeout = MagicMock()
         self.page.is_closed = MagicMock(return_value=False)
@@ -399,7 +825,7 @@ class TestYouTubeRunnerChrome(unittest.IsolatedAsyncioTestCase):
     def _patches(self):
         return (
             patch("modules.youtube_runner.ensure_chrome_executable", return_value=Path("chrome.exe")),
-            patch("modules.youtube_runner.resolve_geo_timezone", AsyncMock(return_value=("Europe/Berlin", "de-DE"))),
+            patch("modules.youtube_runner.resolve_chrome_geo", AsyncMock(return_value=self._geo())),
         )
 
     async def test_start_launches_chrome_with_the_account_profile_and_geo(self):
@@ -414,21 +840,25 @@ class TestYouTubeRunnerChrome(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(kwargs["no_viewport"])
         self.assertTrue(kwargs["headless"])
         self.assertEqual(kwargs["timezone_id"], "Europe/Berlin")
-        self.assertEqual(kwargs["locale"], "de-DE")
-        self.assertIn("--lang=de-DE", kwargs["args"])
-        self.assertIn("--hide-crash-restore-bubble", kwargs["args"])
+        self.assertNotIn("locale", kwargs)  # the language comes from --lang and Preferences, not from patchright
+        self.assertEqual(kwargs["args"], self.chrome_args.return_value)
         self.assertEqual(kwargs["proxy"], {"server": "http://10.0.0.1:8080", "username": "u", "password": "p"})
-        self.assertTrue((self.session_dir / "Default" / "Preferences").is_file())  # prepare_chrome_profile ran
+        self.assertNotIn("geolocation", kwargs)  # the geo has no city point
+        self.assertNotIn("permissions", kwargs)
+        self.prepare.assert_called_once_with(self.session_dir, "de-DE")  # the profile is prepared for the launch locale
+        self.chrome_args.assert_called_once_with(
+            locale="de-DE", account_name="alice", proxy_url="http://u:p@10.0.0.1:8080"
+        )
         self.assertEqual(runner._cached_user_agent, CHROME_UA)
         self.assertTrue(runner.is_running)
         self.assertEqual(runner.engine, "chrome")
 
     async def test_the_account_locale_and_country_reach_the_geo_lookup(self):
         ensure, _ = self._patches()
-        geo = AsyncMock(return_value=(None, "pl-PL"))
-        with self._fake_patchright(), ensure, patch("modules.youtube_runner.resolve_geo_timezone", geo):
+        geo = AsyncMock(return_value=self._geo(timezone=None, locale="pl-PL", country="PL"))
+        with self._fake_patchright(), ensure, patch("modules.youtube_runner.resolve_chrome_geo", geo):
             await self._runner(proxy=None, locale="pl-PL", geo_country="PL").start()
-        geo.assert_awaited_once_with(None, "PL", "pl-PL")
+        geo.assert_awaited_once_with(None, "PL", "pl-PL", "alice")
 
     async def test_close_saves_the_heartbeat_state_closes_the_context_and_stops_the_driver(self):
         ensure, geo = self._patches()
@@ -462,6 +892,356 @@ class TestYouTubeRunnerChrome(unittest.IsolatedAsyncioTestCase):
                 await runner.start()
         self.driver.stop.assert_awaited_once()
         self.assertIsNone(runner._patchright_driver)
+
+    # ---- tabs
+
+    async def test_the_locale_is_resolved_before_the_profile_is_prepared(self):
+        ensure, _ = self._patches()
+        order = MagicMock()
+        geo = AsyncMock(side_effect=lambda *a: order.geo(*a) or self._geo())
+        self.prepare.side_effect = lambda *a: order.prepare(*a)
+        self.network.side_effect = lambda *a, **k: order.network()
+        with self._fake_patchright(), ensure, patch("modules.youtube_runner.resolve_chrome_geo", geo):
+            await self._runner(proxy=None).start()
+        self.assertEqual([c[0] for c in order.method_calls], ["network", "geo", "prepare"])
+
+    async def test_the_first_tab_is_reused_and_no_new_tab_is_opened(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            page = await self._runner(proxy=None).start()
+        self.assertIs(page, self.page)
+        self.context.new_page.assert_not_awaited()
+
+    async def test_a_new_tab_is_opened_only_when_the_profile_has_none(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            fresh = self._page_fake()
+            self.context.pages = []
+            self.context.new_page = AsyncMock(return_value=fresh)
+            page = await self._runner(proxy=None).start()
+        self.assertIs(page, fresh)
+        self.context.new_page.assert_awaited_once()
+
+    async def test_restored_extra_tabs_are_closed_and_the_working_tab_is_kept(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            blank, newtab = self._page_fake(), self._page_fake()
+            blank.url, newtab.url = "about:blank", "chrome://newtab/"
+            self.context.pages = [self.page, blank, newtab]
+            runner = self._runner(proxy=None)
+            page = await runner.start()
+        self.assertIs(page, self.page)
+        blank.close.assert_awaited_once()
+        newtab.close.assert_awaited_once()
+        self.page.close.assert_not_awaited()
+        self.context.new_page.assert_not_awaited()
+        self.assertTrue(runner.is_running)
+
+    async def test_a_tab_that_refuses_to_close_does_not_fail_the_start(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            stuck, other = self._page_fake(), self._page_fake()
+            stuck.close = AsyncMock(side_effect=RuntimeError("target closed"))
+            self.context.pages = [self.page, stuck, other]
+            page = await self._runner(proxy=None).start()
+        self.assertIs(page, self.page)
+        other.close.assert_awaited_once()  # the next tab is still handled
+
+    # ---- client hints
+
+    async def test_client_hints_are_cached_at_start_and_saved_at_close(self):
+        ensure, geo = self._patches()
+        hints = {"brands": [{"brand": "Chromium", "version": "131"}, {"brand": "Google Chrome", "version": "131"}],
+                 "mobile": False, "platform": "Windows"}
+        save = AsyncMock(return_value=True)
+        with self._fake_patchright(), ensure, geo, patch("modules.youtube_runner.save_chrome_heartbeat_state", save):
+            self.page.evaluate = AsyncMock(side_effect=self._identity_evaluate(hints=hints))
+            runner = await self._started_runner()
+            self.assertEqual(runner._cached_client_hints, hints)
+            await runner.close()
+        save.assert_awaited_once_with(
+            profile_dir=self.session_dir, context=self.context, user_agent=CHROME_UA, client_hints=hints
+        )
+
+    async def test_the_client_hints_read_is_plain_evaluate_without_cdp(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            await self._runner(proxy=None).start()
+        scripts = [call.args[0] for call in self.page.evaluate.await_args_list]
+        self.assertTrue(any("navigator.userAgentData" in script for script in scripts))
+        self.context.new_cdp_session.assert_not_called()
+
+    async def test_missing_or_broken_client_hints_are_none_and_the_start_goes_on(self):
+        ensure, geo = self._patches()
+        for hints in (None, RuntimeError("navigating"), "nonsense", {"brands": "x"}):
+            with self.subTest(hints=repr(hints)), self._fake_patchright(), ensure, geo:
+                self.page.evaluate = AsyncMock(side_effect=self._identity_evaluate(hints=hints))
+                runner = await self._started_runner()
+                self.assertIsNone(runner._cached_client_hints)
+                self.assertEqual(runner._cached_user_agent, CHROME_UA)
+                await runner.close()
+
+    async def test_a_failed_user_agent_read_does_not_lose_the_hints(self):
+        ensure, geo = self._patches()
+        hints = {"brands": [{"brand": "Chromium", "version": "131"}], "mobile": False, "platform": "Windows"}
+
+        async def evaluate(script):
+            if "userAgentData" in script:
+                return hints
+            raise RuntimeError("navigating")
+
+        with self._fake_patchright(), ensure, geo:
+            self.page.evaluate = AsyncMock(side_effect=evaluate)
+            runner = await self._started_runner()
+        self.assertIsNone(runner._cached_user_agent)
+        self.assertEqual(runner._cached_client_hints, hints)
+
+    # ---- the driver never outlives the session
+
+    async def test_the_driver_is_stopped_even_when_the_context_close_fails(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            runner = await self._started_runner()
+            self.context.close = AsyncMock(side_effect=RuntimeError("already closed"))
+            await runner.close()
+        self.context.close.assert_awaited_once()
+        self.driver.stop.assert_awaited_once()
+        self.assertIsNone(runner._patchright_driver)
+
+    async def test_the_driver_is_stopped_even_when_the_state_save_raises_anything(self):
+        ensure, geo = self._patches()
+        save = AsyncMock(side_effect=asyncio.CancelledError())
+        with self._fake_patchright(), ensure, geo, patch("modules.youtube_runner.save_chrome_heartbeat_state", save):
+            runner = await self._started_runner()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner.close()
+        self.driver.stop.assert_awaited_once()
+
+    async def test_a_driver_that_fails_to_stop_does_not_raise(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            runner = await self._started_runner()
+            self.driver.stop = AsyncMock(side_effect=RuntimeError("node is gone"))
+            await runner.close()
+        self.context.close.assert_awaited_once()
+
+    async def test_a_failure_after_the_launch_closes_the_context_and_stops_the_driver(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            self.context.pages = []
+            self.context.new_page = AsyncMock(side_effect=RuntimeError("no target"))
+            runner = self._runner(proxy=None)
+            with self.assertRaises(RuntimeError):
+                await runner.start()
+        self.context.close.assert_awaited_once()
+        self.driver.stop.assert_awaited_once()
+        self.assertIsNone(runner._patchright_driver)
+        self.assertIsNone(runner.context)
+        self.assertFalse(runner.is_running)
+
+    async def test_close_without_a_start_is_a_noop(self):
+        await self._runner(proxy=None).close()
+
+    # ---- network guard (fail closed)
+
+    async def test_a_network_guard_error_stops_chrome_before_any_driver_or_profile_work(self):
+        ensure, geo = self._patches()
+        self.network.side_effect = NetworkGuardError("proxy is down")
+        with self._fake_patchright() as _, ensure as ensure_mock, geo as geo_mock:
+            runner = self._runner(proxy="http://10.0.0.1:8080")
+            with self.assertRaises(NetworkGuardError):
+                await runner.start()
+            sys.modules["patchright.async_api"].async_playwright.assert_not_called()
+        ensure_mock.assert_not_called()
+        geo_mock.assert_not_called()
+        self.prepare.assert_not_called()
+        self.assertIsNone(runner._patchright_driver)
+        self.assertIsNone(runner.context)
+
+    async def test_a_network_guard_error_stops_camoufox_before_the_browser_is_created(self):
+        runner = YouTubeRunner(self.cfg, self.cfg.targets[0], session_dir=self.root / "alice", proxy="http://10.0.0.1:8080")
+        self.network.side_effect = NetworkGuardError("proxy is transparent")
+        with patch("modules.youtube_runner.AsyncCamoufox") as camoufox:
+            with self.assertRaises(NetworkGuardError):
+                await runner.start()
+        camoufox.assert_not_called()
+        self.assertIsNone(runner.context)
+
+    async def test_the_proxy_and_the_require_proxy_setting_reach_the_guard(self):
+        ensure, geo = self._patches()
+        self.cfg = _browser_settings(self.root, require_proxy=True)
+        with self._fake_patchright(), ensure, geo:
+            await self._runner(proxy="http://10.0.0.1:8080").start()
+        self.network.assert_awaited_once_with("http://10.0.0.1:8080", require_proxy=True)
+
+    async def test_without_require_proxy_a_proxyless_start_passes_none_and_is_not_blocked(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            await self._runner(proxy=None).start()
+        self.network.assert_awaited_once_with(None, require_proxy=False)
+
+    async def test_require_proxy_without_a_proxy_stops_start_with_the_guards_error(self):
+        ensure, geo = self._patches()
+        self.cfg = _browser_settings(self.root, require_proxy=True)
+        self.network.side_effect = NetworkGuardError("proxy is required")
+        with self._fake_patchright(), ensure as ensure_mock, geo:
+            runner = self._runner(proxy=None)
+            with self.assertRaises(NetworkGuardError):
+                await runner.start()
+        self.network.assert_awaited_once_with(None, require_proxy=True)
+        ensure_mock.assert_not_called()
+
+    # ---- geolocation of the proxy's city
+
+    async def test_the_city_geolocation_reaches_the_launch_without_any_permission(self):
+        ensure, _ = self._patches()
+        point = {"latitude": 52.52, "longitude": 13.405}
+        geo = AsyncMock(return_value=self._geo(geolocation=point))
+        with self._fake_patchright(), ensure, patch("modules.youtube_runner.resolve_chrome_geo", geo):
+            await self._runner(proxy=None).start()
+        kwargs = self.driver.chromium.launch_persistent_context.call_args.kwargs
+        self.assertEqual(kwargs["geolocation"], point)
+        self.assertNotIn("permissions", kwargs)
+
+    # ---- geo-consistency lock
+
+    async def test_chrome_checks_the_geo_lock_with_the_mode_before_anything_is_prepared(self):
+        ensure, geo = self._patches()
+        self.cfg = _browser_settings(self.root, geo_lock="block")
+        with self._fake_patchright(), ensure, geo:
+            await self._runner(proxy=None).start()
+        self.geo_lock.assert_called_once_with(self.session_dir, "DE", "block")
+
+    async def test_the_default_geo_lock_mode_is_warn(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            await self._runner(proxy=None).start()
+        self.geo_lock.assert_called_once_with(self.session_dir, "DE", "warn")
+
+    async def test_a_blocked_geo_change_stops_chrome_before_the_driver_starts(self):
+        ensure, geo = self._patches()
+        self.geo_lock.side_effect = GeoLockError("country changed")
+        with self._fake_patchright(), ensure as ensure_mock, geo:
+            runner = self._runner(proxy=None)
+            with self.assertRaises(GeoLockError):
+                await runner.start()
+            sys.modules["patchright.async_api"].async_playwright.assert_not_called()
+        ensure_mock.assert_not_called()
+        self.prepare.assert_not_called()
+        self.assertIsNone(runner._patchright_driver)
+
+    async def test_an_unknown_country_skips_the_geo_lock(self):
+        ensure, _ = self._patches()
+        geo = AsyncMock(return_value=self._geo(country=None))
+        with self._fake_patchright(), ensure, patch("modules.youtube_runner.resolve_chrome_geo", geo):
+            await self._runner(proxy=None).start()
+        self.geo_lock.assert_not_called()
+
+    async def test_camoufox_checks_the_geo_lock_with_the_exit_country(self):
+        runner = YouTubeRunner(self.cfg, self.cfg.targets[0], session_dir=self.root / "alice", proxy="http://10.0.0.1:8080")
+        self.network.return_value = SimpleNamespace(ip="1.2.3.4", country="PL", timezone="Europe/Warsaw")
+        with self._camoufox_patches():
+            await runner.start()
+            await runner.close()
+        self.geo_lock.assert_called_once_with(self.root / "alice", "PL", "warn")
+
+    async def test_a_blocked_geo_change_stops_camoufox_before_the_browser_is_created(self):
+        runner = YouTubeRunner(self.cfg, self.cfg.targets[0], session_dir=self.root / "alice", proxy="http://10.0.0.1:8080")
+        self.network.return_value = SimpleNamespace(ip="1.2.3.4", country="PL", timezone="Europe/Warsaw")
+        self.geo_lock.side_effect = GeoLockError("country changed")
+        with patch("modules.youtube_runner.AsyncCamoufox") as camoufox:
+            with self.assertRaises(GeoLockError):
+                await runner.start()
+        camoufox.assert_not_called()
+
+    async def test_camoufox_without_a_proxy_has_no_country_and_no_geo_lock(self):
+        runner = YouTubeRunner(self.cfg, self.cfg.targets[0], session_dir=self.root / "alice")
+        with self._camoufox_patches():
+            await runner.start()
+            await runner.close()
+        self.geo_lock.assert_not_called()
+        self.write_geo.assert_not_called()
+
+    # ---- the geo of a signed-in session is remembered
+
+    async def test_chrome_records_the_geo_right_after_the_start_when_already_signed_in(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            await self._runner(proxy=None).start()
+        self.write_geo.assert_called_once_with(self.session_dir, "DE", "Europe/Berlin")
+
+    async def test_chrome_records_the_geo_at_close_after_a_sign_in_during_the_session(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            self.context.cookies = AsyncMock(return_value=[])
+            runner = await self._started_runner()
+            self.write_geo.assert_not_called()  # not signed in yet
+            self.context.cookies = AsyncMock(return_value=[_cookie("LOGIN_INFO", "v", ".youtube.com")])
+            await runner.close()
+        self.write_geo.assert_called_once_with(self.session_dir, "DE", "Europe/Berlin")
+
+    async def test_a_session_without_a_login_records_nothing(self):
+        ensure, geo = self._patches()
+        with self._fake_patchright(), ensure, geo:
+            self.context.cookies = AsyncMock(return_value=[_cookie("SID", "v", ".google.com")])
+            runner = await self._started_runner()
+            await runner.close()
+        self.write_geo.assert_not_called()
+
+    async def test_a_changed_country_never_overwrites_the_recorded_geo(self):
+        ensure, geo = self._patches()
+        self.read_geo.return_value = {"country": "PL", "timezone": "Europe/Warsaw"}
+        with self._fake_patchright(), ensure, geo:
+            runner = await self._started_runner()
+            await runner.close()
+        self.write_geo.assert_not_called()  # the profile keeps the geo it signed in from
+
+    async def test_the_same_country_refreshes_the_recorded_geo(self):
+        ensure, geo = self._patches()
+        self.read_geo.return_value = {"country": "de", "timezone": "Europe/Berlin"}
+        with self._fake_patchright(), ensure, geo:
+            await self._runner(proxy=None).start()
+        self.write_geo.assert_called_once()
+
+    async def test_a_failing_geo_record_never_breaks_the_session(self):
+        ensure, geo = self._patches()
+        self.write_geo.side_effect = OSError("disk full")
+        self.read_geo.side_effect = OSError("locked")
+        with self._fake_patchright(), ensure, geo:
+            runner = await self._started_runner()
+            self.assertTrue(runner.is_running)
+            await runner.close()
+        self.context.close.assert_awaited_once()
+        self.driver.stop.assert_awaited_once()
+
+    async def test_camoufox_records_the_exit_geo_at_close_while_the_context_is_alive(self):
+        runner = YouTubeRunner(self.cfg, self.cfg.targets[0], session_dir=self.root / "alice", proxy="http://10.0.0.1:8080")
+        self.network.return_value = SimpleNamespace(ip="1.2.3.4", country="PL", timezone="Europe/Warsaw")
+        events = []
+        with self._camoufox_patches() as (camoufox, context):
+            context.cookies = AsyncMock(return_value=[_cookie("LOGIN_INFO", "v", ".youtube.com")])
+            self.write_geo.side_effect = lambda *a: events.append("write")
+            camoufox.return_value.__aexit__ = AsyncMock(side_effect=lambda *a: events.append("exit"))
+            await runner.start()
+            self.write_geo.assert_not_called()
+            await runner.close()
+        self.assertEqual(events, ["write", "exit"])
+        self.write_geo.assert_called_once_with(self.root / "alice", "PL", "Europe/Warsaw")
+
+    def _camoufox_patches(self):
+        """Patch AsyncCamoufox and the fingerprint; the context manager yields `(camoufox mock, context)`."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def manager():
+            context = self._camoufox_context()
+            with patch("modules.youtube_runner.AsyncCamoufox") as camoufox, \
+                    patch("modules.youtube_runner.get_or_create_fingerprint", return_value={"pinned": True}):
+                camoufox.return_value.__aenter__ = AsyncMock(return_value=context)
+                camoufox.return_value.__aexit__ = AsyncMock(return_value=None)
+                yield camoufox, context
+
+        return manager()
 
     async def test_socks5_proxy_with_login_is_refused_before_anything_starts(self):
         ensure, geo = self._patches()
@@ -629,6 +1409,164 @@ class TestEngineInTheWizard(unittest.TestCase):
             with patch.object(wizard, "_setup_engine_in_config"):
                 wizard._setup_switch_engine(self.root / "config.yaml", acc, logged_in=False)
         ask.assert_not_called()  # nothing to lose: no question
+
+
+class TestChromeWindowSize(unittest.TestCase):
+    def _size(self, name, work_area=None):
+        with patch("modules.chrome_launcher.get_screen_work_area", return_value=work_area):
+            return get_window_size(name)
+
+    def test_size_is_stable_and_pinned_to_sha256_of_the_name(self):
+        self.assertEqual(self._size("alice"), self._size("alice"))
+        # pinned values: the built-in hash() would change them between processes
+        self.assertEqual(self._size("alice"), (1447, 870))
+        self.assertEqual(self._size("bob"), (1459, 859))
+
+    def test_size_stays_in_range_and_differs_between_accounts(self):
+        sizes = {self._size(f"account-{index}") for index in range(60)}
+        for width, height in sizes:
+            self.assertTrue(1280 <= width <= 1560, width)
+            self.assertTrue(800 <= height <= 940, height)
+        self.assertGreater(len(sizes), 30)
+
+    def test_no_name_keeps_the_old_size(self):
+        self.assertEqual(self._size(None), (1440, 900))
+        self.assertEqual(self._size(""), (1440, 900))
+
+    def test_a_small_screen_clamps_the_window_to_the_work_area(self):
+        self.assertEqual(self._size("alice", (1366, 728)), (1366, 728))  # 1366x768 with a taskbar
+        self.assertEqual(self._size(None, (1366, 728)), (1366, 728))
+        self.assertEqual(self._size("alice", (1600, 800)), (1447, 800))  # only the too large side is cut
+        self.assertEqual(self._size("alice", (3840, 2000)), (1447, 870))
+
+    def test_the_arg_carries_the_clamped_size(self):
+        with patch("modules.chrome_launcher.get_screen_work_area", return_value=(1366, 728)):
+            self.assertIn("--window-size=1366,728", get_chrome_args("en-US", "alice"))
+        with patch("modules.chrome_launcher.get_screen_work_area", return_value=None):
+            self.assertIn("--window-size=1447,870", get_chrome_args("en-US", "alice"))
+            self.assertIn("--window-size=1440,900", get_chrome_args())
+
+    def test_work_area_failures_are_not_fatal(self):
+        self.assertEqual(self._size("alice", None), (1447, 870))
+        with patch("modules.chrome_launcher.sys.platform", "linux"):
+            self.assertIsNone(chrome_launcher.get_screen_work_area())
+        failing = MagicMock()
+        failing.user32.SystemParametersInfoW.side_effect = OSError("no desktop")
+        with patch("modules.chrome_launcher.sys.platform", "win32"), patch("ctypes.windll", failing, create=True):
+            self.assertIsNone(chrome_launcher.get_screen_work_area())
+        refusing = MagicMock()
+        refusing.user32.SystemParametersInfoW.return_value = 0
+        with patch("modules.chrome_launcher.sys.platform", "win32"), patch("ctypes.windll", refusing, create=True):
+            self.assertIsNone(chrome_launcher.get_screen_work_area())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows work area")
+    def test_the_real_work_area_is_positive(self):
+        area = chrome_launcher.get_screen_work_area()
+        if area is not None:
+            self.assertTrue(area[0] > 0 and area[1] > 0)
+
+
+class TestChromeHostResolverRules(unittest.TestCase):
+    def _rules(self, proxy):
+        return [arg for arg in get_chrome_args("en-US", "alice", proxy) if arg.startswith("--host-resolver-rules=")]
+
+    def test_socks5_forbids_local_dns_except_loopback_and_the_proxy(self):
+        self.assertEqual(
+            self._rules("socks5://10.0.0.1:1080"),
+            ["--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1, EXCLUDE localhost, EXCLUDE 10.0.0.1"],
+        )
+
+    def test_a_domain_or_ipv6_proxy_host_is_excluded_without_brackets(self):
+        self.assertEqual(socks5_host_resolver_rule("socks5://proxy.example.com:1080"),
+                         "MAP * ~NOTFOUND , EXCLUDE 127.0.0.1, EXCLUDE localhost, EXCLUDE proxy.example.com")
+        self.assertTrue(socks5_host_resolver_rule("socks5://[2001:db8::1]:1080").endswith("EXCLUDE 2001:db8::1"))
+        self.assertEqual(socks5_host_resolver_rule("socks5://localhost:1080").count("localhost"), 1)
+
+    def test_the_rule_is_one_unquoted_argument_without_credentials(self):
+        args = get_chrome_args("en-US", "alice", "socks5://user:s3cret@proxy.example.com:1080")
+        rules = [arg for arg in args if arg.startswith("--host-resolver-rules=")]
+        self.assertEqual(len(rules), 1)
+        self.assertNotIn('"', rules[0])  # with quotes Chrome ignores the whole rule
+        for arg in args:
+            self.assertNotIn("s3cret", arg)
+            self.assertNotIn("user", arg)
+
+    def test_other_proxies_and_broken_values_get_no_rule(self):
+        for proxy in (None, "", "http://10.0.0.1:8080", "https://10.0.0.1:443", "10.0.0.1:8080:u:p", "socks5://nonsense"):
+            with self.subTest(proxy=proxy):
+                self.assertEqual(self._rules(proxy), [])
+                self.assertIsNone(socks5_host_resolver_rule(proxy))
+
+
+class TestChromeGeo(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _distance_km(lat1, lon1, lat2, lon2):
+        import math
+
+        return math.hypot((lat2 - lat1) * 111.0, (lon2 - lon1) * 111.0 * math.cos(math.radians(lat1)))
+
+    async def test_the_exact_city_timezone_wins_over_the_country_table(self):
+        with _exit_geo_patch(_exit_geo("US", "America/Chicago")):
+            geo = await resolve_chrome_geo("http://p:1")
+        self.assertEqual((geo.timezone, geo.locale, geo.country), ("America/Chicago", "en-US", "US"))
+        self.assertIsNone(geo.geolocation)
+
+    async def test_the_country_table_is_only_the_fallback_for_the_timezone(self):
+        with _exit_geo_patch(_exit_geo("DE", None)):
+            self.assertEqual((await resolve_chrome_geo(None)).timezone, "Europe/Berlin")
+        with _exit_geo_patch(_exit_geo("ZW", None)):
+            self.assertIsNone((await resolve_chrome_geo(None)).timezone)
+
+    async def test_locale_and_country_priorities(self):
+        with _exit_geo_patch(_exit_geo("DE", "Europe/Berlin")):
+            self.assertEqual((await resolve_chrome_geo(None, "FR", "pl-PL")).locale, "pl-PL")  # explicit locale first
+            geo = await resolve_chrome_geo(None, "FR")
+            self.assertEqual((geo.locale, geo.country), ("de-DE", "DE"))  # the exit country beats the account's one
+        with _exit_geo_patch(None):
+            geo = await resolve_chrome_geo(None, "France")
+            self.assertEqual((geo.country, geo.timezone, geo.locale, geo.geolocation), ("FR", "Europe/Paris", "fr-FR", None))
+            geo = await resolve_chrome_geo(None)
+            self.assertEqual((geo.country, geo.timezone, geo.locale), (None, None, "en-US"))
+
+    async def test_the_lookup_gets_the_proxy(self):
+        patcher = _exit_geo_patch(None)
+        with patcher as lookup:
+            await resolve_chrome_geo("http://u:p@10.0.0.1:8080")
+        lookup.assert_awaited_once_with("http://u:p@10.0.0.1:8080")
+
+    async def test_geolocation_is_the_city_point_without_a_name(self):
+        with _exit_geo_patch(_exit_geo("DE", "Europe/Berlin", 52.52, 13.405)):
+            geo = await resolve_chrome_geo(None)
+        self.assertEqual(geo.geolocation, {"latitude": 52.52, "longitude": 13.405, "accuracy": 100})
+
+    async def test_geolocation_noise_is_stable_per_account_and_within_1_to_2_km(self):
+        points = set()
+        for name in ("alice", "bob", "carol", "dave", "erin", "frank"):
+            with _exit_geo_patch(_exit_geo("DE", "Europe/Berlin", 52.52, 13.405)):
+                first = (await resolve_chrome_geo(None, account_name=name)).geolocation
+                again = (await resolve_chrome_geo(None, account_name=name)).geolocation
+            self.assertEqual(first, again)
+            self.assertEqual(first["accuracy"], 100)
+            distance = self._distance_km(52.52, 13.405, first["latitude"], first["longitude"])
+            self.assertTrue(0.99 <= distance <= 2.01, (name, distance))
+            for key in ("latitude", "longitude"):
+                self.assertEqual(first[key], round(first[key], 6))
+            points.add((first["latitude"], first["longitude"]))
+        self.assertEqual(len(points), 6)
+
+    def test_noise_survives_the_poles_and_the_date_line(self):
+        for latitude, longitude in ((89.9999, 0.0), (-89.9999, 10.0), (0.0, 179.9999), (0.0, -179.9999)):
+            point = city_geolocation(latitude, longitude, "alice")
+            self.assertTrue(-90 <= point["latitude"] <= 90 and -180 <= point["longitude"] <= 180, point)
+
+    async def test_the_old_wrapper_returns_the_pair_of_the_new_function(self):
+        with _exit_geo_patch(_exit_geo("US", "America/Chicago", 41.88, -87.63)):
+            self.assertEqual(await resolve_geo_timezone("http://p:1"), ("America/Chicago", "en-US"))
+
+    def test_chrome_geo_is_immutable(self):
+        geo = ChromeGeo("Europe/Berlin", "de-DE", "DE", None)
+        with self.assertRaises(AttributeError):
+            geo.locale = "en-US"
 
 
 if __name__ == "__main__":

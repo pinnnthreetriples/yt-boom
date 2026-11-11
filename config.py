@@ -360,6 +360,10 @@ class BrowserSettings(BaseModel):
     locale: str = "en-US"
     default_engine: EngineType = "camoufox"
     proxy: str | None = None
+    # True: a session never opens without a proxy (no proxy -> refuse instead of leaving from the machine's own IP).
+    require_proxy: bool = False
+    # What to do when a profile is opened from another country than its last session: "warn" logs CRITICAL, "block" refuses.
+    geo_lock: Literal["warn", "block"] = "warn"
     session_root: Path = Path("test_sessions")
     accounts: list[AccountSettings] = Field(default_factory=list)
     navigation_timeout_ms: int = Field(default=45000, ge=5000)

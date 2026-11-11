@@ -548,7 +548,9 @@ async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml"
         all_alive = True
         for acc in accounts:
             if online:
-                res = await check_account_heartbeat(acc, default_proxy=cfg.browser.proxy, locale=cfg.browser.locale)
+                res = await check_account_heartbeat(
+                    acc, default_proxy=cfg.browser.proxy, locale=cfg.browser.locale, require_proxy=cfg.browser.require_proxy
+                )
             else:
                 res = check_session_offline(acc.session_path, acc.name, acc.engine)
             status_str = "ALIVE" if res.is_alive else "EXPIRED"

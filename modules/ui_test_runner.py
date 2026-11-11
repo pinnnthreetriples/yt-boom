@@ -207,7 +207,7 @@ class UITestRunner:
         try:
             await search_input.wait_for(state="visible")
             await self._simulator.click_locator(page, search_input)
-            await search_input.fill("")
+            await self._clear_input(page)
             await self._simulator.type_text(page, query[:80])
             await self._simulator.human_pause(0.3, 0.9)
             await self._simulator.click_locator(page, page.locator(self._target.search_button_selector))
@@ -250,7 +250,7 @@ class UITestRunner:
         try:
             await self._simulator.click_locator(page, submit_input)
             await self._simulator.thinking_pause()
-            await submit_input.fill("")
+            await self._clear_input(page)
             await self._simulator.type_text(page, text)
             typed = (await submit_input.input_value()).strip()
         except (*PlaywrightError, InteractionError) as exc:
@@ -301,6 +301,12 @@ class UITestRunner:
             if match:
                 return match.group(1)
         return None
+
+    async def _clear_input(self, page: Any) -> None:
+        """Empty the focused input with real keys (select-all + Backspace): `fill("")` is a DOM write without key events."""
+        await page.keyboard.press("Control+A", delay=self._rng.uniform(40, 110))
+        await asyncio.sleep(self._rng.uniform(0.1, 0.25))
+        await page.keyboard.press("Backspace", delay=self._rng.uniform(40, 110))
 
     async def _capture_failure(self, page: Any) -> None:
         try:

@@ -89,6 +89,8 @@ browser:
   humanize: false
   locale: en-US
   default_engine: camoufox  # engine of new accounts: camoufox | chrome (Google Chrome through patchright)
+  require_proxy: false  # true: no session opens without a proxy (otherwise the exit would be the machine's real IP)
+  geo_lock: warn  # warn | block: what to do when a profile is opened from another country than its last session
   proxy: null
   session_root: test_sessions
   navigation_timeout_ms: 45000
