@@ -85,6 +85,8 @@ class AccountWarmer:
             account_name=account.name,
             simulator=self._simulator,
             locale=account.locale,
+            engine=account.engine,
+            geo_country=account.geo_country or account.expected_country,
         )
         start_time = time.monotonic()
         chosen_video: str | None = target_video_url

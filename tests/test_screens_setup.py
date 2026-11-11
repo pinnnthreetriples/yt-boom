@@ -141,7 +141,7 @@ class TestAccountScreens(SetupScreenCase):
         self.assertFalse(result)
         self.assertIn("Аккаунты", output)
         self.assertIn("Аккаунтов  1 · вошли 0 из 1", output)
-        self.assertRegex(output, r"default(?:\x1b\[[0-9;]*m| )+○ нет входа(?:\x1b\[[0-9;]*m| )+http://1\.2\.3\.4:8080")
+        self.assertRegex(output, r"default(?:\x1b\[[0-9;]*m| )+○ нет входа(?:\x1b\[[0-9;]*m| )+(?:\[Fx\]|🦊) (?:\x1b\[[0-9;]*m| )*http://1\.2\.3\.4:8080")
         for moved in ("Проверить вход", "Переименовать", "Выйти из аккаунта"):
             self.assertNotIn(moved, output)  # per-account actions live in the account's own menu
 

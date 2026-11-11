@@ -301,6 +301,33 @@ def resolve_account_proxy(account_proxy: str | None, global_proxy: str | None) -
     return own or (global_proxy or None)
 
 
+EngineType = Literal["camoufox", "chrome"]
+
+CHROME_SOCKS5_AUTH_ERROR = (
+    "Движок Chrome не поддерживает SOCKS5 с авторизацией. "
+    "Смените протокол прокси на HTTP/HTTPS или используйте SOCKS5 без логина и пароля."
+)
+
+
+def validate_proxy_for_engine(proxy_url: str | None, engine: EngineType) -> None:
+    """Chrome cannot authenticate against a SOCKS5 proxy: reject such a pair. Raises ValueError (never echoes the proxy)."""
+    if engine != "chrome" or not proxy_url:
+        return
+    parsed = parse_proxy(proxy_url)
+    if parsed is None:
+        return
+    if parsed["server"].startswith("socks5://") and (parsed.get("username") or parsed.get("password")):
+        raise ValueError(CHROME_SOCKS5_AUTH_ERROR)
+
+
+def get_account_session_path(session_root: Path | str, account_name: str, engine: EngineType) -> Path:
+    """Profile folder of an account: `<root>/<name>` for Camoufox (unchanged), `<root>/chrome/<name>` for Chrome."""
+    root = Path(session_root)
+    if engine == "chrome":
+        return root / "chrome" / account_name
+    return root / account_name
+
+
 class AccountSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -312,6 +339,12 @@ class AccountSettings(BaseModel):
     password: str | None = Field(default=None, repr=False, exclude=True)
     totp_secret: str | None = Field(default=None, repr=False, exclude=True)
     recovery_email: str | None = None
+    engine: EngineType = "camoufox"
+
+    @model_validator(mode="after")
+    def _validate_engine_proxy(self) -> "AccountSettings":
+        validate_proxy_for_engine(self.proxy_url, self.engine)
+        return self
 
     def playwright_proxy(self) -> dict[str, str] | None:
         return parse_proxy(self.proxy_url)
@@ -325,6 +358,7 @@ class BrowserSettings(BaseModel):
     geoip: bool = True
     humanize: bool = False
     locale: str = "en-US"
+    default_engine: EngineType = "camoufox"
     proxy: str | None = None
     session_root: Path = Path("test_sessions")
     accounts: list[AccountSettings] = Field(default_factory=list)
@@ -531,14 +565,18 @@ __all__ = [
     "AccountSettings",
     "AppConfig",
     "BrowserSettings",
+    "CHROME_SOCKS5_AUTH_ERROR",
     "CollectorEndpoint",
     "CollectorSettings",
     "ConfigError",
     "DeepSeekSettings",
+    "EngineType",
     "LimitsSettings",
     "ProcessorSettings",
     "TargetSettings",
     "ValidatorSettings",
+    "get_account_session_path",
+    "validate_proxy_for_engine",
     "load_config",
     "mask_proxy_url",
     "parse_proxy",

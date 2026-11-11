@@ -88,6 +88,7 @@ browser:
   geoip: true
   humanize: false
   locale: en-US
+  default_engine: camoufox  # engine of new accounts: camoufox | chrome (Google Chrome through patchright)
   proxy: null
   session_root: test_sessions
   navigation_timeout_ms: 45000
@@ -116,6 +117,7 @@ browser:
     session_path: test_sessions/example
     proxy_url: null
     is_active: true
+    engine: camoufox  # chrome keeps its profile in test_sessions/chrome/<name>; no SOCKS5 proxy with a login
 limits:
   total_iterations: 3
   max_concurrent_sessions: 1

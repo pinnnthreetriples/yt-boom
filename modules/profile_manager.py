@@ -163,6 +163,8 @@ class ProfileEditor:
             proxy=resolve_account_proxy(account.proxy_url, self._cfg.proxy),
             account_name=account.name,
             simulator=self._simulator,
+            engine=account.engine,
+            geo_country=account.geo_country or account.expected_country,
         )
         try:
             await runner.start()

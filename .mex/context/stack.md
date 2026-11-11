@@ -15,7 +15,7 @@ edges:
   - target: context/modules.md
     condition: when inspecting module implementations and code-grounded behaviors
 grounds_to: []
-last_updated: 2026-10-31
+last_updated: 2026-11-11
 mex:
   id: mx_01M69TVZYPF61YBDP3CQ4X9555
   type: architecture
@@ -39,6 +39,7 @@ mex:
 ## Core Technologies
 - **Python 3.11+ / 3.12+** — Primary runtime utilizing modern `asyncio`, type union operators (`X | Y`), and strict static typing.
 - **Camoufox (`camoufox[geoip]`)** — Anti-detect stealth browser based on Firefox/Gecko with C++-level anti-fingerprinting, WebRTC IP masking, canvas/audio noise, and geo-affinity.
+- **Google Chrome via `patchright`** — optional per-account engine (`accounts.engine = chrome`) on Windows: protocol-patched Playwright driving the installed Chrome (`channel="chrome"`), isolated profile under `test_sessions/chrome/`. Chrome 127+ App-Bound Encryption (v20) makes its cookie DB unreadable, hence `heartbeat_state.bin`. No SOCKS5 proxy with a login (Chrome cannot authenticate to it).
 - **SQLite 3 via `aiosqlite`** — Local persistent datastore with WAL mode, parameterized queries, and ACID transaction isolation.
 - **Windows DPAPI (`crypt32.dll` via ctypes)** — Native Windows Current-User Data Protection API for symmetric encryption of credentials at rest.
 
@@ -52,7 +53,7 @@ mex:
 
 ## What We Deliberately Do NOT Use
 - **No Selenium or Puppeteer** — Standard automation frameworks easily detected by Google bot protections; Camoufox with Playwright async API is strictly enforced.
-- **No Chromium / Chrome DevTools Protocol (CDP)** — Chromium-based automation leaks CDP runtime domain instrumentation; Gecko-based Camoufox modifies the browser engine directly.
+- **No stock Chromium / unpatched CDP automation** — plain Chromium automation leaks CDP runtime domain instrumentation; Gecko-based Camoufox modifies the browser engine directly, and the Chrome engine is allowed only through `patchright`.
 - **No ORM (e.g. SQLAlchemy, Tortoise)** — Asynchronous raw SQL via `aiosqlite` is used directly to maintain minimal footprint, zero migration drift, and maximum performance.
 - **No plain text credentials in SQLite** — Sensitive fields (`password`, `totp_secret`) must be encrypted via `secret_store.protect_secret()` before database insertion.
 

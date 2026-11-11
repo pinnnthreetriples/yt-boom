@@ -10,10 +10,12 @@ from urllib.parse import quote
 
 from camoufox.async_api import AsyncCamoufox
 from loguru import logger
-from playwright.async_api import Error as PlaywrightError
+from modules.browser_errors import PlaywrightError
 from pydantic import BaseModel, ConfigDict
 
-from config import BrowserSettings, TargetSettings, parse_proxy
+from config import BrowserSettings, EngineType, TargetSettings, parse_proxy, validate_proxy_for_engine
+from modules.chrome_launcher import ensure_chrome_executable, get_chrome_args, prepare_chrome_profile, resolve_geo_timezone
+from modules.chrome_session import save_chrome_heartbeat_state
 from modules.fingerprint_manager import get_or_create_fingerprint, host_webgl_config, is_compatible
 from modules.interaction_simulator import InteractionError, InteractionSimulator
 from modules.page_helpers import CONSENT_ACCEPT_SELECTORS, SIGN_IN_LINK, first_visible
@@ -92,10 +94,15 @@ class YouTubeRunner:
         artifacts_dir: Path | None = None,
         rng: random.Random | None = None,
         locale: str | None = None,
+        engine: EngineType = "camoufox",
+        geo_country: str | None = None,
     ) -> None:
         self._cfg = browser_settings
         self._target = target
         self._account_name = account_name
+        self._engine: EngineType = engine
+        self._geo_country = geo_country  # Chrome: time zone fallback when the exit country cannot be resolved
+        self._explicit_locale = locale  # the account's own locale: wins over the country default of Chrome
         self._locale = locale or browser_settings.locale  # the account's own locale, else browser.locale
         if proxy is not _UNSET:
             self._proxy = proxy
@@ -109,9 +116,15 @@ class YouTubeRunner:
         self._rng = rng or random.Random()
         self._simulator = simulator or InteractionSimulator(rng=self._rng)
         self._camoufox: Any | None = None
+        self._patchright_driver: Any | None = None
+        self._cached_user_agent: str | None = None
         self._context: Any | None = None
         self._page: Any | None = None
         self._managed_session = False
+
+    @property
+    def engine(self) -> EngineType:
+        return self._engine
 
     @property
     def session_dir(self) -> Path:
@@ -182,9 +195,11 @@ class YouTubeRunner:
         """Launch persistent browser session once and keep it open across comments."""
         if self.is_running:
             return self._page
-        if self._camoufox is not None:  # the page was closed under us: release the old browser and its profile lock first
-            await self.close()
+        if self._camoufox is not None or self._patchright_driver is not None:
+            await self.close()  # the page was closed under us: release the old browser and its profile lock first
         self._prepare_dirs()
+        if self._engine == "chrome":
+            return await self._start_chrome()
         options = await asyncio.to_thread(self._launch_options)  # fingerprint file and GPU table reads must not stall the loop
         self._camoufox = AsyncCamoufox(**options)
         try:
@@ -210,8 +225,53 @@ class YouTubeRunner:
         self._managed_session = True
         return self._page
 
+    async def _start_chrome(self) -> Any:
+        """Google Chrome through patchright: own profile folder, locale and time zone of the exit country."""
+        validate_proxy_for_engine(self._proxy, "chrome")  # the account proxy or the global one: SOCKS5 with a login fails
+        await asyncio.to_thread(ensure_chrome_executable)
+        await asyncio.to_thread(prepare_chrome_profile, self._session_dir)
+        tz, loc = await resolve_geo_timezone(self._proxy, self._geo_country, self._explicit_locale)
+        chrome_args = get_chrome_args(locale=loc)
+
+        from patchright.async_api import async_playwright as async_patchright
+
+        self._patchright_driver = await async_patchright().start()
+        try:
+            self._context = await self._patchright_driver.chromium.launch_persistent_context(
+                user_data_dir=str(self._session_dir),
+                channel="chrome",
+                headless=self._cfg.headless,
+                args=chrome_args,
+                proxy=parse_proxy(self._proxy),
+                locale=loc,
+                timezone_id=tz,
+                no_viewport=True,
+            )
+        except BaseException:
+            driver, self._patchright_driver, self._context = self._patchright_driver, None, None
+            try:
+                await driver.stop()
+            except Exception as exc:
+                logger.debug("Ошибка при остановке драйвера patchright после неудачного запуска: {}", exc)
+            raise
+
+        pages = getattr(self._context, "pages", [])
+        self._page = pages[0] if pages else await self._context.new_page()
+        self._page.set_default_timeout(self._target.wait_timeout_ms)
+        self._page.set_default_navigation_timeout(self._cfg.navigation_timeout_ms)
+        # The UA is read once right after the start: the heartbeat replays it later without a browser
+        try:
+            self._cached_user_agent = await self._page.evaluate("() => navigator.userAgent")
+        except Exception:
+            self._cached_user_agent = None
+        self._managed_session = True
+        return self._page
+
     async def close(self) -> None:
         """Close browser session at the end of the batch and save cookies."""
+        if self._engine == "chrome":
+            await self._close_chrome()
+            return
         if self._camoufox is not None:
             try:
                 await self._camoufox.__aexit__(None, None, None)
@@ -222,6 +282,29 @@ class YouTubeRunner:
                 self._context = None
                 self._page = None
                 self._managed_session = False
+
+    async def _close_chrome(self) -> None:
+        """Save the heartbeat state (cookies are v20-encrypted in the profile), close the context, stop the driver."""
+        context, driver = self._context, self._patchright_driver
+        self._context = self._page = None
+        self._patchright_driver = None
+        self._managed_session = False
+        if context is not None:
+            try:
+                await save_chrome_heartbeat_state(
+                    profile_dir=self._session_dir, context=context, user_agent=self._cached_user_agent
+                )
+            except Exception as exc:
+                logger.warning("Не удалось сохранить heartbeat_state.bin: {}", exc)
+            try:
+                await context.close()
+            except Exception as exc:
+                logger.debug("Ошибка при закрытии сессии Chrome: {}", exc)
+        if driver is not None:
+            try:
+                await driver.stop()
+            except Exception as exc:
+                logger.debug("Ошибка при остановке драйвера patchright: {}", exc)
 
     async def __aenter__(self) -> YouTubeRunner:
         await self.start()
@@ -563,7 +646,7 @@ class YouTubeRunner:
             async with page.expect_response(lambda r: "/comment/create_comment" in r.url, timeout=15000) as sent:
                 await self._simulator.click_locator(page, submit_btn, verify_hit=True)
             response = await sent.value
-        except (InteractionError, PlaywrightError) as exc:
+        except (InteractionError, *PlaywrightError) as exc:
             raise SubmissionError(f"reply was not submitted: {exc}") from exc
         if not response.ok:
             raise SubmissionError(f"YouTube rejected the reply: HTTP {response.status}")

@@ -227,8 +227,29 @@ def check_proxy_connectivity(proxy_url: str | None, timeout: float = 6.0) -> tup
     return False, "Не удалось проверить сетевое соединение"
 
 
+def _check_chrome_session(session_dir: Path) -> tuple[bool, str]:
+    """Chrome keeps its cookies v20-encrypted: the sign-in is read from the `heartbeat_state.bin` the runner exported."""
+    from modules.chrome_session import chrome_login_info_expiry, heartbeat_state_path
+
+    if not session_dir.exists() or not heartbeat_state_path(session_dir).exists():
+        return False, "Сессия отсутствует (нужен вход)"
+    present, expiry = chrome_login_info_expiry(session_dir)
+    if not present:
+        return False, "Гостевой режим (вход в аккаунт НЕ выполнен)"
+    if expiry is not None and expiry <= time.time():
+        return False, "Сессия истекла (нужен вход)"
+    return True, "Авторизован (сессия активна)"
+
+
+def check_account_session(session_dir: Path, engine: str = "camoufox") -> tuple[bool, str]:
+    """`check_youtube_session` for the account's engine: Camoufox reads `cookies.sqlite`, Chrome its exported state."""
+    if engine == "chrome":
+        return _check_chrome_session(session_dir)
+    return check_youtube_session(session_dir)
+
+
 def check_youtube_session(session_root: Path) -> tuple[bool, str]:
-    """Check whether a valid YouTube/Google authenticated session exists."""
+    """Check whether a valid YouTube/Google authenticated session exists (a Camoufox profile)."""
     if (session_root / "cookies.sqlite").exists():
         session_dir = session_root
     else:
@@ -541,12 +562,15 @@ def _setup_proxy_table(accounts: list[tuple[Any, bool]]) -> None:
 
 def _setup_account_rows(accounts: list[tuple[Any, bool]]) -> list[MenuRow | None]:
     """One selectable row per account (key A1, A2, …): name, login state and proxy."""
-    proxy_w = MENU_WIDTH - 3 - 24 - 2 - 11 - 2
+    from modules.ui.icons import engine_icon, icon_cells
+
+    proxy_w = MENU_WIDTH - 3 - 24 - 2 - 11 - 2 - icon_cells() - 1
     rows: list[MenuRow | None] = []
     for i, (acc, ok) in enumerate(accounts, 1):
         proxy = _fit(mask_proxy(acc.proxy_url) if acc.proxy_url else "без прокси", proxy_w)
         state = "● вошёл" if ok else "○ нет входа"
-        rows.append((f"A{i}", _fit(acc.name, 24), f"{state:<11}  {proxy}", CLR_GREEN if ok else CLR_YELLOW))
+        detail = f"{state:<11}  {engine_icon(_engine_of(acc))} {proxy}"
+        rows.append((f"A{i}", _fit(acc.name, 24), detail, CLR_GREEN if ok else CLR_YELLOW))
     return rows
 
 
@@ -647,10 +671,14 @@ def _setup_account_actions(
 
     Returns the notice to show (None = nothing happened).
     """
+    from modules.ui.icons import engine_icon, engine_title
+
     acc = entry[0]
+    engine = _engine_of(acc)
     rows: list[MenuRow | None] = [
         ("4", "Войти автоматически", "по почте и паролю аккаунта", CLR_DIM),
         ("1", "Проверить вход", "", ""),
+        ("5", "Браузер: Camoufox / Google Chrome", f"сейчас {engine_icon(engine)} {engine_title(engine)}", CLR_DIM),
         ("2", "Переименовать", "имя для вас: ник или почта", CLR_DIM),
         ("3", "Выйти из аккаунта", "удалить сохранённую сессию", CLR_DIM),
         None,
@@ -660,8 +688,10 @@ def _setup_account_actions(
     if choice == "4":
         return _setup_auto_login(config_path, acc)
     if choice == "1":
-        ok = check_youtube_session(Path(acc.session_path))[0]
+        ok = check_account_session(Path(acc.session_path), _engine_of(acc))[0]
         return ("ok", f"«{acc.name}»: вход выполнен") if ok else ("warn", f"«{acc.name}»: нет входа")
+    if choice == "5":
+        return _setup_switch_engine(config_path, acc, logged_in=entry[1])
     if choice == "2":
         return _setup_rename(config_path, accounts, acc)
     if choice == "3":
@@ -673,6 +703,54 @@ def _setup_account_actions(
         ok, msg = _setup_clear_session(session_root, acc)
         return ("ok" if ok else "err", msg)
     return None
+
+
+ENGINE_SWITCH_CONFIRM = (
+    "Смена движка потребует отдельной авторизации в Google под новым браузером "
+    "(текущий профиль старого браузера сохранится). Переключить? (y/N)"
+)
+
+
+def _setup_switch_engine(config_path: Path, acc: Any, logged_in: bool) -> tuple[str, str] | None:
+    """«Браузер»: toggle the account between Camoufox and Google Chrome (each keeps its own profile folder).
+
+    An account that is signed in is asked first: the other browser needs its own sign-in. The choice is mirrored into
+    config.yaml, which otherwise would put the old profile folder back at the next start.
+    Returns the notice to show (None = cancelled).
+    """
+    from modules.ui.icons import engine_title, other_engine
+
+    new_engine = other_engine(_engine_of(acc))
+    if logged_in:
+        try:
+            if not _yes(prompt_user(ENGINE_SWITCH_CONFIRM, "n")):
+                return None
+        except WizardBack:
+            return None
+    try:
+        updated = _pools_db(config_path, lambda db: db.set_account_engine(acc.id, new_engine))
+    except ValueError as exc:
+        return "err", f"Не удалось сменить браузер: {exc}"
+    _setup_engine_in_config(config_path, acc.name, updated.engine, updated.session_path)
+    return "ok", f"«{acc.name}»: браузер — {engine_title(updated.engine)}. Нужен вход в новом браузере"
+
+
+def _setup_engine_in_config(config_path: Path, name: str, engine: str, session_path: str) -> None:
+    """Write `engine` and the new `session_path` into the account's entries of config.yaml (when it has any)."""
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        browser = raw.get("browser") if isinstance(raw.get("browser"), dict) else {}
+        changed = False
+        for lst in (raw.get("accounts"), browser.get("accounts")):
+            for item in lst if isinstance(lst, list) else []:
+                if isinstance(item, dict) and item.get("name") == name:
+                    item["engine"] = engine
+                    item["session_path"] = session_path
+                    changed = True
+        if changed:
+            config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    except Exception as exc:
+        safe_print(f" {color('[!]', CLR_YELLOW)} Не удалось синхронизировать config.yaml: {exc}")
 
 
 def _setup_auto_login(config_path: Path, acc: Any) -> tuple[str, str] | None:
@@ -708,9 +786,14 @@ def _setup_auto_login(config_path: Path, acc: Any) -> tuple[str, str] | None:
 _SETUP_MAX_ACCOUNTS = 8
 
 
+def _engine_of(acc: Any) -> str:
+    """`camoufox` or `chrome` of an account record (anything else counts as Camoufox)."""
+    return "chrome" if getattr(acc, "engine", None) == "chrome" else "camoufox"
+
+
 def _setup_accounts(config_path: Path) -> list[tuple[Any, bool]]:
     """Accounts (DB, seeded from config.yaml — a fresh config gives «default») with their login state."""
-    return [(a, check_youtube_session(Path(a.session_path))[0]) for a in load_accounts(config_path)]
+    return [(a, check_account_session(Path(a.session_path), _engine_of(a))[0]) for a in load_accounts(config_path)]
 
 
 def _setup_accounts_table(accounts: list[tuple[Any, bool]]) -> None:
@@ -1147,7 +1230,7 @@ def _setup_lifecycle(config_path: Path) -> None:
         tui.status_line("warn", "Аккаунтов нет — добавьте или импортируйте")
         _pause()
         return
-    rows = lifecycle_rows(accounts, lambda a: check_session_offline(a.session_path, a.name).is_alive)
+    rows = lifecycle_rows(accounts, lambda a: check_session_offline(a.session_path, a.name, _engine_of(a)).is_alive)
     shown = rows[:_LIFECYCLE_MAX_ROWS]
     stage_w, quota_w, beat_w = 10, 5, 15
     name_w = min(18, max(len("Аккаунт"), *(len(row.name) for row in shown)))  # accounts are often named by e-mail
@@ -1612,14 +1695,17 @@ def _logged_in_names(cfg: Any) -> list[str]:
         uri = f"file:{quote(Path(cfg.app.db_path).as_posix(), safe='/:')}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
         try:
-            rows = conn.execute("SELECT name, session_path FROM accounts ORDER BY id").fetchall()
+            try:
+                rows = conn.execute("SELECT name, session_path, engine FROM accounts ORDER BY id").fetchall()
+            except sqlite3.OperationalError:  # a database from before the engine column
+                rows = [(*row, "camoufox") for row in conn.execute("SELECT name, session_path FROM accounts ORDER BY id")]
         finally:
             conn.close()
     except sqlite3.Error:
         rows = []
     if not rows:
         return ["default"] if check_youtube_session(cfg.browser.session_root)[0] else []
-    return [name for name, path in rows if check_youtube_session(Path(path))[0]]
+    return [name for name, path, engine in rows if check_account_session(Path(path), engine)[0]]
 
 
 def _reply_templates_row(templates: list[str]) -> tuple[str, str]:
@@ -2125,7 +2211,7 @@ def list_accounts_wizard(config_path: Path) -> list[dict[str, Any]]:
 
     safe_print(color(f" {'#':<2} {'Аккаунт':<18} {'Вход':<6} {'Ответов':>7}  Прокси", CLR_DIM))
     for idx, acc in enumerate(accounts, 1):
-        is_logged, _ = check_youtube_session(Path(acc.session_path))
+        is_logged, _ = check_account_session(Path(acc.session_path), _engine_of(acc))
         name = color(f"{_fit(acc.name, 18):<18}", "" if acc.is_active else CLR_DIM)
         login = color(f"{'● да' if is_logged else '○ нет':<6}", CLR_DIM if is_logged else CLR_YELLOW)
         proxy = _fit(mask_proxy(acc.proxy_url) if acc.proxy_url else "без прокси", 22)
@@ -2311,7 +2397,7 @@ def login_account_wizard(config_path: Path) -> bool:
     else:
         rows: list[MenuRow | None] = [("N", "＋ Новый аккаунт", "имя и вход в Google", CLR_DIM)]
         for idx, acc in enumerate(accounts, 1):
-            logged = check_youtube_session(Path(acc.session_path))[0]
+            logged = check_account_session(Path(acc.session_path), _engine_of(acc))[0]
             rows.append((str(idx), _fit(acc.name, 24), "● вошёл" if logged else "○ нет входа", CLR_DIM if logged else CLR_YELLOW))
         rows += [None, ("0", "← Назад", "", "")]
         choice = _pools_choice(rows, [color(" Вход в аккаунт", CLR_BOLD)], selected=1)

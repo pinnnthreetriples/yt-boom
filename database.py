@@ -15,6 +15,7 @@ import aiosqlite
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
+from config import EngineType, get_account_session_path, validate_proxy_for_engine
 from secret_store import SecretStoreError, protect_secret, reveal_secret
 
 NodeStatus = Literal["idle", "busy", "cooldown", "disabled"]
@@ -111,7 +112,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     is_active           INTEGER NOT NULL DEFAULT 1,
     total_replies       INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT    NOT NULL,
-    last_used_at        TEXT
+    last_used_at        TEXT,
+    engine              TEXT    NOT NULL DEFAULT 'camoufox'
 );
 
 CREATE TABLE IF NOT EXISTS video_pool (
@@ -141,6 +143,7 @@ _ACCOUNT_AUTH_COLUMNS: tuple[tuple[str, str], ...] = (
     ("geo_country", "TEXT"),
     ("expected_country", "TEXT"),
     ("locale", "TEXT"),
+    ("engine", "TEXT NOT NULL DEFAULT 'camoufox'"),
 )
 
 _ACCOUNT_LIFECYCLE_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -300,6 +303,7 @@ class AccountRecord(BaseModel):
     geo_country: str | None = None
     expected_country: str | None = None
     locale: str | None = None
+    engine: EngineType = "camoufox"
     lifecycle_stage: str = "quarantine"
     authenticated_at: str | None = None
     quarantine_until: str | None = None
@@ -1326,6 +1330,7 @@ class Database:
                 current = self._account_from_row(row)
                 new_session = current.session_path if isinstance(session_path, _Unset) else session_path
                 new_proxy = current.proxy_url if isinstance(proxy_url, _Unset) else proxy_url
+                validate_proxy_for_engine(new_proxy, current.engine)
                 new_active = current.is_active if isinstance(is_active, _Unset) else bool(is_active)
                 new_country = current.geo_country if isinstance(geo_country, _Unset) else geo_country
                 new_expected = current.expected_country if isinstance(expected_country, _Unset) else expected_country
@@ -1416,6 +1421,44 @@ class Database:
             cursor = await conn.execute("UPDATE accounts SET auth_status = ? WHERE id = ?", (status, account_id))
             if cursor.rowcount == 0:
                 raise RecordNotFoundError(f"account id={account_id} not found")
+
+    async def set_account_engine(self, account_id: int, engine: EngineType) -> AccountRecord:
+        """Switch the account's browser engine and point `session_path` at that engine's own profile folder.
+
+        The profile of the other engine stays on disk untouched; the new engine needs its own sign-in. The folder
+        becomes `<session_root>/<name>` (Camoufox) or `<session_root>/chrome/<name>` (Chrome), where `session_root` is
+        the stored path's parent (its `chrome` level removed). Raises ValueError for an unknown engine or when the
+        account's proxy cannot be used by Chrome (SOCKS5 with a login), RecordNotFoundError for an unknown account.
+        """
+        if engine not in ("camoufox", "chrome"):
+            raise ValueError(f"unknown engine: {engine!r}")
+        async with self._transaction() as conn:
+            row = await (await conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))).fetchone()
+            if row is None:
+                raise RecordNotFoundError(f"account id={account_id} not found")
+            current = self._account_from_row(row)
+            validate_proxy_for_engine(current.proxy_url, engine)
+            if current.engine == engine:
+                new_path = current.session_path
+            else:
+                folder = Path(current.session_path)
+                if current.engine == "chrome" and folder.parent.name == "chrome":
+                    root = folder.parent.parent
+                else:
+                    root = folder.parent
+                new_path = str(get_account_session_path(root, current.name, engine))
+                if current.engine == "chrome" and folder.parent.name != "chrome":
+                    logger.warning(
+                        "Аккаунт {!r}: путь сессии Chrome {} нестандартный, новая папка вычислена от {}",
+                        current.name, current.session_path, root,
+                    )
+            await conn.execute(
+                "UPDATE accounts SET engine = ?, session_path = ? WHERE id = ?", (engine, new_path, account_id)
+            )
+            row = await (await conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))).fetchone()
+        account = self._account_from_row(row)
+        logger.info("Аккаунт {!r}: движок {}, профиль {}", account.name, account.engine, account.session_path)
+        return account
 
     async def set_account_geo_country(self, account_id: int, geo_country: str | None) -> None:
         async with self._transaction() as conn:

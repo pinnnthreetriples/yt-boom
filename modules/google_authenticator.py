@@ -10,8 +10,9 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from loguru import logger
-from playwright.async_api import Error as PlaywrightError
 
+from modules.browser_errors import PlaywrightError
+from modules.chrome_session import save_chrome_heartbeat_state
 from modules.dom_snapshot import redact, sanitize_html
 from modules.interaction_simulator import InteractionError, InteractionSimulator
 from modules.page_helpers import CONSENT_REJECT_SELECTORS, SIGN_IN_LINK, first_visible
@@ -172,10 +173,30 @@ def write_session_owner(session_dir: Path | str, email: str) -> None:
 class GoogleAuthenticator:
     """Signs a Camoufox persistent context into YouTube through the regular Google sign-in flow."""
 
-    def __init__(self, simulator: InteractionSimulator, artifacts_dir: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        simulator: InteractionSimulator,
+        artifacts_dir: Path | str | None = None,
+        chrome_profile_dir: Path | str | None = None,
+    ) -> None:
         self._simulator = simulator
         self._artifacts_dir = Path(artifacts_dir) if artifacts_dir is not None else None  # None: no unknown-screen dump
+        # Chrome profile folder: after a successful sign-in the cookies are exported to its heartbeat_state.bin right away
+        self._chrome_profile_dir = Path(chrome_profile_dir) if chrome_profile_dir is not None else None
         self.detected_country: str | None = None
+
+    async def _save_chrome_state(self, context: Any, page: Any | None = None) -> None:
+        """Chrome only, best effort: persist the signed-in cookies without waiting for the browser to close."""
+        if self._chrome_profile_dir is None:
+            return
+        try:
+            if page is None:
+                pages = getattr(context, "pages", None) or []
+                page = pages[0] if pages else None
+            user_agent = await page.evaluate("() => navigator.userAgent") if page is not None else None
+            await save_chrome_heartbeat_state(self._chrome_profile_dir, context, user_agent)
+        except Exception as exc:
+            logger.warning("Не удалось сохранить heartbeat_state.bin после входа: {}", exc)
 
     async def is_session_authenticated(self, context: Any) -> bool:
         """Zero-risk fast path: a live LOGIN_INFO cookie on .youtube.com means the profile is already signed in."""
@@ -220,6 +241,7 @@ class GoogleAuthenticator:
             logger.info("Сессия профиля принадлежит другому аккаунту, куки сброшены, выполняется вход заново")
         elif await self.is_session_authenticated(context):
             logger.info("Сессия уже авторизована (LOGIN_INFO найден), вход пропущен")
+            await self._save_chrome_state(context)
             return True
 
         page = await context.new_page()
@@ -239,6 +261,7 @@ class GoogleAuthenticator:
                     logger.info("Определён гео-регион аккаунта: {}", self.detected_country)
             except Exception as exc:
                 logger.debug("Не удалось определить страну аккаунта: {}", exc)
+            await self._save_chrome_state(context, page)
             logger.success("Авторизация в YouTube завершена")
             return True
         except Exception as exc:
@@ -345,7 +368,7 @@ class GoogleAuthenticator:
                 if await self._any_visible(page, CAPTCHA_MARKERS) or "recaptcha" in url:
                     raise GoogleAuthError("Google запросил капчу: пройдите её вручную (--login)")
                 screen = await self._handle_screen(page, state)
-            except (InteractionError, PlaywrightError) as exc:  # the page navigated under the cursor
+            except (InteractionError, *PlaywrightError) as exc:  # the page navigated under the cursor
                 logger.debug("Экран {} изменился во время действия: {}", path, exc)
                 await asyncio.sleep(FIELD_POLL_SECONDS)
                 continue

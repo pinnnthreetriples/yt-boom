@@ -5,7 +5,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from playwright.async_api import Error as PlaywrightError
+from modules.browser_errors import PlaywrightError
 
 # Structural handles only: the bot runs accounts in any UI language, and visible text, `aria-label` and `title` are
 # localized (verified in en/ru/pl, see .mex/patterns/youtube-reply-flow.md). A text selector is never acceptable here.

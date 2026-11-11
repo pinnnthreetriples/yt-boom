@@ -220,6 +220,7 @@ class Orchestrator:
             simulator=self._simulator,
             artifacts_dir=self._cfg.browser.session_root / "_artifacts",
             rng=self._rng,
+            engine=self._cfg.browser.default_engine,
         )
         job = await self._db.enqueue(
             "submit",

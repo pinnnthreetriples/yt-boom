@@ -16,7 +16,7 @@ edges:
   - target: context/conventions.md
     condition: when extending or modifying module code
 grounds_to: []
-last_updated: 2026-11-01
+last_updated: 2026-11-11
 mex:
   id: mx_01M69V83DQFH77W8JJ4KS4EWP9
   type: component
@@ -40,6 +40,7 @@ mex:
 ## Overview
 The `modules/` directory contains the core implementation layer of the YouTube comment reply and telemetry pipeline:
 - **`youtube_runner.py` & `ui_test_runner.py`**: Browser automation engine managing Camoufox lifecycles, DOM traversal, permalink navigation, and response interception.
+- **`chrome_launcher.py` & `chrome_session.py`**: the Google Chrome engine (patchright): Chrome detect/install, profile prep (stale locks, `Default/Preferences` merge), launch flags, exit-country time zone and locale; DPAPI `heartbeat_state.bin` export/import of Google and YouTube cookies. `browser_errors.PlaywrightError` is the tuple of playwright's and patchright's `Error` classes — use `except (X, *PlaywrightError)` when combining.
 - **`google_authenticator.py` & `totp_helper.py`**: Automated Google account authentication, 2FA challenge handling, and security speedbump resolution.
 - **`account_parser.py`, `fingerprint_manager.py` & `secret_store.py`**: Account credential parsing, hardware fingerprint generation/pinning, and Windows DPAPI encryption.
 - **`youtube_collector.py` & `collector.py`**: High-performance HTTP-level InnerTube search and nested comment thread extraction.

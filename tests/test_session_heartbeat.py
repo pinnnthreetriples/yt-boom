@@ -291,6 +291,7 @@ class TestSessionHeartbeat(unittest.IsolatedAsyncioTestCase):
                 proxy="http://user:pass@1.2.3.4:8080",
                 timeout=15.0,
                 locale="en-US",
+                engine="camoufox",
             )
 
 

@@ -148,12 +148,14 @@ class MultiAccountOrchestrator:
         """Ensure all accounts defined in config are registered in the database."""
         await self.ensure_db()
         for acc in self._cfg.browser.accounts:
-            await self._db.upsert_account(
+            record = await self._db.upsert_account(
                 name=acc.name,
                 session_path=acc.session_path,
                 proxy_url=acc.proxy_url,
                 is_active=acc.is_active,
             )
+            if record.engine != acc.engine:  # config.yaml names the engine; its profile folder follows the engine
+                await self._db.set_account_engine(record.id, acc.engine)
         return await self._db.list_active_accounts()
 
     def create_runner(self, acc: AccountRecord) -> Any:
@@ -169,6 +171,8 @@ class MultiAccountOrchestrator:
             simulator=self._simulator,
             rng=self._rng,
             locale=acc.locale,
+            engine=acc.engine,
+            geo_country=acc.geo_country or acc.expected_country,
         )
 
     async def _get_runner(self, acc: AccountRecord) -> Any:
@@ -219,7 +223,8 @@ class MultiAccountOrchestrator:
         """
         if acc.auth_status == "failed":
             return False
-        if acc.auth_status == "pending" and acc.email and not (Path(acc.session_path) / "cookies.sqlite").exists():
+        saved_session = "heartbeat_state.bin" if acc.engine == "chrome" else "cookies.sqlite"  # Chrome's cookie DB is encrypted
+        if acc.auth_status == "pending" and acc.email and not (Path(acc.session_path) / saved_session).exists():
             return False
         return True
 

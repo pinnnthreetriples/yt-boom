@@ -14,10 +14,13 @@ from loguru import logger
 
 from config import parse_proxy, resolve_account_proxy
 from database import AccountRecord
+from modules.chrome_session import chrome_login_info_expiry, load_chrome_heartbeat_state
 from modules.fingerprint_manager import load_fingerprint
 
-# Sessions are made by Camoufox (Firefox): the request must look like Firefox, not like a Chrome replaying the cookies.
+# Camoufox sessions (Firefox): the request must look like Firefox, not like a Chrome replaying the cookies.
 HEARTBEAT_IMPERSONATE = "firefox155"  # closest curl_cffi TLS profile to the installed Firefox 156
+# Chrome sessions: a Chrome TLS profile (the newest curl_cffi knows, not above the cached UA's major version).
+CHROME_IMPERSONATE_FALLBACK = "chrome124"
 
 
 def curl_proxy_url(proxy: str | None) -> str | None:
@@ -114,12 +117,29 @@ def _no_login_info(session_dir: str | Path, account_name: str) -> HeartbeatStatu
     )
 
 
-def check_session_offline(session_dir: str | Path, account_name: str = "default") -> HeartbeatStatus:
+def read_chrome_login_info_metadata(session_dir: str | Path) -> tuple[bool, str | None, float | None]:
+    """LOGIN_INFO presence and expiry of a Chrome profile, from its saved `heartbeat_state.bin` (the cookie DB is v20-encrypted)."""
+    present, expiry = chrome_login_info_expiry(session_dir)
+    if not present:
+        return False, None, None
+    if expiry is None:
+        return True, None, None
+    dt = datetime.datetime.fromtimestamp(expiry, tz=datetime.timezone.utc)
+    return True, dt.strftime("%Y-%m-%d %H:%M:%S UTC"), round(max(0.0, (expiry - time.time()) / 86400.0), 1)
+
+
+def _login_info_metadata(session_dir: str | Path, engine: str) -> tuple[bool, str | None, float | None]:
+    if engine == "chrome":
+        return read_chrome_login_info_metadata(session_dir)
+    return read_login_info_metadata(session_dir)
+
+
+def check_session_offline(session_dir: str | Path, account_name: str = "default", engine: str = "camoufox") -> HeartbeatStatus:
     """Routine status from the profile alone, no network: LOGIN_INFO present and not expired.
 
     A session revoked on Google's side is not seen here; `check_session_heartbeat` asks YouTube.
     """
-    has_login_info, expires_at_str, days_left = read_login_info_metadata(session_dir)
+    has_login_info, expires_at_str, days_left = _login_info_metadata(session_dir, engine)
     if not has_login_info:
         return _no_login_info(session_dir, account_name)
     expired = days_left is not None and days_left <= 0
@@ -168,22 +188,74 @@ def fingerprint_headers(session_dir: str | Path, locale: str = "en-US") -> dict[
     return headers
 
 
+def chrome_impersonate_profile(user_agent: str | None = None) -> str:
+    """curl_cffi TLS profile for a Chrome session: the newest `chromeNNN` not above the UA's major, else the newest known."""
+    versions: list[int] = []
+    try:
+        from curl_cffi.requests import BrowserType
+
+        versions = sorted(int(m.group(1)) for member in BrowserType if (m := re.fullmatch(r"chrome(\d+)", str(member.value))))
+    except Exception as exc:
+        logger.debug("Could not list curl_cffi browser profiles: {}", exc)
+    if not versions:
+        return CHROME_IMPERSONATE_FALLBACK
+    match = re.search(r"Chrome/(\d+)", user_agent or "")
+    if match:
+        not_above = [v for v in versions if v <= int(match.group(1))]
+        if not_above:
+            return f"chrome{not_above[-1]}"
+    return f"chrome{versions[-1]}"
+
+
+def chrome_client_hints(user_agent: str) -> dict[str, str]:
+    """`sec-ch-ua*` headers matching a Chrome user agent; empty when the UA is not Chrome's."""
+    match = re.search(r"Chrome/(\d+)", user_agent)
+    if not match:
+        return {}
+    major = match.group(1)
+    platform = "Windows" if "Windows" in user_agent else "macOS" if "Macintosh" in user_agent else "Linux"
+    return {
+        "sec-ch-ua": f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not.A/Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": f'"{platform}"',
+    }
+
+
+def chrome_headers(user_agent: str | None, locale: str) -> dict[str, str]:
+    """Headers a Chrome page of this account sends to YouTube: the UA cached at its launch, client hints, Origin."""
+    headers: dict[str, str] = {"Accept-Language": _camoufox_accept_language(locale), "Origin": "https://www.youtube.com"}
+    if user_agent:
+        user_agent = user_agent.replace("HeadlessChrome/", "Chrome/")  # a headless run caches the headless UA; HTTP never says so
+        headers["User-Agent"] = user_agent
+        headers.update(chrome_client_hints(user_agent))
+    return headers
+
+
 async def check_session_heartbeat(
     session_dir: str | Path,
     account_name: str = "default",
     proxy: str | None = None,
     timeout: float = 15.0,
     locale: str = "en-US",
+    engine: str = "camoufox",
 ) -> HeartbeatStatus:
     """Send lightweight HTTP request to YouTube to verify session validity without launching a browser.
 
-    Cookies are only read from the profile; rotated Set-Cookie values are not written back (the browser owns the DB).
+    Cookies are only read from the profile (Camoufox: `cookies.sqlite`; Chrome: the `heartbeat_state.bin` the runner
+    saved); rotated Set-Cookie values are not written back (the browser owns the profile).
     """
-    has_login_info, expires_at_str, days_left = read_login_info_metadata(session_dir)
+    has_login_info, expires_at_str, days_left = _login_info_metadata(session_dir, engine)
     if not has_login_info:
         return _no_login_info(session_dir, account_name)
 
-    cookies =read_youtube_cookies(session_dir)
+    if engine == "chrome":
+        cookies, cached_user_agent = load_chrome_heartbeat_state(session_dir)
+        impersonate = chrome_impersonate_profile(cached_user_agent)
+        headers = chrome_headers(cached_user_agent, locale)
+    else:
+        cookies = read_youtube_cookies(session_dir)
+        impersonate = HEARTBEAT_IMPERSONATE
+        headers = fingerprint_headers(session_dir, locale)
     if "LOGIN_INFO" not in cookies:
         return HeartbeatStatus(
             account_name=account_name,
@@ -194,10 +266,10 @@ async def check_session_heartbeat(
 
     try:
         async with AsyncSession(
-            impersonate=HEARTBEAT_IMPERSONATE,
+            impersonate=impersonate,
             proxy=curl_proxy_url(proxy),
             timeout=timeout,
-            headers=fingerprint_headers(session_dir, locale),
+            headers=headers,
         ) as session:
             resp = await session.get("https://www.youtube.com/", cookies=cookies)
             if resp.status_code != 200:
@@ -258,4 +330,5 @@ async def check_account_heartbeat(
         proxy=proxy,
         timeout=timeout,
         locale=account.locale or locale,
+        engine=account.engine,
     )
