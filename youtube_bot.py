@@ -401,7 +401,8 @@ async def _register_credentials_account(
     parsed = parse_account_line(spec, proxy=proxy_url, country=country, locale=locale)
     account_name = (name or parsed.default_name).strip()
     existing = await db.get_account(account_name)
-    new_engine = cfg.browser.default_engine if existing is None else "camoufox"  # only a new account takes the default engine
+    # only a new account takes the default engine (anything but "chrome" means Camoufox)
+    new_engine = "chrome" if existing is None and getattr(cfg.browser, "default_engine", None) == "chrome" else "camoufox"
     validate_proxy_for_engine(parsed.proxy, new_engine)
     upsert_args: dict[str, Any] = {
         "name": account_name,
