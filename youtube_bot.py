@@ -6,6 +6,8 @@ import inspect
 import os
 import random
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +15,14 @@ from typing import Any, Awaitable, Callable, Iterable, NamedTuple
 
 from loguru import logger
 
-from config import AppConfig, ProxyUnavailableError, load_config, mask_proxy_url, resolve_account_proxy
+from config import (
+    AppConfig,
+    ProxyUnavailableError,
+    load_config,
+    mask_proxy_url,
+    resolve_account_proxy,
+    validate_proxy_for_engine,
+)
 from database import (
     DEFAULT_PROJECT_NAME,
     REPLY_UNAVAILABLE_MARK,
@@ -194,6 +203,22 @@ async def _warn_country_disagreement(
         )
 
 
+@asynccontextmanager
+async def _login_browser(runner: YouTubeRunner, engine: str) -> AsyncIterator[Any]:
+    """The browser context of a manual sign-in: Camoufox with the runner's options, or Google Chrome through the runner."""
+    if engine == "chrome":
+        await runner.start()
+        try:
+            yield runner.context
+        finally:
+            await runner.close()  # saves heartbeat_state.bin while the context is still alive, then closes Chrome
+    else:
+        from camoufox.async_api import AsyncCamoufox
+
+        async with AsyncCamoufox(**runner.launch_options()) as context:
+            yield context
+
+
 async def interactive_login(
     config_path: str = "config.yaml",
     account_name: str | None = None,
@@ -205,8 +230,6 @@ async def interactive_login(
     The browser starts with the same options as automated runs (proxy, prefs, pinned fingerprint). When the
     window is closed with a live LOGIN_INFO cookie, the account is marked `authenticated`.
     """
-    from camoufox.async_api import AsyncCamoufox
-
     cfg = load_config(config_path)
     cfg.browser.headless = False
     db = _open_db(cfg)
@@ -249,7 +272,11 @@ async def interactive_login(
 
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Запуск браузера Camoufox для авторизации в YouTube (аккаунт: {!r})...", account_name or "default")
+    engine = acc.engine if acc is not None else "camoufox"
+    logger.info(
+        "Запуск браузера {} для авторизации в YouTube (аккаунт: {!r})...",
+        "Google Chrome" if engine == "chrome" else "Camoufox", account_name or "default",
+    )
     logger.info("Папка сохранения сессии: {}", session_dir)
     logger.info("Пожалуйста, выполните вход в свой аккаунт YouTube в открывшемся окне. После входа закройте браузер.")
 
@@ -260,20 +287,25 @@ async def interactive_login(
         proxy=proxy_url,
         account_name=account_name or "default",
         locale=acc.locale if acc is not None else None,
+        engine=engine,
+        geo_country=(acc.geo_country or acc.expected_country) if acc is not None else None,
     )
-    opts = runner.launch_options()
-    authenticator = GoogleAuthenticator(InteractionSimulator())
+    authenticator = GoogleAuthenticator(InteractionSimulator(), chrome_profile_dir=session_dir if engine == "chrome" else None)
     logged_in = False
 
     try:
-        async with AsyncCamoufox(**opts) as context:
+        async with _login_browser(runner, engine) as context:
             pages = getattr(context, "pages", [])
             page = pages[0] if pages else await context.new_page()
             await page.goto("https://www.youtube.com", wait_until="domcontentloaded")
             logger.info("Окно браузера открыто. Ожидание завершения авторизации пользователем...")
+            saved_chrome_state = False
             try:
                 while any(not p.is_closed() for p in getattr(context, "pages", [])):
                     logged_in = logged_in or await authenticator.is_session_authenticated(context)
+                    if logged_in and engine == "chrome" and not saved_chrome_state:
+                        await authenticator._save_chrome_state(context)  # the window may be closed any moment
+                        saved_chrome_state = True
                     await asyncio.sleep(0.5)
                 logged_in = logged_in or await authenticator.is_session_authenticated(context)
             except Exception:
@@ -369,6 +401,9 @@ async def _register_credentials_account(
     parsed = parse_account_line(spec, proxy=proxy_url, country=country, locale=locale)
     account_name = (name or parsed.default_name).strip()
     existing = await db.get_account(account_name)
+    # only a new account takes the default engine (anything but "chrome" means Camoufox)
+    new_engine = "chrome" if existing is None and getattr(cfg.browser, "default_engine", None) == "chrome" else "camoufox"
+    validate_proxy_for_engine(parsed.proxy, new_engine)
     upsert_args: dict[str, Any] = {
         "name": account_name,
         "email": parsed.email,
@@ -385,6 +420,8 @@ async def _register_credentials_account(
     if parsed.locale is not None:
         upsert_args["locale"] = parsed.locale
     account = await db.upsert_account(**upsert_args)
+    if new_engine != "camoufox":
+        account = await db.set_account_engine(account.id, new_engine)
     mode = parsed.lifecycle_mode or default_mode
     if mode is not None and mode != account.lifecycle_mode:
         await db.set_account_lifecycle_mode(account.id, mode)
@@ -465,12 +502,18 @@ async def _authenticate_account(
         simulator=simulator,
         proxy=proxy,
         locale=account.locale,
+        engine=account.engine,
+        geo_country=account.geo_country or account.expected_country,
     )
     authenticated = False
     new_status: str | None = None
     try:
         await runner.start()
-        authenticator = GoogleAuthenticator(simulator, artifacts_dir=cfg.browser.session_root / "_artifacts")
+        authenticator = GoogleAuthenticator(
+            simulator,
+            artifacts_dir=cfg.browser.session_root / "_artifacts",
+            chrome_profile_dir=account.session_path if account.engine == "chrome" else None,
+        )
         authenticated = await authenticator.authenticate(
             runner.context,
             account.email,
@@ -501,10 +544,11 @@ async def _authenticate_account(
         await db.set_account_auth_status(account.id, new_status)
     if authenticated:
         write_session_owner(account.session_path, account.email)
-        try:
-            await db.sync_account_fingerprint(account.id, Path(account.session_path))
-        except Exception as exc:
-            logger.debug("Не удалось синхронизировать отпечаток аккаунта {!r}: {}", account.name, exc)
+        if account.engine != "chrome":  # fingerprint.json is Camoufox's: Chrome keeps the real browser's own
+            try:
+                await db.sync_account_fingerprint(account.id, Path(account.session_path))
+            except Exception as exc:
+                logger.debug("Не удалось синхронизировать отпечаток аккаунта {!r}: {}", account.name, exc)
         await _intro_warm_up(db, cfg, account)
     return authenticated
 
@@ -671,9 +715,11 @@ async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml"
         all_alive = True
         for acc in accounts:
             if online:
-                res = await check_account_heartbeat(acc, locale=cfg.browser.locale)
+                res = await check_account_heartbeat(
+                    acc, locale=cfg.browser.locale, require_proxy=cfg.browser.require_proxy
+                )
             else:
-                res = check_session_offline(acc.session_path, acc.name)
+                res = check_session_offline(acc.session_path, acc.name, acc.engine)
             status_str = "ALIVE" if res.is_alive else "EXPIRED"
             if not res.is_alive:
                 all_alive = False

@@ -91,6 +91,9 @@ browser:
   geoip: true
   humanize: false
   locale: en-US
+  default_engine: camoufox  # engine of new accounts: camoufox | chrome (Google Chrome through patchright)
+  require_proxy: false  # true: no session opens without a proxy (otherwise the exit would be the machine's real IP)
+  geo_lock: warn  # warn | block: what to do when a profile is opened from another country than its last session
   proxy: null
   session_root: test_sessions
   navigation_timeout_ms: 45000
@@ -119,6 +122,7 @@ browser:
     session_path: test_sessions/example
     proxy_url: null
     is_active: true
+    engine: camoufox  # chrome keeps its profile in test_sessions/chrome/<name>; no SOCKS5 proxy with a login
 limits:
   total_iterations: 3
   max_concurrent_sessions: 1

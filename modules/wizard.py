@@ -86,6 +86,27 @@ def clear_terminal() -> None:
 _proxy_tags: dict[int, str] = {}  # proxy id -> «[PL] 45.130.253.31:8000»; refreshed by load_accounts
 
 
+def _check_chrome_session(session_dir: Path) -> tuple[bool, str]:
+    """Chrome keeps its cookies v20-encrypted: the sign-in is read from the `heartbeat_state.bin` the runner exported."""
+    from modules.chrome_session import chrome_login_info_expiry, heartbeat_state_path
+
+    if not session_dir.exists() or not heartbeat_state_path(session_dir).exists():
+        return False, "Сессия отсутствует (нужен вход)"
+    present, expiry = chrome_login_info_expiry(session_dir)
+    if not present:
+        return False, "Гостевой режим (вход в аккаунт НЕ выполнен)"
+    if expiry is not None and expiry <= time.time():
+        return False, "Сессия истекла (нужен вход)"
+    return True, "Авторизован (сессия активна)"
+
+
+def check_account_session(session_dir: Path, engine: str = "camoufox") -> tuple[bool, str]:
+    """`check_youtube_session` for the account's engine: Camoufox reads `cookies.sqlite`, Chrome its exported state."""
+    if engine == "chrome":
+        return _check_chrome_session(session_dir)
+    return check_youtube_session(session_dir)
+
+
 def check_youtube_session(session_root: Path) -> tuple[bool, str]:
     """Check whether a valid YouTube/Google authenticated session exists."""
     if (session_root / "cookies.sqlite").exists():
@@ -266,7 +287,7 @@ async def _confirm_country_mismatch_async(message: str) -> bool:
 
 def _setup_accounts(config_path: Path) -> list[tuple[Any, bool]]:
     """Accounts (DB, seeded from config.yaml — a fresh config gives «default») with their login state."""
-    return [(a, check_youtube_session(Path(a.session_path))[0]) for a in load_accounts(config_path)]
+    return [(a, check_account_session(Path(a.session_path), getattr(a, "engine", "camoufox"))[0]) for a in load_accounts(config_path)]
 
 
 def _setup_rename_in_config(config_path: Path, acc: Any, new_name: str) -> None:
@@ -395,14 +416,17 @@ def _logged_in_names(cfg: Any) -> list[str]:
         uri = f"file:{quote(Path(cfg.app.db_path).as_posix(), safe='/:')}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
         try:
-            rows = conn.execute("SELECT name, session_path FROM accounts ORDER BY id").fetchall()
+            try:
+                rows = conn.execute("SELECT name, session_path, engine FROM accounts ORDER BY id").fetchall()
+            except sqlite3.OperationalError:  # a database from before the engine column
+                rows = [(*row, "camoufox") for row in conn.execute("SELECT name, session_path FROM accounts ORDER BY id")]
         finally:
             conn.close()
     except sqlite3.Error:
         rows = []
     if not rows:
         return ["default"] if check_youtube_session(cfg.browser.session_root)[0] else []
-    return [name for name, path in rows if check_youtube_session(Path(path))[0]]
+    return [name for name, path, engine in rows if check_account_session(Path(path), engine)[0]]
 
 
 def load_accounts(config_path: Path) -> list[Any]:

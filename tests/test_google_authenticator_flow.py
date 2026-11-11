@@ -85,7 +85,7 @@ class FakePage:
     def url(self):
         return self.screen.url
 
-    async def _press(self, key):
+    async def _press(self, key, delay=None):
         if key == "Backspace":  # after Control+A: the whole value is removed by a keystroke, never by fill("")
             self.fills += 1
             self.field_text = ""

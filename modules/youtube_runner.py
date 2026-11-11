@@ -11,11 +11,15 @@ from urllib.parse import quote
 
 from camoufox.async_api import AsyncCamoufox
 from loguru import logger
-from playwright.async_api import Error as PlaywrightError
+from modules.browser_errors import PlaywrightError
 from pydantic import BaseModel, ConfigDict
 
-from config import BrowserSettings, TargetSettings, parse_proxy
+from config import BrowserSettings, EngineType, TargetSettings, parse_proxy, validate_proxy_for_engine
+from modules.chrome_launcher import ensure_chrome_executable, get_chrome_args, prepare_chrome_profile, resolve_chrome_geo
+from modules.chrome_session import save_chrome_heartbeat_state
 from modules.fingerprint_manager import get_or_create_fingerprint, host_webgl_config, is_compatible
+from modules.geo_guard import check_geo_lock, ensure_network_ready, read_session_geo, write_session_geo
+from modules.google_authenticator import has_live_login_cookie, read_chrome_identity
 from modules.interaction_simulator import InteractionError, InteractionSimulator
 from modules.page_helpers import CONSENT_ACCEPT_SELECTORS, SIGN_IN_LINK, first_visible
 from modules.ui_test_runner import NavigationError, ReplyUnavailableError, SubmissionError, SubmissionResult
@@ -93,10 +97,15 @@ class YouTubeRunner:
         artifacts_dir: Path | None = None,
         rng: random.Random | None = None,
         locale: str | None = None,
+        engine: EngineType = "camoufox",
+        geo_country: str | None = None,
     ) -> None:
         self._cfg = browser_settings
         self._target = target
         self._account_name = account_name
+        self._engine: EngineType = engine
+        self._geo_country = geo_country  # Chrome: time zone fallback when the exit country cannot be resolved
+        self._explicit_locale = locale  # the account's own locale: wins over the country default of Chrome
         self._locale = locale or browser_settings.locale  # the account's own locale, else browser.locale
         if proxy is not _UNSET:
             self._proxy = proxy
@@ -110,9 +119,18 @@ class YouTubeRunner:
         self._rng = rng or random.Random()
         self._simulator = simulator or InteractionSimulator(rng=self._rng)
         self._camoufox: Any | None = None
+        self._patchright_driver: Any | None = None
+        self._cached_user_agent: str | None = None
+        self._cached_client_hints: dict[str, Any] | None = None  # Chrome: navigator.userAgentData, replayed as Sec-CH-UA
         self._context: Any | None = None
         self._page: Any | None = None
         self._managed_session = False
+        self._session_country: str | None = None  # exit country of this session: recorded as the profile's geo after a sign-in
+        self._session_timezone: str | None = None
+
+    @property
+    def engine(self) -> EngineType:
+        return self._engine
 
     @property
     def session_dir(self) -> Path:
@@ -183,9 +201,19 @@ class YouTubeRunner:
         """Launch persistent browser session once and keep it open across comments."""
         if self.is_running:
             return self._page
-        if self._camoufox is not None:  # the page was closed under us: release the old browser and its profile lock first
-            await self.close()
+        if self._camoufox is not None or self._patchright_driver is not None:
+            await self.close()  # the page was closed under us: release the old browser and its profile lock first
         self._prepare_dirs()
+        if self._engine == "chrome":
+            validate_proxy_for_engine(self._proxy, "chrome")  # the account proxy or the global one: SOCKS5 with a login fails
+        # Fail closed before any browser or driver exists: a dead, transparent or host-IP proxy (NetworkGuardError) must
+        # never let the account out through the machine's own address. Without a proxy and without require_proxy: a no-op.
+        exit_geo = await ensure_network_ready(self._proxy, require_proxy=bool(getattr(self._cfg, "require_proxy", False)))
+        if self._engine == "chrome":
+            return await self._start_chrome()
+        self._session_country = getattr(exit_geo, "country", None)
+        self._session_timezone = getattr(exit_geo, "timezone", None)
+        await self._check_geo_lock(self._session_country)
         options = await asyncio.to_thread(self._launch_options)  # fingerprint file and GPU table reads must not stall the loop
         self._camoufox = AsyncCamoufox(**options)
         try:
@@ -211,9 +239,109 @@ class YouTubeRunner:
         self._managed_session = True
         return self._page
 
+    async def _start_chrome(self) -> Any:
+        """Google Chrome through patchright: own profile folder, locale and time zone of the exit country.
+
+        Only the launch options below are passed to the browser: no injected scripts, no request interception, no
+        user agent / header / viewport overrides (see tests/test_chrome_webauthn_tabs.py). No `locale=` either: patchright
+        would then replace navigator.languages and Accept-Language with a single tag; the language comes from `--lang`
+        and the profile Preferences (`prepare_chrome_profile`). `no_viewport` keeps the real window.
+        """
+        geo = await resolve_chrome_geo(self._proxy, self._geo_country, self._explicit_locale, self._account_name)
+        self._session_country, self._session_timezone = geo.country, geo.timezone
+        await self._check_geo_lock(geo.country)
+        await asyncio.to_thread(ensure_chrome_executable)
+        await asyncio.to_thread(prepare_chrome_profile, self._session_dir, geo.locale)  # the profile language follows the launch locale
+        chrome_args = get_chrome_args(locale=geo.locale, account_name=self._account_name, proxy_url=self._proxy)
+        launch_options: dict[str, Any] = {
+            "user_data_dir": str(self._session_dir),
+            "channel": "chrome",
+            "headless": self._cfg.headless,
+            "args": chrome_args,
+            "proxy": parse_proxy(self._proxy),
+            "timezone_id": geo.timezone,
+            "no_viewport": True,
+        }
+        if geo.geolocation:
+            # The point of the proxy's city. No `permissions=`: nothing is granted on purpose, a site that asks gets the prompt.
+            launch_options["geolocation"] = geo.geolocation
+
+        from patchright.async_api import async_playwright as async_patchright
+
+        self._patchright_driver = await async_patchright().start()
+        try:
+            self._context = await self._patchright_driver.chromium.launch_persistent_context(**launch_options)
+        except BaseException:
+            driver, self._patchright_driver, self._context = self._patchright_driver, None, None
+            try:
+                await driver.stop()
+            except Exception as exc:
+                logger.debug("Ошибка при остановке драйвера patchright после неудачного запуска: {}", exc)
+            raise
+
+        try:
+            pages = list(getattr(self._context, "pages", None) or [])
+            # The first tab is the working one: a new tab is opened only when the profile came up with none
+            self._page = pages[0] if pages else await self._context.new_page()
+            await self._close_extra_tabs(pages)
+            self._page.set_default_timeout(self._target.wait_timeout_ms)
+            self._page.set_default_navigation_timeout(self._cfg.navigation_timeout_ms)
+            # The UA and the client hints are read once right after the start: the heartbeat replays them later without a browser
+            self._cached_user_agent, self._cached_client_hints = await read_chrome_identity(self._page)
+            await self._remember_session_geo(self._context)  # a profile that is already signed in
+        except BaseException:  # a half-started Chrome must not keep the profile locked or leave node.exe behind
+            await self._close_chrome()
+            raise
+        self._managed_session = True
+        return self._page
+
+    async def _check_geo_lock(self, country: str | None) -> None:
+        """Compare the exit country with the one this profile signed in from: GeoLockError (mode block) stops the start.
+
+        Nothing is launched yet. An unknown country (no proxy, lookup failed) has nothing to compare and is skipped.
+        """
+        if not country:
+            return
+        await asyncio.to_thread(check_geo_lock, self._session_dir, country, getattr(self._cfg, "geo_lock", "warn"))
+
+    async def _remember_session_geo(self, context: Any) -> None:
+        """Record the exit geo of a session that holds a live YouTube login; best effort, never raises.
+
+        The record is created when there is none and refreshed when the country is the same. A different country never
+        overwrites it silently: `check_geo_lock` already reported the change (critical in mode warn, an error in
+        block), and the profile keeps the geo it signed in from.
+        """
+        country = self._session_country
+        if not country or context is None:
+            return
+        try:
+            if not has_live_login_cookie(await context.cookies()):
+                return
+            saved = await asyncio.to_thread(read_session_geo, self._session_dir)
+            saved_country = str(saved.get("country") or "").upper() if isinstance(saved, dict) else ""
+            if saved_country and saved_country != country.upper():
+                return
+            await asyncio.to_thread(write_session_geo, self._session_dir, country, self._session_timezone)
+        except Exception as exc:
+            logger.debug("Не удалось записать гео сессии профиля: {}", exc)
+
+    async def _close_extra_tabs(self, pages: list[Any]) -> None:
+        """Close the tabs Chrome restored next to the working one (blank, new tab page or leftovers); never the working tab."""
+        for extra in pages:
+            if extra is self._page:
+                continue
+            try:
+                await extra.close()
+            except Exception as exc:
+                logger.debug("Не удалось закрыть лишнюю вкладку Chrome: {}", exc)
+
     async def close(self) -> None:
         """Close browser session at the end of the batch and save cookies."""
+        if self._engine == "chrome":
+            await self._close_chrome()
+            return
         if self._camoufox is not None:
+            await self._remember_session_geo(self._context)  # the context is still alive here
             try:
                 await self._camoufox.__aexit__(None, None, None)
             except Exception as exc:
@@ -223,6 +351,40 @@ class YouTubeRunner:
                 self._context = None
                 self._page = None
                 self._managed_session = False
+                self._session_country = self._session_timezone = None
+
+    async def _close_chrome(self) -> None:
+        """Save the heartbeat state (cookies are v20-encrypted in the profile), close the context, stop the driver.
+
+        Each step is on its own: a failed save or close never leaves the patchright driver (node.exe) running.
+        """
+        context, driver = self._context, self._patchright_driver
+        self._context = self._page = None
+        self._patchright_driver = None
+        self._managed_session = False
+        try:
+            if context is not None:
+                await self._remember_session_geo(context)
+                try:
+                    await save_chrome_heartbeat_state(
+                        profile_dir=self._session_dir,
+                        context=context,
+                        user_agent=self._cached_user_agent,
+                        client_hints=self._cached_client_hints,
+                    )
+                except Exception as exc:
+                    logger.warning("Не удалось сохранить heartbeat_state.bin: {}", exc)
+                try:
+                    await context.close()
+                except Exception as exc:
+                    logger.debug("Ошибка при закрытии сессии Chrome: {}", exc)
+        finally:
+            if driver is not None:
+                try:
+                    await driver.stop()
+                except Exception as exc:
+                    logger.debug("Ошибка при остановке драйвера patchright: {}", exc)
+            self._session_country = self._session_timezone = None
 
     async def __aenter__(self) -> YouTubeRunner:
         await self.start()
@@ -345,9 +507,12 @@ class YouTubeRunner:
                 locator = page.locator(sel).first
                 if await locator.count() > 0 and await locator.is_visible():
                     logger.debug("Закрытие всплывающего баннера согласия YouTube ({})", sel)
-                    await locator.click()
+                    await self._simulator.click_locator(page, locator)  # the simulated pointer path, never locator.click()
                     await self._simulator.human_pause(1.0, 2.0)
                     break
+            except InteractionError as exc:  # no clickable box: the banner is not really there, try the next selector
+                logger.debug("Баннер согласия не кликабелен ({}): {}", sel, exc)
+                continue
             except Exception:
                 continue
 
@@ -379,7 +544,7 @@ class YouTubeRunner:
             await self._simulator.human_pause(0.6, 1.0)
             after = await page.evaluate(_PLAYER_STATE_JS)
             if after and after.get("video") and not after.get("muted") and not after.get("ad"):
-                await page.keyboard.press("m")
+                await page.keyboard.press("m", delay=self._key_hold_ms())
             logger.debug("Видео запущено кликом без звука (было на паузе)")
         except asyncio.CancelledError:
             raise
@@ -432,10 +597,29 @@ class YouTubeRunner:
             try:
                 target_loc = page.locator(f"a[href*='lc={comment_id}']").first
                 if await target_loc.count() > 0 and await target_loc.is_visible():
-                    await target_loc.scroll_into_view_if_needed()
+                    await self._scroll_target_into_view(page, target_loc)
                     logger.debug("Целевой комментарий {} прокручен в область видимости", comment_id)
             except Exception:
                 pass
+
+    def _key_hold_ms(self) -> float:
+        """How long a key stays down (ms): a keydown followed by a keyup in the same millisecond is not a human press."""
+        return self._rng.uniform(40, 110)
+
+    async def _scroll_target_into_view(self, page: Any, locator: Any) -> None:
+        """Bring a linked comment into view with wheel scrolling; the instant scroll stays as a correction only.
+
+        `scroll_into_view_if_needed` is a no-op once the element is visible, so after the wheel scroll it only fixes what
+        the lazy-loaded layout moved meanwhile.
+        """
+        try:
+            box = await locator.bounding_box()
+            height = await page.evaluate("() => window.innerHeight")
+            if box and isinstance(height, (int, float)) and height > 0 and not (0 <= box["y"] and box["y"] + box["height"] <= height):
+                await self._simulator.scroll(page, int(box["y"] - height * 0.4))
+        except Exception as exc:
+            logger.debug("Плавная прокрутка к комментарию не удалась: {}", exc)
+        await locator.scroll_into_view_if_needed()
 
     async def _expand_replies(self, page: Any, comment_id: str | None = None) -> None:
         """Find and expand reply buttons ('View replies', 'X ответов') under comments."""
@@ -533,11 +717,7 @@ class YouTubeRunner:
 
         # 3. Focus and type into contenteditable with human cadence & typo simulation
         logger.debug("Активация поля ввода ответа на YouTube")
-        try:
-            await reply_input.focus()
-        except Exception:
-            pass
-        await self._simulator.click_locator(page, reply_input)
+        await self._simulator.click_locator(page, reply_input)  # the click focuses the field: no programmatic focus()
         logger.debug("Осмысленная пауза перед вводом текста...")
         await self._simulator.thinking_pause()
 
@@ -578,7 +758,7 @@ class YouTubeRunner:
             async with page.expect_response(lambda r: "/comment/create_comment" in r.url, timeout=15000) as sent:
                 await self._simulator.click_locator(page, submit_btn, verify_hit=True)
             response = await sent.value
-        except (InteractionError, PlaywrightError) as exc:
+        except (InteractionError, *PlaywrightError) as exc:
             raise SubmissionError(f"reply was not submitted: {exc}") from exc
         if not response.ok:
             raise SubmissionError(f"YouTube rejected the reply: HTTP {response.status}")

@@ -6,7 +6,9 @@ what differs from the live channel, and checks the result after reloading the pa
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import random
 import re
 import shutil
 from dataclasses import dataclass
@@ -167,6 +169,8 @@ class ProfileEditor:
             proxy=proxy,
             account_name=account.name,
             simulator=self._simulator,
+            engine=account.engine,
+            geo_country=account.geo_country or account.expected_country,
         )
         try:
             await runner.start()
@@ -244,8 +248,9 @@ class ProfileEditor:
         if not write:
             return False
         await self._simulator.click_locator(page, field)
-        await page.keyboard.press("Control+A")
-        await page.keyboard.press("Delete")
+        await page.keyboard.press("Control+A", delay=random.uniform(40, 110))  # a held key, not a 0 ms keydown/keyup
+        await asyncio.sleep(random.uniform(0.1, 0.25))
+        await page.keyboard.press("Delete", delay=random.uniform(40, 110))
         await self._simulator.type_text(page, value, allow_typos=False)
         await self._simulator.human_pause(0.6, 1.4)
         return False

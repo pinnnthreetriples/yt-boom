@@ -118,12 +118,20 @@ class _FakeKeyboard:
     def __init__(self) -> None:
         self.buffer: list[str] = []
         self.deleted_positions: list[int] = []
+        self.shift_held = False
+        self.capitals_without_shift: list[str] = []
 
     async def down(self, key: str) -> None:
+        if key == "Shift":  # a modifier types nothing
+            self.shift_held = True
+            return
+        if (key.isupper() or key in '!@#$%^&*()_+{}|:"<>?~') and not self.shift_held:
+            self.capitals_without_shift.append(key)
         self.buffer.append(key)
 
     async def up(self, key: str) -> None:
-        return None
+        if key == "Shift":
+            self.shift_held = False
 
     async def type(self, text: str) -> None:
         self.buffer.extend(text)
@@ -168,6 +176,8 @@ class TestTypoFinalTextInvariant(unittest.IsolatedAsyncioTestCase):
                 with patch("asyncio.sleep", new_callable=AsyncMock):
                     await sim.type_text(page, sample)
                 self.assertEqual(keyboard.text, sample, f"seed={seed}")
+                self.assertEqual(keyboard.capitals_without_shift, [], f"seed={seed}")
+                self.assertFalse(keyboard.shift_held, f"seed={seed}: Shift left pressed")
                 run = 0
                 for first, second in zip(keyboard.deleted_positions, keyboard.deleted_positions[1:]):
                     run = run + 1 if second == first - 1 else 0

@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from config import BrowserSettings, TargetSettings
-from modules.interaction_simulator import InteractionSimulator
+from modules.interaction_simulator import InteractionError, InteractionSimulator
 from modules.ui_test_runner import ReplyUnavailableError, SubmissionError, SubmissionResult
 from modules.youtube_runner import YouTubeRunner
 
@@ -84,8 +84,43 @@ class TestYouTubeRunner(unittest.IsolatedAsyncioTestCase):
         locator_mock.first = btn_mock
         page.locator = MagicMock(return_value=locator_mock)
 
-        await self.runner._dismiss_consent(page)
-        btn_mock.click.assert_called_once()
+        with patch.object(self.runner._simulator, "click_locator", AsyncMock()) as click:
+            await self.runner._dismiss_consent(page)
+        click.assert_awaited_once_with(page, btn_mock)  # through the simulator, never locator.click()
+        btn_mock.click.assert_not_called()
+
+    async def test_dismiss_consent_survives_a_banner_without_a_clickable_box(self):
+        page = MagicMock()
+        btn_mock = MagicMock(count=AsyncMock(return_value=1), is_visible=AsyncMock(return_value=True))
+        page.locator = MagicMock(return_value=MagicMock(first=btn_mock))
+        with patch.object(self.runner._simulator, "click_locator", AsyncMock(side_effect=InteractionError("no box"))) as click:
+            await self.runner._dismiss_consent(page)  # must not raise
+        click.assert_awaited()  # the click was attempted and its InteractionError swallowed
+
+    async def test_key_hold_is_between_40_and_110_ms(self):
+        for _ in range(50):
+            self.assertTrue(40 <= self.runner._key_hold_ms() <= 110)
+
+    async def test_linked_comment_is_scrolled_with_the_wheel_before_the_correction(self):
+        page = MagicMock(evaluate=AsyncMock(return_value=800))
+        locator = MagicMock(
+            bounding_box=AsyncMock(return_value={"x": 0, "y": 2000, "width": 100, "height": 50}),
+            scroll_into_view_if_needed=AsyncMock(),
+        )
+        with patch.object(self.runner._simulator, "scroll", AsyncMock()) as scroll:
+            await self.runner._scroll_target_into_view(page, locator)
+        scroll.assert_awaited_once_with(page, 2000 - 320)
+        locator.scroll_into_view_if_needed.assert_awaited_once()
+
+    async def test_a_comment_already_in_view_is_not_scrolled(self):
+        page = MagicMock(evaluate=AsyncMock(return_value=800))
+        locator = MagicMock(
+            bounding_box=AsyncMock(return_value={"x": 0, "y": 100, "width": 100, "height": 50}),
+            scroll_into_view_if_needed=AsyncMock(),
+        )
+        with patch.object(self.runner._simulator, "scroll", AsyncMock()) as scroll:
+            await self.runner._scroll_target_into_view(page, locator)
+        scroll.assert_not_awaited()
 
     async def test_submit_reply_dry_run_with_mocked_elements(self):
         page = MagicMock()

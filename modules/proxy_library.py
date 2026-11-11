@@ -168,7 +168,10 @@ async def sync_config_accounts(db: Database, accounts: list[AccountSettings]) ->
             args: dict[str, Any] = {"name": acc.name, "session_path": acc.session_path, "is_active": acc.is_active}
             if explicit_proxy:
                 args["proxy_url"] = explicit_proxy
-            created.append((await db.upsert_account(**args)).id)
+            record = await db.upsert_account(**args)
+            created.append(record.id)
+            if acc.engine != record.engine:  # config.yaml names the engine; its profile folder follows the engine
+                await db.set_account_engine(record.id, acc.engine)
             if explicit_proxy:
                 imported.append(acc.name)
         elif explicit_proxy and existing.proxy_url is None and not existing.proxy_unavailable:

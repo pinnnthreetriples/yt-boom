@@ -10,8 +10,9 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from loguru import logger
-from playwright.async_api import Error as PlaywrightError
 
+from modules.browser_errors import PlaywrightError
+from modules.chrome_session import save_chrome_heartbeat_state
 from modules.dom_snapshot import redact, sanitize_html
 from modules.interaction_simulator import InteractionError, InteractionSimulator
 from modules.page_helpers import CONSENT_REJECT_SELECTORS, SIGN_IN_LINK, first_visible
@@ -87,6 +88,31 @@ YTCFG_JS = r"""() => {
   return {ready: flag !== null, loggedIn: flag !== null && flag[1] === 'true', channelId: channel ? channel[1] : null};
 }"""
 
+# Chrome only: the real navigator.userAgent / navigator.userAgentData of the browser, cached for the offline heartbeat so its
+# Sec-CH-UA headers match the User-Agent. Plain property reads, no CDP and no injected script. In headless Chrome the brands
+# may contain "HeadlessChrome": they are stored as they are, `session_heartbeat` normalizes them.
+CHROME_USER_AGENT_JS = "() => navigator.userAgent"
+CHROME_CLIENT_HINTS_JS = (
+    "() => navigator.userAgentData ? {brands: navigator.userAgentData.brands.map(b => ({brand: b.brand, version: b.version})), "
+    "mobile: navigator.userAgentData.mobile, platform: navigator.userAgentData.platform} : null"
+)
+BLANK_PAGE_URLS = ("", "about:blank")
+BLANK_PAGE_PREFIXES = ("chrome://newtab", "chrome://new-tab-page")
+
+# Chrome only: a silent virtual WebAuthn authenticator for the time of the sign-in. Without it Google's passkey screens call
+# navigator.credentials.get/create and Windows opens its native Windows Hello / security key dialog, which automation cannot
+# close. Only the WebAuthn CDP domain is used (never Runtime or anything else). With automaticPresenceSimulation=False a
+# request never resolves (nobody simulates the touch) and with isUserVerified=False a user verification fails: the page
+# buttons stay clickable, the flow declines or goes "Try another way" like it does without an authenticator.
+VIRTUAL_AUTHENTICATOR_OPTIONS = {
+    "protocol": "ctap2",
+    "transport": "internal",
+    "hasResidentKey": True,
+    "hasUserVerification": True,
+    "isUserVerified": False,
+    "automaticPresenceSimulation": False,
+}
+
 SESSION_OWNER_FILE = "account_owner.txt"
 
 AUTH_TIMEOUT_SECONDS = 240.0
@@ -132,6 +158,11 @@ def _screen_path(url: str) -> str:
     return f"{parsed.hostname or ''}{parsed.path}"
 
 
+def _key_hold_ms() -> float:
+    """How long a key stays down (ms): a keydown followed by a keyup in the same millisecond is not a human press."""
+    return random.uniform(40, 110)
+
+
 def with_hl_en(url: str) -> str:
     """The same URL with `hl=en`: every other parameter (service, continue, flowName...) is kept as it is."""
     parsed = urlparse(url)
@@ -169,13 +200,135 @@ def write_session_owner(session_dir: Path | str, email: str) -> None:
         logger.warning("Не удалось сохранить владельца сессии {}: {}", path, exc)
 
 
+def has_live_login_cookie(cookies: list[dict[str, Any]]) -> bool:
+    """A non-empty, unexpired LOGIN_INFO cookie on .youtube.com: the profile is signed in."""
+    now = time.time()
+    for cookie in cookies:
+        if cookie.get("name") != "LOGIN_INFO":
+            continue
+        domain = str(cookie.get("domain", "")).lstrip(".")
+        if domain != "youtube.com" and not domain.endswith(".youtube.com"):
+            continue
+        expires = cookie.get("expires", -1)
+        if cookie.get("value") and (expires in (None, -1) or expires > now):
+            return True
+    return False
+
+
+def is_blank_page_url(url: Any) -> bool:
+    """True for a tab that shows nothing: an empty URL, about:blank or the new tab page."""
+    if not isinstance(url, str):
+        return False
+    url = url.strip().lower()
+    return url in BLANK_PAGE_URLS or url.startswith(BLANK_PAGE_PREFIXES)
+
+
+def normalize_client_hints(raw: Any) -> dict[str, Any] | None:
+    """`{"brands": [{"brand", "version"}], "mobile": bool, "platform": str}` from a page read; None when it is not that shape."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("brands"), list):
+        return None
+    brands = [
+        {"brand": item["brand"], "version": item["version"]}
+        for item in raw["brands"]
+        if isinstance(item, dict) and isinstance(item.get("brand"), str) and isinstance(item.get("version"), str)
+    ]
+    if not brands:
+        return None
+    return {"brands": brands, "mobile": bool(raw.get("mobile")), "platform": str(raw.get("platform") or "")}
+
+
+async def read_chrome_identity(page: Any) -> tuple[str | None, dict[str, Any] | None]:
+    """`(navigator.userAgent, client hints)` of a Chrome page; each half is None when its read failed (no CDP, plain evaluate)."""
+    user_agent: str | None = None
+    hints: dict[str, Any] | None = None
+    try:
+        value = await page.evaluate(CHROME_USER_AGENT_JS)
+        user_agent = value if isinstance(value, str) and value else None
+    except Exception as exc:
+        logger.debug("Не удалось прочитать navigator.userAgent: {}", exc)
+    try:
+        hints = normalize_client_hints(await page.evaluate(CHROME_CLIENT_HINTS_JS))
+    except Exception as exc:
+        logger.debug("Не удалось прочитать navigator.userAgentData: {}", exc)
+    return user_agent, hints
+
+
 class GoogleAuthenticator:
     """Signs a Camoufox persistent context into YouTube through the regular Google sign-in flow."""
 
-    def __init__(self, simulator: InteractionSimulator, artifacts_dir: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        simulator: InteractionSimulator,
+        artifacts_dir: Path | str | None = None,
+        chrome_profile_dir: Path | str | None = None,
+    ) -> None:
         self._simulator = simulator
         self._artifacts_dir = Path(artifacts_dir) if artifacts_dir is not None else None  # None: no unknown-screen dump
+        # Chrome profile folder: after a successful sign-in the cookies are exported to its heartbeat_state.bin right away
+        self._chrome_profile_dir = Path(chrome_profile_dir) if chrome_profile_dir is not None else None
         self.detected_country: str | None = None
+
+    async def _save_chrome_state(self, context: Any, page: Any | None = None) -> None:
+        """Chrome only, best effort: persist the signed-in cookies without waiting for the browser to close."""
+        if self._chrome_profile_dir is None:
+            return
+        try:
+            if page is None:
+                pages = getattr(context, "pages", None) or []
+                page = pages[0] if pages else None
+            user_agent, client_hints = await read_chrome_identity(page) if page is not None else (None, None)
+            await save_chrome_heartbeat_state(self._chrome_profile_dir, context, user_agent, client_hints=client_hints)
+        except Exception as exc:
+            logger.warning("Не удалось сохранить heartbeat_state.bin после входа: {}", exc)
+
+    @staticmethod
+    async def _acquire_page(context: Any, reuse_blank: bool) -> tuple[Any, bool]:
+        """`(page, reused)`. Chrome reuses an empty tab it already has instead of opening a second one; Camoufox never does."""
+        if reuse_blank:
+            try:
+                for candidate in list(getattr(context, "pages", None) or []):
+                    if not candidate.is_closed() and is_blank_page_url(candidate.url):
+                        return candidate, True
+            except Exception as exc:
+                logger.debug("Не удалось найти пустую вкладку для авторизации: {}", exc)
+        return await context.new_page(), False
+
+    @staticmethod
+    async def _attach_virtual_authenticator(context: Any, page: Any) -> tuple[Any, str | None] | None:
+        """Chrome only: add the silent virtual authenticator to `page`; None (the login goes on) when any CDP step fails."""
+        cdp: Any | None = None
+        try:
+            cdp = await context.new_cdp_session(page)
+            await cdp.send("WebAuthn.enable")
+            added = await cdp.send("WebAuthn.addVirtualAuthenticator", {"options": dict(VIRTUAL_AUTHENTICATOR_OPTIONS)})
+            authenticator_id = added.get("authenticatorId") if isinstance(added, dict) else None
+        except Exception as exc:
+            logger.debug("Виртуальный аутентификатор WebAuthn не подключён: {}", exc)
+            if cdp is not None:
+                await GoogleAuthenticator._detach_virtual_authenticator((cdp, None))
+            return None
+        logger.debug("Подключён виртуальный аутентификатор WebAuthn на время входа")
+        return cdp, authenticator_id
+
+    @staticmethod
+    async def _detach_virtual_authenticator(virtual: tuple[Any, str | None] | None) -> None:
+        """Remove the authenticator, disable the WebAuthn domain, detach the session: every step on its own, never raises."""
+        if virtual is None:
+            return
+        cdp, authenticator_id = virtual
+        if authenticator_id is not None:
+            try:
+                await cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": authenticator_id})
+            except Exception as exc:
+                logger.debug("Не удалось удалить виртуальный аутентификатор: {}", exc)
+        try:
+            await cdp.send("WebAuthn.disable")
+        except Exception as exc:
+            logger.debug("Не удалось отключить домен WebAuthn: {}", exc)
+        try:
+            await cdp.detach()
+        except Exception as exc:
+            logger.debug("Не удалось отсоединить CDP-сессию WebAuthn: {}", exc)
 
     async def is_session_authenticated(self, context: Any) -> bool:
         """Zero-risk fast path: a live LOGIN_INFO cookie on .youtube.com means the profile is already signed in."""
@@ -184,17 +337,7 @@ class GoogleAuthenticator:
         except Exception as exc:
             logger.debug("Не удалось прочитать cookies контекста: {}", exc)
             return False
-        now = time.time()
-        for cookie in cookies:
-            if cookie.get("name") != "LOGIN_INFO":
-                continue
-            domain = str(cookie.get("domain", "")).lstrip(".")
-            if domain != "youtube.com" and not domain.endswith(".youtube.com"):
-                continue
-            expires = cookie.get("expires", -1)
-            if cookie.get("value") and (expires in (None, -1) or expires > now):
-                return True
-        return False
+        return has_live_login_cookie(cookies)
 
     async def authenticate(
         self,
@@ -220,12 +363,18 @@ class GoogleAuthenticator:
             logger.info("Сессия профиля принадлежит другому аккаунту, куки сброшены, выполняется вход заново")
         elif await self.is_session_authenticated(context):
             logger.info("Сессия уже авторизована (LOGIN_INFO найден), вход пропущен")
+            await self._save_chrome_state(context)
             return True
 
-        page = await context.new_page()
-        page.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
-        page.set_default_timeout(NAVIGATION_TIMEOUT_MS)
+        is_chrome = self._chrome_profile_dir is not None
+        page, reused = await self._acquire_page(context, reuse_blank=is_chrome)
+        if not reused:  # a reused tab belongs to the runner: its own timeouts stay
+            page.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
+            page.set_default_timeout(NAVIGATION_TIMEOUT_MS)
+        virtual: tuple[Any, str | None] | None = None
         try:
+            if is_chrome:
+                virtual = await self._attach_virtual_authenticator(context, page)
             await self._open_sign_in(page)
             await self._run_form(page, email, password, totp_secret, recovery_email, timeout_seconds)
             if not await self._wait_login_cookie(context):
@@ -239,6 +388,7 @@ class GoogleAuthenticator:
                     logger.info("Определён гео-регион аккаунта: {}", self.detected_country)
             except Exception as exc:
                 logger.debug("Не удалось определить страну аккаунта: {}", exc)
+            await self._save_chrome_state(context, page)
             logger.success("Авторизация в YouTube завершена")
             return True
         except Exception as exc:
@@ -250,10 +400,12 @@ class GoogleAuthenticator:
                 pass
             raise
         finally:
-            try:
-                await page.close()
-            except Exception as exc:
-                logger.debug("Не удалось закрыть страницу авторизации: {}", exc)
+            await self._detach_virtual_authenticator(virtual)  # before the page goes away: the CDP session belongs to it
+            if not reused:  # the page after the sign-in stays open when it was the runner's own tab
+                try:
+                    await page.close()
+                except Exception as exc:
+                    logger.debug("Не удалось закрыть страницу авторизации: {}", exc)
 
     async def detect_account_country(self, page: Any) -> str | None:
         """Fetch the account's registered country version from Google Terms (hl=en)."""
@@ -345,7 +497,7 @@ class GoogleAuthenticator:
                 if await self._any_visible(page, CAPTCHA_MARKERS) or "recaptcha" in url:
                     raise GoogleAuthError("Google запросил капчу: пройдите её вручную (--login)")
                 screen = await self._handle_screen(page, state)
-            except (InteractionError, PlaywrightError) as exc:  # the page navigated under the cursor
+            except (InteractionError, *PlaywrightError) as exc:  # the page navigated under the cursor
                 logger.debug("Экран {} изменился во время действия: {}", path, exc)
                 await asyncio.sleep(FIELD_POLL_SECONDS)
                 continue
@@ -453,23 +605,23 @@ class GoogleAuthenticator:
         else:
             if selectors != KPE_INPUT:  # only the recovery-email screen has no Next; anywhere else Enter is a fallback worth a trace
                 logger.warning("На экране {} нет кнопки Next, отправляю Enter", path_before)
-            await page.keyboard.press("Enter")
+            await page.keyboard.press("Enter", delay=_key_hold_ms())
         return await self._wait_after_submit(page, selectors, path_before, stale_error)
 
-    @staticmethod
-    async def _clear_field(page: Any, field_locator: Any) -> None:
+    async def _clear_field(self, page: Any, field_locator: Any) -> None:
         """A rejected value stays in the input: never append to it.
 
-        Select-all + Backspace instead of `fill("")`: a direct DOM write has no keydown/keyup and a 0 ms delta.
+        Select-all + Backspace instead of `fill("")`: a direct DOM write has no keydown/keyup and a 0 ms delta. The focusing
+        click goes through the simulator (a pointer path), keys are held for a human-like time.
         """
         try:
             if await field_locator.input_value():
-                await field_locator.click()
-                await page.keyboard.press("Control+A")
+                await self._simulator.click_locator(page, field_locator)
+                await page.keyboard.press("Control+A", delay=_key_hold_ms())
                 await asyncio.sleep(random.uniform(0.1, 0.25))
-                await page.keyboard.press("Backspace")
+                await page.keyboard.press("Backspace", delay=_key_hold_ms())
                 await asyncio.sleep(random.uniform(0.15, 0.3))
-        except PlaywrightError as exc:
+        except (InteractionError, *PlaywrightError) as exc:
             logger.debug("Не удалось очистить поле: {}", exc)
 
     async def _wait_after_submit(
@@ -663,7 +815,7 @@ class GoogleAuthenticator:
                     return
             else:
                 try:
-                    await page.keyboard.press("Escape")
+                    await page.keyboard.press("Escape", delay=_key_hold_ms())
                 except Exception:
                     pass
                 return

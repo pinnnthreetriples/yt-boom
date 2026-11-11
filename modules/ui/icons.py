@@ -88,7 +88,25 @@ _ICONS: dict[str, tuple[str, str]] = {
     "similar": ("🧭", "≈"),
     "copy": ("🧬", "c"),
     "order": ("⇅", "⇅"),
+    # browser engine of an account: Camoufox (Firefox) / Google Chrome
+    "engine_camoufox": ("🦊", "F"),
+    "engine_chrome": ("🌐", "C"),
 }
+
+ENGINE_TITLES = {"camoufox": "Camoufox", "chrome": "Google Chrome"}
+
+
+def engine_icon(engine: str) -> str:
+    """The marker of an account's browser engine (anything but `chrome` counts as Camoufox)."""
+    return icon("engine_chrome" if engine == "chrome" else "engine_camoufox")
+
+
+def engine_title(engine: str) -> str:
+    return ENGINE_TITLES.get(engine, ENGINE_TITLES["camoufox"])
+
+
+def other_engine(engine: str) -> str:
+    return "camoufox" if engine == "chrome" else "chrome"
 
 
 def _console_is_pseudo() -> bool:

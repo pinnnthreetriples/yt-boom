@@ -30,7 +30,7 @@ edges:
     condition: when pre-warming a fresh profile with cookies before the Google sign-in
   - target: patterns/debug-browser-interaction.md
     condition: when diagnosing browser automation or selector issues
-last_updated: 2026-11-10
+last_updated: 2026-11-11
 ---
 
 # Session Bootstrap
@@ -60,11 +60,12 @@ Then read this file fully before doing anything else in this session.
 - Proxy library (`proxies` table, `accounts.proxy_id`, DPAPI-encrypted passwords; address assembled only by `config.compose_proxy_url`): one proxy serves any number of accounts; the search proxy (`app_settings.search_proxy_id`) serves only the InnerTube collector; an account uses only its own proxy or goes direct, and an assigned-but-unreadable proxy raises `ProxyUnavailableError` (fail-closed). Paste parsing `modules/proxy_paste.py`, shared check `modules/proxy_check.py`, yaml migration and route texts `modules/proxy_library.py`. SOCKS5 with a login cannot be used by Camoufox (Playwright refuses it)
 - «Прокси» tab (`modules/ui/tab_proxies.py`; `modules/proxy_screen.py` is now only proxy logic, no screens; also reached from an account's «Прокси» menu item): rows per proxy with the accounts on it (Enter: accounts on a proxy, check, edit line, search role, delete); `+` add pastes many lines → shown → checked in parallel → saved → offered to proxy-less accounts, `C` check all, `S` search proxy. «с вашего IP» is shown in the «Запуск» and «Аккаунты» tabs and the run log (`proxy_library.log_proxy_routes`)
 - Visibility check of published replies (`modules/comment_visibility.py`): `limits.visibility_check_enabled` (switch in the tab «Запуск») + `visibility_check_delay_seconds` (45 s, 0 = off); after a live reply a background anonymous InnerTube look-up stores `activity_log.visibility` = `seen` / `unseen` / `unknown` (NULL = not checked) in all three run modes; shown green / yellow in the log (`[ВИДИМОСТЬ]`), the journal, the record card and `--history`; observation only — never touches `status`, error counters or limits (see `patterns/youtube-reply-flow.md`)
+- Per-account browser engine (`accounts.engine`, `camoufox` default | `chrome`): Chrome is Google Chrome driven by `patchright` (`modules/chrome_launcher.py`), profile in `test_sessions/chrome/<name>`; cookies are v20-encrypted there, so the runner exports them to a DPAPI `heartbeat_state.bin` (`modules/chrome_session.py`) which the heartbeat replays with a `chromeNNN` curl_cffi profile; the «Аккаунты» tab account menu row «Браузер» switches the engine (`Database.set_account_engine`)
 - Comprehensive automated test suite (unit and integration tests, `python run_tests.py`; UI tests `tests/test_ui_*.py`)
 
 **Not yet built:**
 - Real-time WebRTC audio stream generation for interactive live events
-- Multi-browser cross-engine test runner (Chromium / WebKit) — explicitly restricted to Camoufox/Gecko
+- WebKit and any non-Chrome Chromium runner — engines are Camoufox/Gecko or Google Chrome (patchright) only; non-YouTube staging targets (`UITestRunner`) stay Camoufox-only
 
 **Known issues:**
 - Copying `test_metrics.db` across different Windows machines requires re-importing credentials due to DPAPI user binding

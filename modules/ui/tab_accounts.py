@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from modules.ui.app import AppContext
-from modules.ui.icons import icon, quota
+from modules.ui.icons import engine_icon, engine_title, icon, other_engine, quota
 from modules.ui.shell import Cell, Confirm, Field, Hotkey, Menu, Notice, Row, Run, Screen, Step, Tab, View, fit
 
 WARM_UP_SECONDS = 45.0  # same default as `--warm-up-duration`
@@ -34,11 +34,11 @@ _STAGES = {
 
 def load(ctx: AppContext) -> list[tuple[Any, bool, Any]]:
     """Accounts (seeded from config.yaml like before) with their login state and their proxy record."""
-    from modules.wizard import check_youtube_session, load_accounts
+    from modules.wizard import check_account_session, load_accounts
 
     accounts = load_accounts(ctx.config_path)
     proxies = {p.id: p for p in ctx.db(lambda db: db.list_proxies())}
-    return [(a, check_youtube_session(Path(a.session_path))[0], proxies.get(a.proxy_id)) for a in accounts]
+    return [(a, check_account_session(Path(a.session_path), a.engine)[0], proxies.get(a.proxy_id)) for a in accounts]
 
 
 def _fresh(ctx: AppContext, account_id: int) -> Any:
@@ -166,6 +166,7 @@ def account_row(ctx: AppContext, acc: Any, logged: bool, record: Any, projects: 
     cells = [
         Cell(icon(state_icon), "", 3),
         Cell(acc.name, "dim" if not acc.is_active else ("warn" if not projects else ""), 17),
+        Cell(engine_icon(acc.engine), "", 3),
         Cell(proxy, proxy_style, 21, grow=True),
         Cell(icon(stage_icon), "", 3),
         Cell(pie, "accent", 2),
@@ -286,6 +287,9 @@ def account_menu(ctx: AppContext, account_id: int) -> Step:
                            Cell(str(len(in_projects)) if in_projects else "нет", "" if in_projects else "warn")],
             hint=("В проектах: " + ", ".join(p.name for p in in_projects) if in_projects else NO_PROJECT) + " · Enter — список",
             enter=lambda: Screen(lambda: account_projects_view(ctx, account_id))),
+        Row("m-engine", [Cell(engine_icon(acc.engine), "", 3), Cell("браузер", "", 14), Cell(engine_title(acc.engine))],
+            hint="Camoufox или Google Chrome · Enter — сменить, у каждого браузера свой профиль и свой вход",
+            enter=lambda: engine_step(ctx, account_id)),
     ]
     if acc.consecutive_errors >= CIRCUIT_BREAKER_ERRORS:
         rows.append(Row("m-release", [Cell(icon("stopped"), "", 3), Cell("снять ограничение", "warn")],
@@ -417,6 +421,35 @@ def release(ctx: AppContext, account_id: int) -> Step:
     return Confirm([Cell(f"Снять ограничение с «{acc.name}»? Счётчик ошибок обнулится", "warn")], ["Нет", "Снять"], pick)
 
 
+ENGINE_SWITCH_CONFIRM = (
+    "Смена движка потребует отдельной авторизации в Google под новым браузером "
+    "(текущий профиль старого браузера сохранится). Переключить?"
+)
+
+
+def switch_engine(ctx: AppContext, acc: Any) -> Notice:
+    """Move the account to the other browser engine: its own profile folder, its own sign-in."""
+    new_engine = other_engine(acc.engine)
+    try:
+        updated = ctx.db(lambda db: db.set_account_engine(acc.id, new_engine))
+    except ValueError as exc:
+        return Notice("err", f"Не удалось сменить браузер: {exc}")
+    return Notice("ok", f"«{acc.name}»: браузер — {engine_title(updated.engine)}. Нужен вход в новом браузере")
+
+
+def engine_step(ctx: AppContext, account_id: int) -> Step:
+    """«браузер»: an account that is signed in is asked first (the other browser needs its own sign-in)."""
+    from modules.wizard import check_account_session
+
+    acc = _fresh(ctx, account_id)
+    if acc is None:
+        return Notice("warn", "Аккаунт не найден")
+    if not check_account_session(Path(acc.session_path), acc.engine)[0]:
+        return switch_engine(ctx, acc)
+    return Confirm([Cell(ENGINE_SWITCH_CONFIRM, "warn")], ["Нет", "Переключить"],
+                   lambda i: switch_engine(ctx, acc) if i == 1 else None)
+
+
 def rename_field(ctx: AppContext, account_id: int) -> Step:
     acc = _fresh(ctx, account_id)
 
@@ -460,9 +493,9 @@ def login_menu(ctx: AppContext, account_id: int) -> Step:
 
 
 def check_login(acc: Any) -> Notice:
-    from modules.wizard import check_youtube_session
+    from modules.wizard import check_account_session
 
-    ok = check_youtube_session(Path(acc.session_path))[0]
+    ok = check_account_session(Path(acc.session_path), acc.engine)[0]
     return Notice("ok", f"«{acc.name}»: вход выполнен") if ok else Notice("warn", f"«{acc.name}»: нет входа")
 
 

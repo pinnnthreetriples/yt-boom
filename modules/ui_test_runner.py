@@ -10,10 +10,10 @@ from urllib.parse import quote
 
 from camoufox.async_api import AsyncCamoufox
 from loguru import logger
-from playwright.async_api import Error as PlaywrightError
+from modules.browser_errors import PlaywrightError
 from pydantic import BaseModel, ConfigDict
 
-from config import BrowserSettings, TargetSettings
+from config import BrowserSettings, EngineType, TargetSettings, get_account_session_path
 from modules.interaction_simulator import InteractionError, InteractionSimulator
 
 
@@ -57,13 +57,15 @@ class UITestRunner:
         artifacts_dir: Path | None = None,
         rng: random.Random | None = None,
         locale: str | None = None,
+        engine: EngineType = "camoufox",
     ) -> None:
         self._cfg = browser_settings
         self._target = target
+        self._engine: EngineType = engine
         self._locale = locale or browser_settings.locale  # the account's own locale, else browser.locale
         self._rng = rng or random.Random()
         self._simulator = simulator or InteractionSimulator(rng=self._rng)
-        self._session_dir = browser_settings.session_root / target.name
+        self._session_dir = get_account_session_path(browser_settings.session_root, target.name, engine)
         self._artifacts_dir = artifacts_dir or (browser_settings.session_root / "_artifacts")
 
     @property
@@ -86,10 +88,12 @@ class UITestRunner:
             yt_runner = YouTubeRunner(
                 self._cfg,
                 self._target,
+                session_dir=self._session_dir,
                 simulator=self._simulator,
                 artifacts_dir=self._artifacts_dir,
                 rng=self._rng,
                 locale=self._locale,
+                engine=self._engine,
             )
             try:
                 return await yt_runner.run(
@@ -100,6 +104,13 @@ class UITestRunner:
                 )
             finally:
                 await yt_runner.close()  # run() opens a persistent browser: without this it outlives the call and locks the profile
+
+        if self._engine == "chrome":  # arbitrary staging targets are Camoufox-only; only YouTube has a Chrome runner
+            return SubmissionResult(
+                success=False,
+                duration_seconds=0.0,
+                error=f"engine 'chrome' supports only the YouTube target, not {self._target.name!r}",
+            )
 
         self._prepare_dirs()
 
@@ -206,11 +217,11 @@ class UITestRunner:
         try:
             await search_input.wait_for(state="visible")
             await self._simulator.click_locator(page, search_input)
-            await search_input.fill("")
+            await self._clear_input(page)
             await self._simulator.type_text(page, query[:80])
             await self._simulator.human_pause(0.3, 0.9)
             await self._simulator.click_locator(page, page.locator(self._target.search_button_selector))
-        except (PlaywrightError, InteractionError) as exc:
+        except (*PlaywrightError, InteractionError) as exc:
             raise NavigationError(f"search flow failed: {exc}") from exc
         await self._simulator.human_pause(1.0, 2.5)
 
@@ -249,10 +260,10 @@ class UITestRunner:
         try:
             await self._simulator.click_locator(page, submit_input)
             await self._simulator.thinking_pause()
-            await submit_input.fill("")
+            await self._clear_input(page)
             await self._simulator.type_text(page, text)
             typed = (await submit_input.input_value()).strip()
-        except (PlaywrightError, InteractionError) as exc:
+        except (*PlaywrightError, InteractionError) as exc:
             raise SubmissionError(f"could not fill the submit input: {exc}") from exc
         if typed != text.strip():
             logger.warning("Target {}: typed text differs from the payload", self._target.name)
@@ -260,7 +271,7 @@ class UITestRunner:
         await self._simulator.human_pause(0.4, 1.2)
         try:
             await self._simulator.click_locator(page, page.locator(self._target.submit_button_selector))
-        except (PlaywrightError, InteractionError) as exc:
+        except (*PlaywrightError, InteractionError) as exc:
             raise SubmissionError(f"could not click the submit button: {exc}") from exc
 
         if self._target.confirmation_selector:
@@ -300,6 +311,12 @@ class UITestRunner:
             if match:
                 return match.group(1)
         return None
+
+    async def _clear_input(self, page: Any) -> None:
+        """Empty the focused input with real keys (select-all + Backspace): `fill("")` is a DOM write without key events."""
+        await page.keyboard.press("Control+A", delay=self._rng.uniform(40, 110))
+        await asyncio.sleep(self._rng.uniform(0.1, 0.25))
+        await page.keyboard.press("Backspace", delay=self._rng.uniform(40, 110))
 
     async def _capture_failure(self, page: Any) -> None:
         try:
