@@ -586,3 +586,81 @@ class TestCollectorProxy(unittest.IsolatedAsyncioTestCase):
             youtube_collector.return_value.collect_from_videos = AsyncMock(return_value=[])
             await collector.collect()
         youtube_collector.assert_called_once_with(self.settings, "socks5://1.2.3.4:1080")
+
+
+class SearchPagingTest(unittest.TestCase):
+    """Order by a view cap, the next page token, duplicates, the hint for an empty result."""
+
+    def setUp(self):
+        from config import CollectorEndpoint, CollectorSettings
+        from modules.youtube_collector import YouTubeCollector
+
+        self.collector = YouTubeCollector(CollectorSettings(endpoints=[CollectorEndpoint(name="yt", url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")]))
+
+    @staticmethod
+    def video(vid, views):
+        return {"videoRenderer": {"videoId": vid, "title": {"simpleText": vid}, "viewCountText": {"simpleText": f"{views:,} views"}}}
+
+    @staticmethod
+    def page(videos, token=None):
+        chip = {"chipCloudChipRenderer": {"navigationEndpoint": {"continuationCommand": {"token": "chip_reload"}}}}
+        contents = [{"itemSectionRenderer": {"contents": videos}}]
+        if token:
+            contents.append({"continuationItemRenderer": {"continuationEndpoint": {"continuationCommand": {"token": token}}}})
+        # the header with its filter chips comes first, as in real responses from page 2 on
+        return {"header": {"chipBar": {"chips": [chip]}}, "onResponseReceivedCommands": [
+            {"appendContinuationItemsAction": {"continuationItems": contents}}]}
+
+    def run_search(self, pages, **kwargs):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        responses = []
+        for data in pages:
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json = MagicMock(return_value=data)
+            responses.append(resp)
+        with patch.object(self.collector, "_ensure_innertube_credentials", new_callable=AsyncMock) as creds, \
+             patch.object(self.collector, "open", new_callable=AsyncMock):
+            creds.return_value = ("fake_key", "fake_ver")
+            self.collector._session = MagicMock()
+            self.collector._session.post = AsyncMock(side_effect=responses)
+            videos = asyncio.run(self.collector.search_videos("iphone 17", **kwargs))
+        return videos, [c.kwargs["json"] for c in self.collector._session.post.call_args_list]
+
+    def test_next_page_token_skips_the_header_chips(self):
+        from modules.youtube_collector import next_page_token
+
+        self.assertEqual(next_page_token(self.page([], token="page_2")), "page_2")
+        self.assertIsNone(next_page_token(self.page([])))
+
+    def test_view_cap_searches_by_relevance_and_reads_further_pages(self):
+        pages = [
+            self.page([self.video("big_video_01", 3_000_000), self.video("big_video_02", 2_000_000)], token="page_2"),
+            self.page([self.video("big_video_01", 3_000_000), self.video("fit_video_01", 90_000),
+                       self.video("fit_video_01", 90_000)], token="page_3"),
+            self.page([self.video("fit_video_02", 400_000), self.video("small_vid_01", 500)]),
+        ]
+        videos, requests = self.run_search(pages, min_views=10_000, max_views=500_000, limit=5)
+        self.assertEqual([v["video_id"] for v in videos], ["fit_video_01", "fit_video_02"])  # no duplicate
+        self.assertEqual(requests[0]["params"], "EgIQAQ==")  # relevance, videos only
+        self.assertEqual([r.get("continuation") for r in requests[1:]], ["page_2", "page_3"])  # not the chip token
+
+    def test_without_a_view_cap_the_order_stays_by_views(self):
+        _, requests = self.run_search([self.page([self.video("big_video_01", 3_000_000)])], min_views=10_000, limit=5)
+        self.assertEqual(requests[0]["params"], "CAMSAhAB")
+
+    def test_relevance_with_freshness(self):
+        from modules.youtube_collector import build_search_params
+
+        self.assertEqual(build_search_params("relevance", True, 2), "EgQIAhAB")
+
+    def test_empty_search_hint(self):
+        from modules.youtube_collector import empty_search_hint
+
+        self.assertEqual(empty_search_hint(10_000, 500_000, 24),
+                         "шире свежесть (до 24 ч), шире просмотры (10 тыс – 500 тыс) или другая тема")
+        self.assertEqual(empty_search_hint(1_000_000), "меньше просмотров (от 1 млн) или другая тема")
+        self.assertEqual(empty_search_hint(0, 5000), "больше просмотров (до 5 тыс) или другая тема")
+        self.assertEqual(empty_search_hint(), "другая тема")

@@ -4,6 +4,7 @@ import asyncio
 import random
 import re
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -21,7 +22,7 @@ from modules.geo_guard import check_geo_lock, ensure_network_ready, read_session
 from modules.google_authenticator import has_live_login_cookie, read_chrome_identity
 from modules.interaction_simulator import InteractionError, InteractionSimulator
 from modules.page_helpers import CONSENT_ACCEPT_SELECTORS, SIGN_IN_LINK, first_visible
-from modules.ui_test_runner import NavigationError, SubmissionError, SubmissionResult
+from modules.ui_test_runner import NavigationError, ReplyUnavailableError, SubmissionError, SubmissionResult
 
 
 class YouTubeCommentElement(BaseModel):
@@ -444,6 +445,16 @@ class YouTubeRunner:
             return result
         except asyncio.CancelledError:
             raise
+        except ReplyUnavailableError as exc:
+            duration = time.monotonic() - started
+            logger.warning("Цель пропущена: у комментария нет кнопки «Ответить» (YouTube скрыл её, {:.1f}с)", duration)
+            return SubmissionResult(
+                success=False,
+                final_url=page.url if page is not None else None,
+                duration_seconds=duration,
+                error=f"{type(exc).__name__}: {exc}",
+                reply_unavailable=True,
+            )
         except Exception as exc:
             duration = time.monotonic() - started
             logger.exception("Ошибка при выполнении действия на YouTube ({:.1f}с): {}", duration, exc)
@@ -679,6 +690,10 @@ class YouTubeRunner:
                     logger.info("[Тестовый режим] Навигация успешна. Текст ответа готов: {!r}", text[:60])
                     return f"simulated_sub_reply_{int(time.time())}"
                 raise SubmissionError(msg)
+            if await self._reply_disabled_on_target(page, comment_id):
+                raise ReplyUnavailableError(
+                    "YouTube hides the Reply button on the target comment (#reply-button-end is hidden)"
+                )
             raise SubmissionError("could not locate Reply button on sub-comment")
 
         logger.debug("Нажатие кнопки «Ответить» под комментарием")
@@ -749,21 +764,39 @@ class YouTubeRunner:
             raise SubmissionError(f"YouTube rejected the reply: HTTP {response.status}")
         await self._simulator.human_pause(1.5, 3.0)
 
-        remote_id = await self._extract_remote_id(response)
+        remote_id = await self._extract_remote_id(response, exclude=(comment_id or "",))
         if remote_id is None:
-            logger.warning("В ответе create_comment не найден серверный commentId")
+            logger.warning(
+                "В ответе create_comment не найден id нового ответа: проверка видимости для него невозможна"
+            )
         return remote_id
 
     @staticmethod
-    async def _extract_remote_id(response: Any) -> str | None:
-        """Server-side commentId (Ugw.../Ugx.../Ugy.../Ugz...) from the create_comment response body."""
+    async def _extract_remote_id(response: Any, *, exclude: Iterable[str] = ()) -> str | None:
+        """Server-side id of the NEW reply (`Parent.Reply`, Ugw/Ugx/Ugy/Ugz...) from the create_comment body.
+
+        The body may also name the thread's parent, the comment we answered or its siblings; an id of any of them is
+        public whatever happened to our reply, so taking one would give the visibility check a false "visible".
+        Only a reply-shaped id (it holds a dot, a parent's never does) that is not in `exclude` and sits in the
+        answered comment's thread qualifies, and only when exactly one such id is left; otherwise None ("unknown").
+        """
         try:
             body = await response.text()
         except Exception as exc:
             logger.debug("Не удалось прочитать тело ответа create_comment: {}", exc)
             return None
-        match = _COMMENT_ID_RE.search(body or "")
-        return match.group(1) if match else None
+        skipped = {item for item in exclude if item}
+        threads = {item.split(".", 1)[0] for item in skipped}
+        found = dict.fromkeys(match.group(1) for match in _COMMENT_ID_RE.finditer(body or ""))
+        candidates = [
+            item
+            for item in found
+            if "." in item and item not in skipped and (not threads or item.split(".", 1)[0] in threads)
+        ]
+        if len(candidates) > 1:
+            logger.debug("В ответе create_comment несколько кандидатов на id нового ответа: {}", candidates)
+            return None
+        return candidates[0] if candidates else None
 
     async def _wait_reply_input(self, page: Any, timeout_seconds: float = 6.0) -> Any | None:
         deadline = time.monotonic() + timeout_seconds
@@ -800,6 +833,36 @@ class YouTubeRunner:
     async def _first_visible(page: Any, selector: str, limit: int = 8) -> Any | None:
         """First visible match of `selector`; YouTube keeps hidden duplicates of comments ahead of the real one."""
         return await first_visible(page, selector, limit=limit)
+
+    async def _reply_disabled_on_target(self, page: Any, comment_id: str | None) -> bool:
+        """True when the target comment is fully rendered but YouTube hides its Reply button.
+
+        Structure only (no text, no locale): the comment is visible, its action row `#toolbar` is rendered, and
+        `#reply-button-end` exists yet none of its buttons is visible (YouTube sets `hidden` on it for comments whose
+        replies are off, e.g. some pinned or channel comments). Verified live 2026-11-05: identical for ru-RU and ky-KG
+        accounts, so it is a property of the comment, never of the account language. Unknown state (comment not
+        rendered, no toolbar, no `#reply-button-end` at all) is False: that stays the generic "could not locate" error.
+        """
+        if not comment_id:
+            return False
+        try:
+            for tag in ("ytd-comment-view-model", "ytd-comment-renderer"):
+                comment = await self._first_visible(page, f"{tag}:has(a[href*='lc={comment_id}'])")
+                if comment is None:
+                    continue
+                if await comment.locator("#toolbar").count() == 0 or not await comment.locator("#toolbar").first.is_visible():
+                    return False  # the action row is still rendering: not a verdict
+                slots = comment.locator("#reply-button-end")
+                if await slots.count() == 0:
+                    return False
+                buttons = comment.locator("#reply-button-end :is(button, a)")
+                for index in range(await buttons.count()):
+                    if await buttons.nth(index).is_visible():
+                        return False
+                return True
+        except Exception as exc:
+            logger.debug("Не удалось определить, скрыта ли кнопка «Ответить»: {}", exc)
+        return False
 
     async def _find_sub_comment_reply_button(
         self,

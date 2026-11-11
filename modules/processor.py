@@ -49,6 +49,7 @@ PARAPHRASE_SYSTEM_PROMPT = (
     "Do not add or drop facts. Reply with the rewritten comment only, without quotes or explanations."
 )
 _MENTION = re.compile(r"@[\w.\-]+")
+_CYRILLIC = re.compile(r"[Ѐ-ӿ]")
 
 
 def _trigrams(text: str) -> set[str]:
@@ -62,6 +63,119 @@ def text_similarity(first: str, second: str) -> float:
     if not a or not b:  # emoji- or punctuation-only text has no trigrams: identical text still counts as a copy
         return 1.0 if first.strip().lower() == second.strip().lower() and first.strip() else 0.0
     return len(a & b) / len(a | b)
+
+
+_LANGUAGE_NAMES = {
+    "ru": "Russian", "uk": "Ukrainian", "be": "Belarusian", "kk": "Kazakh", "en": "English", "es": "Spanish",
+    "pt": "Portuguese", "de": "German", "fr": "French", "it": "Italian", "tr": "Turkish", "pl": "Polish",
+    "ar": "Arabic", "hi": "Hindi", "id": "Indonesian", "ja": "Japanese", "ko": "Korean", "zh": "Chinese",
+}
+
+
+def _language_rule(code: str) -> str:
+    """Hard instruction that keeps the reply in the comment's language (an English prompt makes DeepSeek drift to English)."""
+    name = _LANGUAGE_NAMES.get((code or "").lower())
+    if not name:
+        return "Reply in the exact same language as the comment above, even if these instructions are in English."
+    return (
+        f"The comment is written in {name}. Write the reply ONLY in {name}"
+        + ("" if name == "English" else ", never in English")
+        + "."
+    )
+
+
+def _forced_language_rule(code: str) -> str:
+    """Rule for a language fixed in settings: the reply is in it whatever language the comment is in."""
+    name = _LANGUAGE_NAMES.get(code, code.upper())
+    return f"Write the reply ONLY in {name}, regardless of the language of the comment" + (
+        ", never in English." if code != "en" else "."
+    )
+
+
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i", "й": "y",
+    "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f",
+    "х": "x", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sh", "э": "e", "ю": "u", "я": "ya",
+}
+_CYRILLIC_WORD = re.compile(r"(?<![\w@#])[а-яёА-ЯЁ]{4,}(?!\w)")
+# Never touched: @mentions, links with a scheme or www, #hashtags and any whitespace-delimited token with a dot
+# followed by a letter or a slash (bare links like vk.com/путь and Cyrillic domains like привет.рф).
+_PROTECTED_SPAN = re.compile(r"@[\w.\-]+|(?:https?://|www\.)\S+|#\w+|\S*\.(?=[^\W\d_]|/)\S*")
+_NON_RUSSIAN_CYRILLIC = re.compile(r"[іїєґўІЇЄҐЎ]")
+_CYRILLIC_LETTER = re.compile(r"[а-яёА-ЯЁіїєґўІЇЄҐЎ]")
+_HARD_LETTERS = re.compile(r"[ьъыЬЪЫ]")
+
+
+# Common Ukrainian words that have none of the special letters ("Дякую дуже гарно"): a text with one is not Russian.
+_UKRAINIAN_WORDS = frozenset(
+    "дякую дякуємо дуже гарно добре як це ви що який яка яке які якщо також тільки мені тобі цей ця".split()
+)
+
+
+def _is_clearly_russian(text: str) -> bool:
+    """Russian text: Cyrillic letters are the majority, no Ukrainian / Belarusian letter (і ї є ґ ў), no typical word."""
+    if _NON_RUSSIAN_CYRILLIC.search(text):
+        return False
+    if _UKRAINIAN_WORDS.intersection(re.findall(r"[а-яё]+", text.lower())):
+        return False
+    cyrillic = len(_CYRILLIC_LETTER.findall(text))
+    letters = sum(1 for c in text if c.isalpha())
+    return cyrillic > 0 and cyrillic * 2 > letters
+
+
+def _translit_chunk(chunk: str, *, capitalize: bool, upper: bool) -> str:
+    out = "".join(_TRANSLIT[c.lower()] for c in chunk)
+    if upper:
+        return out.upper()
+    return out.capitalize() if capitalize else out
+
+
+def mix_latin(
+    text: str,
+    probability: float,
+    rng: random.Random | None = None,
+    max_length: int | None = None,
+) -> str:
+    """Write a few letters of a Russian word in Latin ("привет" -> "prивет", "приходи" -> "приxodi").
+
+    This is done by code on the final text, after DeepSeek has answered: the model itself is never asked to mix
+    alphabets. With the given probability per message one word (rarely two) gets a 2-4 letter prefix or suffix
+    transliterated. Words with ь/ъ/ы, @mentions, #hashtags, URLs and non-Cyrillic text are left alone; a result
+    longer than `max_length` (transliteration can lengthen a word) is discarded and the text returned unchanged.
+    Only Russian messages are mixed: one with Ukrainian / Belarusian letters, or where Cyrillic is not the majority
+    of the letters (an English message with one Russian word), stays as it is; so do links without a scheme.
+    """
+    generator = rng or random.Random()
+    if probability <= 0 or generator.random() >= probability:
+        return text
+    protected = [m.span() for m in _PROTECTED_SPAN.finditer(text)]
+    keep = [True] * len(text)
+    for a, b in protected:
+        keep[a:b] = [False] * (b - a)
+    unprotected = "".join(c for c, k in zip(text, keep) if k)
+    if not _is_clearly_russian(unprotected):
+        return text
+    words = [
+        m
+        for m in _CYRILLIC_WORD.finditer(text)
+        if not _HARD_LETTERS.search(m.group()) and not any(a < m.end() and m.start() < b for a, b in protected)
+    ]
+    if not words:
+        return text
+    picked = generator.sample(words, k=min(len(words), 2 if generator.random() < 0.25 else 1))
+    mixed_text = text
+    for match in sorted(picked, key=lambda m: m.start(), reverse=True):
+        word = match.group()
+        size = generator.randint(2, min(4, len(word) - 1))
+        upper = len(word) > 1 and word.isupper()
+        if generator.random() < 0.5:
+            mixed = _translit_chunk(word[:size], capitalize=word[0].isupper(), upper=upper) + word[size:]
+        else:
+            mixed = word[:-size] + _translit_chunk(word[-size:], capitalize=False, upper=upper)
+        mixed_text = mixed_text[: match.start()] + mixed + mixed_text[match.end() :]
+    if max_length is not None and len(mixed_text) > max(max_length, len(text)):
+        return text
+    return mixed_text
 
 
 class ProcessorError(RuntimeError):
@@ -173,8 +287,11 @@ class DeepSeekProcessor:
     async def close(self) -> None:
         await self._client.close()
 
-    async def paraphrase(self, text: str) -> str:
+    async def paraphrase(self, text: str, *, source: str | None = None) -> str:
         """Reword `text` keeping its meaning, with one retry when the result is unusable or a near-copy.
+
+        `source` is the raw template before {placeholders} were filled: the language of the rewrite follows its own
+        wording, not a quoted comment that got substituted into it.
 
         A variant is unusable when it is empty, too long, drops a mention, or reaches SIMILARITY_LIMIT against the
         template or a recently produced variant. When no usable variant comes out (API error, two bad results) the
@@ -182,6 +299,19 @@ class DeepSeekProcessor:
         """
         mentions = [m.rstrip(".-") for m in _MENTION.findall(text)]
         limit = max(self._text.max_output_length, int(len(text) * 1.5))
+        # The template's language wins, whatever language the comment under it is in; never translate.
+        forced = getattr(self._text, "reply_language", "auto")
+        if forced != "auto":
+            name = _LANGUAGE_NAMES.get(forced, forced.upper())
+            template_rule = f"Write the rewrite ONLY in {name}. If the text is in another language, translate it into {name}."
+        elif _is_clearly_russian(source if source is not None else text):
+            template_rule = "The text is in Russian. Write the rewrite ONLY in Russian, never in English, and never translate it."
+        else:
+            template_rule = "Write the rewrite in the exact same language as the text. Never translate it."
+            if source is not None and source != text:
+                template_rule += (
+                    " The language is decided by the wording of the template itself, not by a quoted comment inside it."
+                )
         for attempt in (1, 2):
             prompt = f"Comment:\n{text}"
             if self._recent_variants:
@@ -193,8 +323,8 @@ class DeepSeekProcessor:
                 response = await self._client.chat.completions.create(
                     model=self._api.model,
                     messages=[
-                        {"role": "system", "content": PARAPHRASE_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
+                        {"role": "system", "content": f"{PARAPHRASE_SYSTEM_PROMPT}\n\n{template_rule}"},
+                        {"role": "user", "content": f"{prompt}\n\n{template_rule}"},
                     ],
                     temperature=max(float(self._api.temperature), 0.9),
                     max_tokens=self._api.max_tokens,
@@ -214,7 +344,7 @@ class DeepSeekProcessor:
                 logger.warning("Перефразирование слишком похоже на шаблон или недавний ответ (попытка {}/2)", attempt)
                 continue
             self._recent_variants.append(variant)
-            return variant
+            return mix_latin(variant, self._text.latin_mix_probability, self._rng, max_length=limit)
 
         self.fallback_count += 1
         logger.error(
@@ -223,7 +353,7 @@ class DeepSeekProcessor:
             self.fallback_count,
         )
         self._recent_variants.append(text)  # later paraphrases must not echo what is about to be posted
-        return text
+        return mix_latin(text, self._text.latin_mix_probability, self._rng, max_length=limit)
 
     async def generate(self, item: CollectedItem, *, style: str | None = None) -> str:
         if not item.text.strip():
@@ -233,9 +363,11 @@ class DeepSeekProcessor:
             available_styles = getattr(self._text, "styles", None) or DEFAULT_STYLES
             chosen_style = self._rng.choice(available_styles)
 
+        forced = getattr(self._text, "reply_language", "auto")
+        prompt_language = (item.language if forced == "auto" else forced).upper()
         prompt_kwargs = {
             "text": item.text,
-            "language": item.language.upper(),
+            "language": prompt_language,
             "parent_text": item.parent_text or "",
             "parent_author": item.parent_author or "",
             "author": item.author or "",
@@ -244,7 +376,7 @@ class DeepSeekProcessor:
         try:
             prompt = self._text.user_prompt_template.format(**prompt_kwargs)
         except KeyError:
-            prompt = self._text.user_prompt_template.format(text=item.text, language=item.language.upper())
+            prompt = self._text.user_prompt_template.format(text=item.text, language=prompt_language)
 
         if item.parent_text and "{parent_text}" not in self._text.user_prompt_template:
             prompt = f"Context (parent comment): {item.parent_text}\nTarget sub-comment to reply to: {item.text}\n" + prompt
@@ -252,9 +384,10 @@ class DeepSeekProcessor:
         if "{style}" not in self._text.user_prompt_template and chosen_style:
             prompt = f"{prompt}\nTone/Style: {chosen_style}"
 
+        language_rule = _language_rule(item.language) if forced == "auto" else _forced_language_rule(forced)
         messages = [
-            {"role": "system", "content": f"{self._text.system_prompt.strip()}\n\n{ANTI_CLICHE_RULES}"},
-            {"role": "user", "content": prompt.strip()},
+            {"role": "system", "content": f"{self._text.system_prompt.strip()}\n\n{ANTI_CLICHE_RULES}\n\n{language_rule}"},
+            {"role": "user", "content": f"{prompt.strip()}\n\n{language_rule}"},
         ]
 
         last_error = "unknown error"
@@ -307,7 +440,9 @@ class DeepSeekProcessor:
                             attempt,
                             self._api.max_retries,
                         )
-                        return text
+                        return mix_latin(
+                            text, self._text.latin_mix_probability, self._rng, max_length=self._text.max_output_length
+                        )
 
             if not retryable:
                 raise ProcessorError(f"Ошибка обращения к DeepSeek API: {last_error}")
@@ -352,6 +487,7 @@ __all__ = [
     "DeepSeekProcessor",
     "ProcessorError",
     "normalize_text",
+    "mix_latin",
     "resolve_reply_text",
     "should_paraphrase",
     "text_similarity",

@@ -46,6 +46,7 @@ collector:
   search_query: null
   min_views: 500000
   max_views: 5000000
+  max_videos: 5
   target_mode: first_reply
 processor:
   system_prompt: 'You are an active YouTube user participating in comment discussions.
@@ -82,6 +83,8 @@ processor:
   lowercase_initial_probability: 0.2
   max_output_length: 400
   paraphrase_custom: true
+  reply_language: auto  # auto = язык комментария/шаблона; либо код: ru, en, es...; в интерфейсе: вкладка «Ответы», строка «язык»
+  latin_mix_probability: 0.0  # доля ответов, где в одном слове часть букв пишется латиницей (prивет); 0 = выкл. Код делает это после ответа DeepSeek, в режимах ИИ и свой текст; в интерфейсе: вкладка «Ответы», строка «смешивание букв»
 browser:
   headless: false
   os: windows
@@ -130,6 +133,16 @@ limits:
   pause_max_seconds: 45
   retry_backoff_seconds: 30
   max_queue_attempts: 3
+  # Проверка видимости: после опубликованного ответа бот через visibility_check_delay_seconds секунд заходит на
+  # YouTube как обычный зритель (без cookies) и ищет там свой комментарий. Результат: «виден» (зелёный) или «не
+  # подтверждён» (жёлтый) в логе и журнале. Только наблюдение: статус ответа, лимиты и счётчик ошибок не меняются.
+  # Переключатель — вкладка «Запуск». Задержка 0 тоже выключает проверку.
+  visibility_check_enabled: true
+  visibility_check_delay_seconds: 45
+  # Если ответ не найден (или проверить не удалось), проверка повторяется через эти паузы, секунды; первая находка
+  # её завершает, поэтому обычный ответ не ждёт лишнего. Пустой список [] — одна проверка. Прогон в конце ждёт
+  # не дольше суммы задержки, пауз и минуты запаса.
+  visibility_retry_delays_seconds: [120, 300]
 validator:
   delay_seconds: 300
   timeout_seconds: 30

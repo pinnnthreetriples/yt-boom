@@ -9,7 +9,7 @@ from urllib.parse import quote_plus
 
 from loguru import logger
 
-from config import BrowserSettings, TargetSettings, resolve_account_proxy
+from config import BrowserSettings, ProxyUnavailableError, TargetSettings, resolve_account_proxy
 from database import AccountRecord, Database
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
 from modules.youtube_runner import YouTubeRunner
@@ -64,7 +64,11 @@ class AccountWarmer:
         db: Database | None = None,
     ) -> WarmUpResult:
         logger.info("Начинается прогрев аккаунта {!r} (длительность ~{:.0f}с)...", account.name, duration_seconds)
-        proxy = resolve_account_proxy(account.proxy_url, self._cfg.proxy)
+        try:
+            proxy = resolve_account_proxy(account)
+        except ProxyUnavailableError as exc:  # fail closed: no warm-up from the own IP
+            logger.error("{}", exc)
+            return WarmUpResult(account.name, False, None, 0.0, str(exc))
         target = (
             self._cfg.targets[0]
             if self._cfg.targets

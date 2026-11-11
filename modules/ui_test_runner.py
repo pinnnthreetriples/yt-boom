@@ -21,6 +21,14 @@ class SubmissionError(RuntimeError):
     """Raised when the fixture text cannot be submitted through the target form."""
 
 
+class ReplyUnavailableError(SubmissionError):
+    """YouTube itself hides the Reply button of the target comment (replies are off for it).
+
+    Not an account, proxy or UI-language problem: every account sees the same comment without the button, so the
+    target must be skipped and must not count against the account's error budget.
+    """
+
+
 class NavigationError(RuntimeError):
     """Raised when the target page or its result container cannot be reached."""
 
@@ -33,6 +41,8 @@ class SubmissionResult(BaseModel):
     final_url: str | None = None
     duration_seconds: float
     error: str | None = None
+    # the target comment has no Reply button at all (see ReplyUnavailableError): skip it, do not blame the account
+    reply_unavailable: bool = False
 
 
 class UITestRunner:

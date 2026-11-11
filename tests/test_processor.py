@@ -127,6 +127,46 @@ class TestProcessor(unittest.TestCase):
             self.assertIn("Sub: Sub-comment text (by UserA)", messages[1]["content"])
             self.assertIn("Lang: EN", messages[1]["content"])
 
+    def test_reply_language_setting_forces_language_in_prompts(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        with self.assertRaises(ValueError):
+            ProcessorSettings(system_prompt="s", user_prompt_template="{text}", reply_language="russian")
+
+        proc_cfg = ProcessorSettings(system_prompt="s", user_prompt_template="Lang: {language}\n{text}", reply_language="RU")
+        self.assertEqual(proc_cfg.reply_language, "ru")
+        proc = DeepSeekProcessor(DeepSeekSettings(api_key="k"), proc_cfg)
+        item = CollectedItem(
+            endpoint="youtube:dQw4w9WgXcQ", external_id="v#c", text="Nice video", language="en", confidence=0.9
+        )
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = "Класс"
+        with patch.object(proc._client.chat.completions, "create", new_callable=AsyncMock, return_value=resp) as create:
+            asyncio.run(proc.generate(item))
+            messages = create.call_args.kwargs["messages"]
+            self.assertIn("ONLY in Russian", messages[0]["content"])
+            self.assertIn("Lang: RU", messages[1]["content"])
+
+            create.reset_mock()
+            asyncio.run(proc.paraphrase("Nice template for you"))
+            self.assertIn("translate it into Russian", create.call_args.kwargs["messages"][0]["content"])
+
+    def test_mix_latin_transliterates_part_of_a_russian_word(self):
+        import random
+
+        from modules.processor import mix_latin
+
+        text = "Привет, приходи завтра на стрим"
+        self.assertEqual(mix_latin(text, 0.0, random.Random(1)), text)
+        mixed = [mix_latin(text, 1.0, random.Random(seed)) for seed in range(20)]
+        self.assertTrue(all(m != text for m in mixed))
+        self.assertTrue(all(any("a" <= c.lower() <= "z" for c in m) for m in mixed))
+        self.assertEqual(mix_latin("@Вася, Great video", 1.0, random.Random(1)), "@Вася, Great video")  # nothing eligible
+        with self.assertRaises(ValueError):
+            ProcessorSettings(system_prompt="s", user_prompt_template="{text}", latin_mix_probability=1.5)
+
     def test_processor_empty_input_raises(self):
         import asyncio
 

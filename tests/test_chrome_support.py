@@ -649,21 +649,18 @@ class TestChromeHeartbeatCheck(unittest.IsolatedAsyncioTestCase):
         self.assertIn("request not sent", status.details)
         self.assertNotIn("SECRETPW", status.details)
 
-    async def test_chrome_account_proxy_chain_own_then_global(self):
+    async def test_chrome_account_goes_through_its_own_proxy_and_never_falls_back(self):
         await self._save()
         account = AccountRecord(id=1, name="alice", session_path=str(self.profile), created_at="now", engine="chrome",
                                 proxy_url="http://own:80")
-        for own, global_proxy, expected in (("http://own:80", "http://global:80", "http://own:80"),
-                                            (None, "http://global:80", "http://global:80")):
-            with self.subTest(own=own):
-                session = self._session()
-                with patch("modules.session_heartbeat.AsyncSession", return_value=session) as factory:
-                    status = await check_account_heartbeat(account.model_copy(update={"proxy_url": own}), global_proxy)
-                self.assertTrue(status.is_alive)
-                self.assertEqual(factory.call_args.kwargs["proxy"], expected)
+        session = self._session()
+        with patch("modules.session_heartbeat.AsyncSession", return_value=session) as factory:
+            status = await check_account_heartbeat(account)
+        self.assertTrue(status.is_alive)
+        self.assertEqual(factory.call_args.kwargs["proxy"], "http://own:80")
         with patch("modules.session_heartbeat.AsyncSession", side_effect=AssertionError("network used")) as factory:
-            bad = await check_account_heartbeat(account.model_copy(update={"proxy_url": "not a proxy"}), "http://global:80")
-        factory.assert_not_called()  # the account's own broken proxy does not fall back to the global one or to direct
+            bad = await check_account_heartbeat(account.model_copy(update={"proxy_url": "not a proxy"}))
+        factory.assert_not_called()  # a broken proxy of the account never turns into a direct request
         self.assertFalse(bad.is_alive)
 
     async def test_chrome_check_stops_when_the_guard_refuses_or_a_proxy_is_required(self):
@@ -1319,15 +1316,15 @@ class TestAccountEngineInDatabase(unittest.IsolatedAsyncioTestCase):
 
     async def test_migration_adds_the_engine_column_to_an_old_accounts_table(self):
         old = self.root / "old.db"
-        conn = sqlite3.connect(old)
-        conn.execute(
-            "CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, session_path TEXT NOT NULL,"
-            " proxy_url TEXT, is_active INTEGER NOT NULL DEFAULT 1, total_replies INTEGER NOT NULL DEFAULT 0,"
-            " created_at TEXT NOT NULL, last_used_at TEXT)"
-        )
-        conn.execute("INSERT INTO accounts (name, session_path, created_at) VALUES ('legacy', 'test_sessions/legacy', 'now')")
-        conn.execute("PRAGMA user_version = 2")
+        first = Database(old)
+        await first.connect()
+        await first.init_schema()
+        await first.upsert_account("legacy", session_path="test_sessions/legacy")
+        await first.close()
+        conn = sqlite3.connect(old)  # the table as it was before the engine column existed
+        conn.execute("ALTER TABLE accounts DROP COLUMN engine")
         conn.commit()
+        self.assertNotIn("engine", {row[1] for row in conn.execute("PRAGMA table_info(accounts)")})
         conn.close()
         db = Database(old)
         await db.connect()
@@ -1345,27 +1342,46 @@ class TestAccountEngineInDatabase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(columns["engine"][4], "'camoufox'")
 
 
-class TestEngineInTheWizard(unittest.TestCase):
+class _FakeCtx:
+    """The part of AppContext the account actions use: `db(fn)` runs `fn(db)` against a stub."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def db(self, fn):
+        return asyncio.run(fn(self._db))
+
+
+class TestEngineInTheAccountsTab(unittest.TestCase):
     def setUp(self):
+        from modules.ui import icons
+
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.addCleanup(icons.use_emoji, icons.EMOJI)
 
     def test_icons_have_an_emoji_and_a_plain_form(self):
-        from modules.ui.icons import engine_icon, icon_cells, other_engine
+        from modules.ui import icons
 
-        self.assertEqual(engine_icon("camoufox", plain=False), "🦊")
-        self.assertEqual(engine_icon("chrome", plain=False), "🌐")
-        self.assertEqual(engine_icon("camoufox", plain=True), "[Fx]")
-        self.assertEqual(engine_icon("chrome", plain=True), "[Cr]")
-        self.assertEqual((icon_cells(False), icon_cells(True)), (2, 4))
-        self.assertEqual((other_engine("chrome"), other_engine("camoufox")), ("camoufox", "chrome"))
-        with patch.dict("os.environ", {"YT_PLAIN_UI": "1"}):
-            self.assertEqual(engine_icon("chrome"), "[Cr]")
+        icons.use_emoji(True)
+        self.assertEqual((icons.engine_icon("camoufox"), icons.engine_icon("chrome")), ("🦊", "🌐"))
+        icons.use_emoji(False)
+        self.assertEqual((icons.engine_icon("camoufox"), icons.engine_icon("chrome")), ("F", "C"))
+        self.assertEqual((icons.other_engine("chrome"), icons.other_engine("camoufox")), ("camoufox", "chrome"))
+        self.assertEqual((icons.engine_title("chrome"), icons.engine_title("camoufox")), ("Google Chrome", "Camoufox"))
+
+    def test_the_account_row_shows_the_engine(self):
+        from modules.ui import icons
+        from modules.ui.tab_accounts import account_row
+
+        icons.use_emoji(False)
+        for engine, mark in (("camoufox", "F"), ("chrome", "C")):
+            acc = AccountRecord(id=1, name="alice", session_path="s", created_at="now", engine=engine)
+            row = account_row(None, acc, False, None, [])
+            self.assertIn(mark, [cell.text for cell in row.cells])
 
     def test_chrome_session_check_reads_the_saved_state(self):
-        import asyncio
-
         from modules.wizard import check_account_session
 
         profile = self.root / "chrome" / "alice"
@@ -1376,39 +1392,51 @@ class TestEngineInTheWizard(unittest.TestCase):
         self.assertTrue(check_account_session(profile, "chrome")[0])
         self.assertFalse(check_account_session(profile)[0])  # as Camoufox the folder has no cookies.sqlite
 
-    def test_switching_the_engine_is_mirrored_into_config_yaml(self):
-        from modules.wizard import _setup_engine_in_config
+    def test_switch_engine_moves_the_account_to_the_other_browser(self):
+        from modules.ui.shell import Notice
+        from modules.ui.tab_accounts import switch_engine
 
-        path = self.root / "config.yaml"
-        path.write_text(yaml.safe_dump({"browser": {"accounts": [
-            {"name": "alice", "session_path": "test_sessions/alice"}, {"name": "bob", "session_path": "test_sessions/bob"},
-        ]}}), encoding="utf-8")
-        _setup_engine_in_config(path, "alice", "chrome", "test_sessions/chrome/alice")
-        accounts = yaml.safe_load(path.read_text(encoding="utf-8"))["browser"]["accounts"]
-        self.assertEqual(accounts[0], {"name": "alice", "session_path": "test_sessions/chrome/alice", "engine": "chrome"})
-        self.assertEqual(accounts[1], {"name": "bob", "session_path": "test_sessions/bob"})
+        db = MagicMock()
+        db.set_account_engine = AsyncMock(return_value=MagicMock(engine="chrome"))
+        acc = AccountRecord(id=7, name="alice", session_path="s", created_at="now")
+        notice = switch_engine(_FakeCtx(db), acc)
+        self.assertIsInstance(notice, Notice)
+        self.assertEqual(notice.kind, "ok")
+        db.set_account_engine.assert_awaited_once_with(7, "chrome")
+        db.set_account_engine = AsyncMock(side_effect=ValueError("socks5 with a login"))
+        self.assertEqual(switch_engine(_FakeCtx(db), acc).kind, "err")
 
-    def test_the_switch_asks_before_leaving_a_signed_in_profile(self):
-        from modules import wizard
+    def test_a_signed_in_account_is_asked_before_the_switch(self):
+        from modules.ui.shell import Confirm
+        from modules.ui.tab_accounts import ENGINE_SWITCH_CONFIRM, engine_step
 
-        acc = MagicMock(engine="camoufox")
-        acc.id, acc.name = 1, "alice"
-        with patch.object(wizard, "prompt_user", return_value="n") as ask, patch.object(wizard, "_pools_db") as db:
-            self.assertIsNone(wizard._setup_switch_engine(self.root / "config.yaml", acc, logged_in=True))
-        self.assertIn("отдельной авторизации в Google", ask.call_args.args[0])
-        db.assert_not_called()
-        updated = MagicMock(engine="chrome", session_path="test_sessions/chrome/alice")
-        with patch.object(wizard, "prompt_user", return_value="y"), \
-                patch.object(wizard, "_pools_db", return_value=updated) as db, \
-                patch.object(wizard, "_setup_engine_in_config") as mirror:
-            notice = wizard._setup_switch_engine(self.root / "config.yaml", acc, logged_in=True)
-        self.assertEqual(notice[0], "ok")
-        db.assert_called_once()
-        mirror.assert_called_once_with(self.root / "config.yaml", "alice", "chrome", "test_sessions/chrome/alice")
-        with patch.object(wizard, "prompt_user") as ask, patch.object(wizard, "_pools_db", return_value=updated):
-            with patch.object(wizard, "_setup_engine_in_config"):
-                wizard._setup_switch_engine(self.root / "config.yaml", acc, logged_in=False)
-        ask.assert_not_called()  # nothing to lose: no question
+        acc = AccountRecord(id=7, name="alice", session_path=str(self.root), created_at="now")
+        db = MagicMock()
+        db.get_account = AsyncMock(return_value=acc)
+        db.set_account_engine = AsyncMock(return_value=MagicMock(engine="chrome"))
+        with patch("modules.wizard.check_account_session", return_value=(True, "")):
+            step = engine_step(_FakeCtx(db), 7)
+            self.assertIsInstance(step, Confirm)
+            self.assertIn("отдельной авторизации в Google", ENGINE_SWITCH_CONFIRM)
+            self.assertEqual(step.question[0].text, ENGINE_SWITCH_CONFIRM)
+            self.assertEqual(step.choices, ["Нет", "Переключить"])
+            self.assertIsNone(step.pick(0))
+            db.set_account_engine.assert_not_awaited()
+            self.assertEqual(step.pick(1).kind, "ok")
+            db.set_account_engine.assert_awaited_once_with(7, "chrome")
+
+    def test_an_account_without_a_session_switches_without_a_question(self):
+        from modules.ui.shell import Notice
+        from modules.ui.tab_accounts import engine_step
+
+        acc = AccountRecord(id=7, name="alice", session_path=str(self.root), created_at="now", engine="chrome")
+        db = MagicMock()
+        db.get_account = AsyncMock(return_value=acc)
+        db.set_account_engine = AsyncMock(return_value=MagicMock(engine="camoufox"))
+        with patch("modules.wizard.check_account_session", return_value=(False, "")):
+            step = engine_step(_FakeCtx(db), 7)
+        self.assertIsInstance(step, Notice)
+        db.set_account_engine.assert_awaited_once_with(7, "camoufox")
 
 
 class TestChromeWindowSize(unittest.TestCase):

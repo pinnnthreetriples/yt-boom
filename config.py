@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import string
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -96,6 +98,7 @@ class CollectorSettings(BaseModel):
     min_views: int = Field(default=0, ge=0)
     max_views: int | None = Field(default=None)
     max_age_hours: int | None = Field(default=None, ge=1)  # auto-search: only videos published within N hours
+    max_videos: int = Field(default=5, ge=1, le=50)  # auto-search: videos taken per run
     comments_per_video: int = Field(default=2, ge=1, le=100)
     target_mode: str = Field(default="first_reply")
 
@@ -138,6 +141,19 @@ class ProcessorSettings(BaseModel):
     reply_mode: Literal["ai", "custom"] = "ai"
     custom_replies: list[str] = Field(default_factory=list)
     paraphrase_custom: bool = True  # reword custom templates through DeepSeek (needs an API key)
+    # Language of the posted replies: "auto" follows the comment (AI) / the template (custom); an ISO 639-1 code
+    # (ru, en, ...) forces it, translating a template of another language when paraphrase_custom is on.
+    reply_language: str = "auto"
+    # Share of messages in which one Russian word gets a few letters written in Latin ("prивет"); 0 = off.
+    latin_mix_probability: float = Field(default=0.0, ge=0, le=1)
+
+    @field_validator("reply_language")
+    @classmethod
+    def _normalize_reply_language(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value != "auto" and not re.fullmatch(r"[a-z]{2}", value):
+            raise ValueError("processor.reply_language must be 'auto' or a two-letter ISO 639-1 code like 'ru'")
+        return value
 
     @field_validator("user_prompt_template")
     @classmethod
@@ -295,10 +311,75 @@ def mask_proxy_url(proxy_url: str | None) -> str:
     return f"{scheme}://{user}{':***' if parsed.get('password') else ''}@{host_port}"
 
 
-def resolve_account_proxy(account_proxy: str | None, global_proxy: str | None) -> str | None:
-    """The proxy one account uses everywhere (sign-in, posting): its own, otherwise the global `browser.proxy`."""
-    own = account_proxy.strip() if account_proxy else ""
-    return own or (global_proxy or None)
+# Written to `accounts.proxy_url` for every account whose proxy lives in the `proxies` table. Older versions read
+# that column as the proxy itself: `parse_proxy` rejects this value, so an old build fails instead of going direct.
+PROXY_LIBRARY_MARKER = "library:see-proxies-table"
+
+
+@dataclass(frozen=True)
+class ProxyParts:
+    """One proxy split into the fields the `proxies` table stores. `scheme` None: not known yet (a check finds it)."""
+
+    scheme: str | None
+    host: str
+    port: int
+    login: str | None = None
+    password: str | None = None
+
+    def __repr__(self) -> str:  # the password never reaches a log line
+        return f"ProxyParts(scheme={self.scheme!r}, host={self.host!r}, port={self.port}, login={self.login!r})"
+
+
+def compose_proxy_url(scheme: str | None, host: str, port: int, login: str | None = None, password: str | None = None) -> str:
+    """The one place a proxy address is assembled: `scheme://login:password@host:port`, credentials percent-encoded
+    (so `@ : / %` in a password survive `parse_proxy` and libcurl), IPv6 hosts in brackets, no scheme -> http."""
+    host = host.strip().strip("[]")
+    address = f"[{host}]" if ":" in host else host
+    credentials = ""
+    if login:
+        credentials = quote(login, safe="") + (f":{quote(password, safe='')}" if password else "") + "@"
+    return f"{scheme or 'http'}://{credentials}{address}:{int(port)}"
+
+
+def split_proxy(proxy_url: str) -> ProxyParts:
+    """`ProxyParts` from any form `parse_proxy` accepts; `scheme` is None when the text names none. ValueError otherwise."""
+    text = (proxy_url or "").strip()
+    if not text or text == PROXY_LIBRARY_MARKER:
+        raise ValueError(_PROXY_ERROR)
+    parsed = parse_proxy(text)
+    assert parsed is not None
+    scheme, _, address = parsed["server"].partition("://")
+    host, _, port = address.rpartition(":")
+    if scheme == "socks5h":  # Playwright knows only socks5; DNS on the proxy is curl_proxy_url's job
+        scheme = "socks5"
+    return ProxyParts(
+        scheme.lower() if "://" in text else None,
+        host.strip("[]").lower(),
+        int(port),
+        parsed.get("username") or None,
+        parsed.get("password") or None,
+    )
+
+
+class ProxyUnavailableError(RuntimeError):
+    """An account (or the search) has a proxy assigned that cannot be read: it must not run at all, never go direct."""
+
+
+def resolve_account_proxy(account: Any) -> str | None:
+    """The proxy one account uses everywhere (sign-in, posting, warm-up, heartbeat): its own one, or None = direct.
+
+    There is no global fallback. An assigned proxy that cannot be read (`AccountRecord.proxy_unavailable`: DPAPI
+    could not decrypt it, the record was deleted or damaged) raises ProxyUnavailableError instead of going direct.
+    """
+    name = getattr(account, "name", "?")
+    own = (getattr(account, "proxy_url", None) or "").strip()
+    if getattr(account, "proxy_unavailable", False) or own == PROXY_LIBRARY_MARKER:
+        raise ProxyUnavailableError(
+            f"Аккаунт «{name}»: назначенный ему прокси не читается (запись удалена или повреждена, либо база "
+            "перенесена с другого компьютера/пользователя Windows и пароль не расшифровывается). Аккаунт не запущен, "
+            "чтобы не выйти в сеть с вашего IP: назначьте прокси заново на этапе «Прокси» мастера"
+        )
+    return own or None
 
 
 EngineType = Literal["camoufox", "chrome"]
@@ -421,8 +502,22 @@ class LimitsSettings(BaseModel):
     pause_max_seconds: float = Field(default=20.0, ge=0)
     # Wait this long after a posted reply, then look for it as an anonymous visitor would (0 turns the check off).
     visibility_check_delay_seconds: float = Field(default=45.0, ge=0)
+    # Pauses before each further look when the reply was not seen (a miss can be propagation delay); the first
+    # sighting ends the series, so a normal reply costs no extra wait. An empty list means a single look.
+    visibility_retry_delays_seconds: list[float] = Field(default_factory=lambda: [120.0, 300.0])
+    # The switch of the «Запуск» tab; the check runs only when it is on AND the delay above is above 0.
+    visibility_check_enabled: bool = True
     retry_backoff_seconds: float = Field(default=45.0, ge=1)
     max_queue_attempts: int = Field(default=3, ge=1, le=10)
+
+    @field_validator("visibility_retry_delays_seconds")
+    @classmethod
+    def _validate_visibility_retry_delays(cls, value: list[float]) -> list[float]:
+        if len(value) > 10:
+            raise ValueError("limits.visibility_retry_delays_seconds holds at most 10 pauses")
+        if any(not math.isfinite(delay) or delay < 0 for delay in value):
+            raise ValueError("limits.visibility_retry_delays_seconds must hold finite, non-negative pauses")
+        return value
 
     @model_validator(mode="after")
     def _validate_pauses(self) -> "LimitsSettings":
@@ -524,6 +619,23 @@ def _resolve_path(base: Path, value: Path) -> Path:
     return value if value.is_absolute() else (base / value).resolve()
 
 
+def repair_text(value: Any) -> Any:
+    """Join UTF-16 surrogate halves into real characters (strings, lists and mappings, recursively).
+
+    The Windows console delivers an emoji as two surrogate halves, and YAML keeps them as "\\uD83D\\uDE33":
+    such a string cannot be stored in SQLite or typed into a browser. A half without its pair is dropped.
+    """
+    if isinstance(value, str):
+        if not any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            return value
+        return value.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "ignore")
+    if isinstance(value, list):
+        return [repair_text(item) for item in value]
+    if isinstance(value, dict):
+        return {key: repair_text(item) for key, item in value.items()}
+    return value
+
+
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
     config_path = Path(path)
     if not config_path.is_file():
@@ -535,6 +647,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         raise ConfigError(f"failed to read {config_path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError(f"{config_path} must contain a YAML mapping at the top level")
+    raw = repair_text(raw)
 
     missing: list[str] = []
     expanded = _expand_env(raw, "$", missing)
@@ -576,13 +689,18 @@ __all__ = [
     "DeepSeekSettings",
     "EngineType",
     "LimitsSettings",
+    "PROXY_LIBRARY_MARKER",
+    "ProxyParts",
+    "ProxyUnavailableError",
     "ProcessorSettings",
     "TargetSettings",
     "ValidatorSettings",
+    "compose_proxy_url",
     "get_account_session_path",
     "validate_proxy_for_engine",
     "load_config",
     "mask_proxy_url",
     "parse_proxy",
     "resolve_account_proxy",
+    "split_proxy",
 ]

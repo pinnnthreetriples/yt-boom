@@ -14,7 +14,7 @@ edges:
   - target: context/architecture.md
     condition: when understanding how components connect during setup
 grounds_to: []
-last_updated: 2026-10-31
+last_updated: 2026-11-04
 mex:
   id: mx_01M69TVZYDJAF96PJC4A94TX3T
   type: guide
@@ -50,7 +50,7 @@ mex:
    ```
 3. **Configure environment & keys**:
    Copy or edit `config.yaml` with your DeepSeek API key and proxy settings if applicable.
-4. **Run interactive onboarding wizard**:
+4. **Run the console interface** (six tabs: «Запуск», «Аккаунты», «Прокси», «Проекты», «Цель», «Ответы»):
    ```powershell
    python youtube_bot.py --wizard
    ```
@@ -65,11 +65,12 @@ mex:
 
 ## Common Commands
 - **Run all automated tests**: `python run_tests.py`
-- **Launch interactive wizard**: `python youtube_bot.py` (or `python youtube_bot.py --wizard`)
+- **Launch the console interface**: `python youtube_bot.py` (or `python youtube_bot.py --wizard`)
 - **Authenticate Google account**: `python youtube_bot.py --auth-account <name>`
 - **Batch import accounts**: `python youtube_bot.py --import-accounts-file <path>`
 - **List stored accounts**: `python youtube_bot.py --list-accounts`
-- **Search videos & reply**: `python youtube_bot.py --search "<topic>" --min-views 10000 --max-views 500000 --dry-run`
+- **Run / search & reply**: `python youtube_bot.py --dry-run` runs the projects «в запуске» one after another, `--project NAME` only that one; `python youtube_bot.py --search "<topic>" --dry-run` without `--project` is the old global search (all active accounts, filters / `--max-videos` / `--comments-per-video` default to `collector.*`, `--max-views 0` / `--max-age-hours 0` turn a limit off, `--account NAME` = only that account); with `--project` the topic replaces the project's topics for this run only
+- **Projects**: `python youtube_bot.py --list-projects`, `--project-add NAME`, `--project-accounts NAME acc1,acc2`, `--project-remove-account NAME acc`
 - **Inspect activity audit history**: `python youtube_bot.py --history`
 - **Inspect database metrics**: `python youtube_bot.py --status`
 - **MEX memory health check**: `mex doctor` and `mex check`

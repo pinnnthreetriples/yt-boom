@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from database import Database, RecordNotFoundError
+from database import REPLY_UNAVAILABLE_MARK, REPLY_UNAVAILABLE_TTL_SECONDS, Database, RecordNotFoundError
 
 
 class TestDatabase(unittest.IsolatedAsyncioTestCase):
@@ -159,6 +159,39 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(old_p)
         self.assertEqual(old_p.status, "failed")
         self.assertIn("stale pending", old_p.error or "")
+
+    async def test_reply_unavailable_target_is_skipped_by_later_runs(self):
+        """A comment YouTube gives no Reply button is remembered: not reserved again, counted as handled."""
+        node = await self.db.upsert_test_node("yt-no-reply", "https://example.com")
+        ref = "vid#nobutton"
+        first = await self.db.reserve_payload(node_id=node.id, source_ref=ref, language="en", source_text="t")
+        self.assertIsNotNone(first)
+        await self.db.mark_payload_failed(first.id, f"{REPLY_UNAVAILABLE_MARK}: ReplyUnavailableError: hidden")
+        self.assertTrue(await self.db.is_reply_unavailable(ref))
+        self.assertTrue(await self.db.has_replied_to(ref))
+        self.assertIsNone(await self.db.reserve_payload(node_id=node.id, source_ref=ref, language="en"))
+
+        # an ordinary failure stays retryable
+        other = await self.db.reserve_payload(node_id=node.id, source_ref="vid#ordinary", language="en")
+        await self.db.mark_payload_failed(other.id, "SubmissionError: could not locate Reply button on sub-comment")
+        self.assertFalse(await self.db.is_reply_unavailable("vid#ordinary"))
+        self.assertIsNotNone(await self.db.reserve_payload(node_id=node.id, source_ref="vid#ordinary", language="en"))
+
+    async def test_mark_reply_unavailable_without_a_reservation(self):
+        node = await self.db.upsert_test_node("yt-no-reply-2", "https://example.com")
+        await self.db.mark_reply_unavailable(node_id=node.id, source_ref="vid#direct", language="ru", source_text="x", reason="hidden")
+        self.assertTrue(await self.db.is_reply_unavailable("vid#direct"))
+        self.assertIsNone(await self.db.reserve_payload(node_id=node.id, source_ref="vid#direct", language="ru"))
+        with self.assertRaises(ValueError):
+            await self.db.mark_reply_unavailable(source_ref="  ")
+
+    async def test_reply_unavailable_mark_expires(self):
+        node = await self.db.upsert_test_node("yt-no-reply-3", "https://example.com")
+        await self.db.mark_reply_unavailable(node_id=node.id, source_ref="vid#old", reason="hidden")
+        async with self.db._transaction() as conn:
+            await conn.execute("UPDATE payloads SET created_at = created_at - ? WHERE source_ref = 'vid#old'", (REPLY_UNAVAILABLE_TTL_SECONDS + 60,))
+        self.assertFalse(await self.db.is_reply_unavailable("vid#old"))
+        self.assertIsNotNone(await self.db.reserve_payload(node_id=node.id, source_ref="vid#old", language="en"))
 
     async def test_queue_lifecycle(self):
         node = await self.db.upsert_test_node("yt", "https://www.youtube.com")

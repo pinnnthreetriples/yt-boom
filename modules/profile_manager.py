@@ -17,7 +17,7 @@ from typing import Any
 
 from loguru import logger
 
-from config import BrowserSettings, TargetSettings, resolve_account_proxy
+from config import BrowserSettings, ProxyUnavailableError, TargetSettings, resolve_account_proxy
 from database import AccountRecord, Database
 from modules.account_menu_logic import applied_snapshot, name_changes_left, profile_pending_fields
 from modules.google_authenticator import GoogleAuthenticator
@@ -157,12 +157,16 @@ class ProfileEditor:
         if not wanted:
             return ProfileResult(account.name, True, (), "")
         name_blocked = "name" in wanted and name_changes_left(account) == 0
+        try:
+            proxy = resolve_account_proxy(account)
+        except ProxyUnavailableError as exc:  # fail closed: the channel is never edited from the own IP
+            return ProfileResult(account.name, False, (), str(exc))
 
         runner = YouTubeRunner(
             self._cfg,
             _runner_target(self._cfg),
             session_dir=account.session_path,
-            proxy=resolve_account_proxy(account.proxy_url, self._cfg.proxy),
+            proxy=proxy,
             account_name=account.name,
             simulator=self._simulator,
             engine=account.engine,

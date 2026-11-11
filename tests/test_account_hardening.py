@@ -30,7 +30,6 @@ from modules.google_authenticator import GoogleAuthError, read_session_owner, wr
 from modules.multi_account_orchestrator import MultiAccountOrchestrator
 from modules.totp_helper import generate_totp, normalize_secret, validate_totp_secret
 from modules.validator import _is_youtube_comment
-from modules.wizard import mask_proxy
 from modules.youtube_runner import YouTubeRunner
 from secret_store import DPAPI_PREFIX, SecretStoreError, protect_secret, reveal_secret
 
@@ -88,11 +87,11 @@ class TestProxyFormats(unittest.TestCase):
             self.assertNotIn("SECRETPW", str(caught.exception), bad)
             self.assertIsNone(caught.exception.__cause__, bad)
 
-    def test_resolve_account_proxy_prefers_the_account(self):
-        self.assertEqual(resolve_account_proxy("a:1", "g:2"), "a:1")
-        self.assertEqual(resolve_account_proxy(None, "g:2"), "g:2")
-        self.assertEqual(resolve_account_proxy("  ", "g:2"), "g:2")
-        self.assertIsNone(resolve_account_proxy(None, None))
+    def test_resolve_account_proxy_is_the_accounts_own_only(self):
+        """No global fallback any more: an account without a proxy goes direct (the search proxy is separate)."""
+        self.assertEqual(resolve_account_proxy(AccountSettings(name="a", proxy_url="a:1")), "a:1")
+        self.assertIsNone(resolve_account_proxy(AccountSettings(name="a", proxy_url="  ")))
+        self.assertIsNone(resolve_account_proxy(AccountSettings(name="a")))
 
 
 class TestMaskProxy(unittest.TestCase):
@@ -105,11 +104,9 @@ class TestMaskProxy(unittest.TestCase):
             "socks5://user:SECRETPW@[::1]:1080",
             "1.2.3.4:abc:user:SECRETPW",  # unparseable: masked entirely
         ):
-            for masked in (mask_proxy(proxy), mask_proxy_url(proxy)):
-                self.assertNotIn("SECRETPW", masked, proxy)
-        self.assertEqual(mask_proxy("1.2.3.4:8080:user:SECRETPW"), "http://user:***@1.2.3.4:8080")
-        self.assertEqual(mask_proxy("1.2.3.4:8080"), "http://1.2.3.4:8080")
-        self.assertEqual(mask_proxy(None), "Прямое соединение (без прокси)")
+            self.assertNotIn("SECRETPW", mask_proxy_url(proxy), proxy)
+        self.assertEqual(mask_proxy_url("1.2.3.4:8080:user:SECRETPW"), "http://user:***@1.2.3.4:8080")
+        self.assertEqual(mask_proxy_url("1.2.3.4:8080"), "http://1.2.3.4:8080")
 
 
 class TestAccountLineFormats(unittest.TestCase):
@@ -204,7 +201,7 @@ class TestUpsertKeepsData(_DbCase):
         async with Database(self.path) as db:
             await db.upsert_account("bob", "s1", proxy_url="1.2.3.4:80:u:p", is_active=False, email="b@g.c", password="pw")
             again = await db.upsert_account("bob", email="b@g.c", password="pw", totp_secret=SECRET)
-            self.assertEqual((again.session_path, again.proxy_url, again.is_active), ("s1", "1.2.3.4:80:u:p", False))
+            self.assertEqual((again.session_path, again.proxy_url, again.is_active), ("s1", "http://u:p@1.2.3.4:80", False))  # the library's form
             self.assertEqual(again.totp_secret, SECRET)
 
     async def test_explicit_values_still_overwrite_and_none_removes_the_proxy(self):
@@ -335,7 +332,7 @@ class TestImportAccountsFile(_DbCase):
 
     async def test_one_bad_line_and_one_failed_account_do_not_stop_the_rest(self):
         results = {"a@gmail.com": True, "b@gmail.com": False, "c@gmail.com": True}
-        authenticate = AsyncMock(side_effect=lambda db, cfg, account: results[account.email])
+        authenticate = AsyncMock(side_effect=lambda db, cfg, account, *_: results[account.email])
         ok, errors = await self._import(
             ["# comment", "", self._good("a"), "broken line SECRETPW", self._good("b"), self._good("c")], authenticate
         )
@@ -350,7 +347,7 @@ class TestImportAccountsFile(_DbCase):
         self.assertTrue(ok)
 
     async def test_second_import_skips_authenticated_accounts_unless_forced(self):
-        async def authenticate(db, cfg, account):
+        async def authenticate(db, cfg, account, *_):
             await db.set_account_auth_status(account.id, "authenticated")
             return True
 
@@ -368,7 +365,7 @@ class TestImportAccountsFile(_DbCase):
         self.assertEqual(forced.await_count, 2)
 
     async def test_changed_password_makes_the_account_sign_in_again(self):
-        async def authenticate(db, cfg, account):
+        async def authenticate(db, cfg, account, *_):
             await db.set_account_auth_status(account.id, "authenticated")
             return True
 
@@ -385,7 +382,7 @@ class TestImportAccountsFile(_DbCase):
         await self._import([self._good("a")], authenticate)
         async with Database(self.root / "metrics.db") as db:
             account = await db.get_account("a@gmail.com")
-        self.assertEqual((account.proxy_url, account.session_path, account.is_active), ("1.2.3.4:8080:u:p", "custom-session", False))
+        self.assertEqual((account.proxy_url, account.session_path, account.is_active), ("http://u:p@1.2.3.4:8080", "custom-session", False))
 
     async def test_missing_file_is_an_error_code(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -860,6 +857,28 @@ class TestCommentIds(unittest.IsolatedAsyncioTestCase):
             response = MagicMock(text=AsyncMock(return_value=body))
             self.assertEqual(await YouTubeRunner._extract_remote_id(response), f"{prefix}Q1w.AbC-9_x")
 
+    async def test_remote_id_is_the_new_reply_never_the_parent_or_the_answered_comment(self):
+        parent, answered, new = "UgxParent4AaABAg", "UgxParent4AaABAg.9AAAA", "UgxParent4AaABAg.9BBBB"
+        body = (
+            '{"parent":{"commentId":"%s"},"target":{"commentId":"%s"},"created":{"commentId":"%s"}}'
+            % (parent, answered, new)
+        )
+        response = MagicMock(text=AsyncMock(return_value=body))
+        self.assertEqual(await YouTubeRunner._extract_remote_id(response, exclude=(answered,)), new)
+        # without anything that tells the new reply apart there is no id: "unknown" beats a wrong "visible"
+        only_known = MagicMock(text=AsyncMock(return_value='{"a":{"commentId":"%s"},"b":{"commentId":"%s"}}' % (parent, answered)))
+        self.assertIsNone(await YouTubeRunner._extract_remote_id(only_known, exclude=(answered,)))
+        only_parent = MagicMock(text=AsyncMock(return_value='{"commentId":"%s"}' % parent))
+        self.assertIsNone(await YouTubeRunner._extract_remote_id(only_parent))
+
+    async def test_remote_id_is_unknown_when_a_sibling_reply_makes_it_ambiguous(self):
+        answered, sibling, new = "UgxP.9AAAA", "UgxP.9CCCC", "UgxP.9BBBB"
+        body = '{"a":{"commentId":"%s"},"b":{"commentId":"%s"},"c":{"commentId":"%s"}}' % (answered, sibling, new)
+        response = MagicMock(text=AsyncMock(return_value=body))
+        self.assertIsNone(await YouTubeRunner._extract_remote_id(response, exclude=(answered,)))
+        other_thread = MagicMock(text=AsyncMock(return_value='{"a":{"commentId":"UgxOther.9ZZZZ"},"b":{"commentId":"%s"}}' % new))
+        self.assertEqual(await YouTubeRunner._extract_remote_id(other_thread, exclude=(answered,)), new)
+
     def test_validator_treats_every_youtube_comment_id_as_a_comment(self):
         base = dict(
             id=1, node_id=1, source_ref="vid12345678#p", source_text=None, text="t", language="en", status="submitted",
@@ -887,7 +906,7 @@ class TestOrchestratorAccounts(unittest.TestCase):
             self.assertTrue(usable(account("pending", "a@b.c", with_session)))
             self.assertTrue(usable(account("authenticated", "a@b.c", Path(temp) / "none")))
 
-    def test_runner_proxy_falls_back_to_the_global_proxy_like_the_sign_in(self):
+    def test_runner_proxy_is_the_accounts_own_never_the_global_one(self):
         orchestrator = MultiAccountOrchestrator.__new__(MultiAccountOrchestrator)
         orchestrator._runner_factory = None
         orchestrator._cfg = SimpleNamespace(browser=SimpleNamespace(proxy="9.9.9.9:80"))
@@ -899,7 +918,7 @@ class TestOrchestratorAccounts(unittest.TestCase):
         with patch("modules.multi_account_orchestrator.YouTubeRunner") as factory:
             orchestrator.create_runner(bare)
             orchestrator.create_runner(own)
-        self.assertEqual([call.kwargs["proxy"] for call in factory.call_args_list], ["9.9.9.9:80", "1.1.1.1:80"])
+        self.assertEqual([call.kwargs["proxy"] for call in factory.call_args_list], [None, "1.1.1.1:80"])
 
 
 class TestSimulatorWithoutMockImport(unittest.IsolatedAsyncioTestCase):

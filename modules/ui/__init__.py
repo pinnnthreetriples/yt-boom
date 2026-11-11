@@ -1,1 +1,1 @@
-"""Console UI helpers shared by the wizard screens."""
+"""Tabbed console interface: shell (rows, tabs, keys), icons and the five tabs."""

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
+import os
 import random
 import sys
 from collections.abc import AsyncIterator
@@ -9,29 +11,99 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, NamedTuple
 
 from loguru import logger
 
-from config import AppConfig, load_config, mask_proxy_url, resolve_account_proxy, validate_proxy_for_engine
-from database import AccountRecord, ActivityLogCreate, Database, RecordNotFoundError
+from config import (
+    AppConfig,
+    ProxyUnavailableError,
+    load_config,
+    mask_proxy_url,
+    resolve_account_proxy,
+    validate_proxy_for_engine,
+)
+from database import (
+    DEFAULT_PROJECT_NAME,
+    REPLY_UNAVAILABLE_MARK,
+    AccountRecord,
+    ActivityLogCreate,
+    Database,
+    ProjectRecord,
+    RecordNotFoundError,
+)
 from modules.collector import CollectorError
+from modules.cookie_robot import CookieRobot, CookieRobotResult
+from modules.comment_visibility import VisibilityWatcher, make_visibility_checker
 from modules.account_parser import looks_like_credentials, parse_account_line
 from modules.account_menu_logic import format_profile_summary, profile_pending_fields
 from modules.account_warmer import AccountWarmer, WarmUpResult
 from modules.geo_guard import check_account_exit, normalize_country, normalize_locale, resolve_exit_country, warn_if_exit_mismatch
 from modules.google_authenticator import GoogleAuthenticator, GoogleAuthError, read_session_owner, write_session_owner
 from modules.interaction_simulator import InteractionConfig, InteractionSimulator
-from modules.lifecycle_engine import AccountLifecycleEngine
+from modules.lifecycle_engine import (
+    CIRCUIT_BREAKER_ERRORS,
+    LIFECYCLE_MODES,
+    MODE_LABELS,
+    AccountLifecycleEngine,
+    release_restriction,
+)
 from modules.process_guard import bind_to_kill_on_close_job
+from modules.projects import project_config, project_plan, project_seed
 from modules.profile_manager import ProfileEditor
-from modules.processor import DeepSeekProcessor, resolve_reply_text, should_paraphrase
+from modules.proxy_library import log_proxy_routes, run_config_proxy_migration
+from modules.processor import DeepSeekProcessor, should_paraphrase
+from modules.reply_deck import ReplyDeck, prepare_reply
 from modules.session_heartbeat import check_account_heartbeat, check_session_offline, HeartbeatStatus
-from modules.youtube_collector import YouTubeCollector, extract_video_id
+from modules.youtube_collector import YouTubeCollector, empty_search_hint, extract_video_id
 from modules.youtube_runner import YouTubeRunner
 
 
 from modules.logger_config import configure_windows_encoding, setup_bot_logging
+
+
+async def _deck_project_id(db: Database) -> int | None:
+    """The project a run without --project takes its replies from (see below): the scope of the template deck."""
+    try:
+        projects = await db.list_projects()
+        project = projects[0] if len(projects) == 1 else await db.get_project_by_name(DEFAULT_PROJECT_NAME)
+        return int(project.id) if project is not None else None
+    except Exception:  # the deck then falls back to its own default scope
+        return None
+
+
+async def _settings_without_project(db: Database, cfg: AppConfig, log: bool = True) -> AppConfig | None:
+    """Target and replies for a run without --project (`--search`, `--account`, `--video`): config.yaml no longer
+    holds them (the interface writes into the projects), so they come from the only project, else from «Основной».
+    None (logged, with the hint to name --project) when there are several projects and no «Основной»."""
+    projects = await db.list_projects()
+    project = projects[0] if len(projects) == 1 else await db.get_project_by_name(DEFAULT_PROJECT_NAME)
+    if project is None:
+        names = ", ".join(f"«{p.name}»" for p in projects) or "нет"
+        logger.error("Проектов несколько и «{}» нет: укажите, чьи цель и ответы взять — --project ИМЯ (проекты: {})",
+                     DEFAULT_PROJECT_NAME, names)
+        return None
+    if log:
+        logger.info("Цель и ответы — из проекта «{}» (без --project; аккаунты — как раньше)", project.name)
+    return project_config(cfg, project, project.search_topics[0] if project.search_topics else None)
+
+
+def _cli_settings(args: argparse.Namespace, cfg: AppConfig) -> AppConfig:
+    """`_settings_without_project` for main(): the filters and limits of the command line default to it; exit 1."""
+    async def resolve() -> AppConfig | None:
+        async with _open_db(cfg) as db:
+            return await _settings_without_project(db, cfg, log=False)
+
+    settings = asyncio.run(resolve())
+    if settings is None:
+        sys.exit(1)
+    return settings
+
+
+def _open_db(cfg: AppConfig) -> Database:
+    """The configured database; its first start with projects seeds «Основной» from this config (a stand-in config
+    without the target sections seeds nothing)."""
+    return Database(cfg.app.db_path, project_seed=project_seed(cfg) if isinstance(cfg, AppConfig) else None)
 
 
 def format_author(author: str | None) -> str:
@@ -44,25 +116,70 @@ def setup_cli_logging(level: str = "INFO", log_file: str | None = None) -> None:
     setup_bot_logging(level=level, log_file=log_file)
 
 
-async def _login_country_allowed(account_name: str, expected: str | None, proxy: str | None) -> tuple[bool, str | None]:
-    """Fail closed before a sign-in: the exit country of the proxy must be the account's expected one.
+CountryConfirm = Callable[[str], "bool | Awaitable[bool]"]  # gets the explanation, answers "continue the sign-in?"
 
-    Returns (allowed, exit country). Without an expected country nothing is checked and the login goes on as before.
+
+def _stdin_is_interactive() -> bool:
+    return sys.stdin.isatty()
+
+
+def _ask_continue_in_console(message: str) -> bool:
+    """Console question; Enter, anything but yes, Ctrl+C or a closed stdin all mean «отменить»."""
+    print(f"\n{message}\n", file=sys.stderr)
+    try:
+        answer = input("Отменить вход или продолжить? [О]тменить / [П]родолжить (по умолчанию — отменить): ")
+    except (KeyboardInterrupt, EOFError):
+        return False
+    return answer.strip().lower() in {"п", "продолжить", "p", "y", "yes", "да", "continue"}
+
+
+async def _login_country_allowed(
+    account_name: str,
+    expected: str | None,
+    proxy: str | None,
+    allow_mismatch: bool = False,
+    confirm: CountryConfirm | None = None,
+) -> tuple[bool, str | None]:
+    """Before a sign-in compare the proxy's exit country with the account's expected one.
+
+    A mismatch (or an exit country that could not be found) no longer cancels silently: `allow_mismatch`
+    (`--allow-country-mismatch`) goes on with a warning, otherwise the person is asked (`confirm`, or the console
+    when stdin is one; the default answer is «отменить»), and with nobody to ask the sign-in is cancelled.
+    Returns (allowed, exit country). Without an expected country nothing is checked. Asked at most once per call.
     """
     verdict, exit_country = await check_account_exit(expected, proxy)
+    if verdict not in ("mismatch", "unknown"):
+        return True, exit_country
     if verdict == "mismatch":
-        logger.error(
-            "Вход аккаунта {!r} отменён: ожидаемая страна {}, а прокси выходит из страны {}. "
-            "Первый вход с IP чужой страны ставит аккаунт под риск блокировки: смените прокси или ожидаемую страну",
-            account_name, expected, exit_country,
+        problem = f"ожидаемая страна {expected}, а прокси выходит из страны {exit_country}"
+    else:
+        problem = (
+            f"не удалось определить страну выхода прокси (ожидается {expected}); проверьте прокси, "
+            "возможно, не скачана гео-база Camoufox"
         )
-    elif verdict == "unknown":
+    risk = "Первый вход с IP чужой страны может вызвать проверку или блокировку аккаунта Google"
+    if allow_mismatch:
+        logger.warning("Аккаунт {!r}: {}. {}. Вход продолжен по --allow-country-mismatch", account_name, problem, risk)
+        return True, exit_country
+    message = f"Аккаунт «{account_name}»: {problem}.\n{risk}."
+    if confirm is not None:
+        answer = confirm(message)
+        proceed = bool(await answer if inspect.isawaitable(answer) else answer)
+    elif _stdin_is_interactive():
+        proceed = await asyncio.to_thread(_ask_continue_in_console, message)
+    else:
         logger.error(
-            "Вход аккаунта {!r} отменён: не удалось определить страну выхода прокси (ожидается {}). "
-            "Проверьте прокси и повторите",
-            account_name, expected,
+            "Вход аккаунта {!r} отменён: {}. {}. Нет консоли для вопроса: чтобы войти всё равно, "
+            "запустите с --allow-country-mismatch, либо смените прокси или ожидаемую страну",
+            account_name, problem, risk,
         )
-    return verdict not in ("mismatch", "unknown"), exit_country
+        return False, exit_country
+    logger.log(
+        "WARNING" if proceed else "ERROR",
+        "Аккаунт {!r}: {}. Решение пользователя: {}",
+        account_name, problem, "вход продолжен" if proceed else "вход отменён",
+    )
+    return proceed, exit_country
 
 
 async def _warn_country_disagreement(
@@ -102,7 +219,12 @@ async def _login_browser(runner: YouTubeRunner, engine: str) -> AsyncIterator[An
             yield context
 
 
-async def interactive_login(config_path: str = "config.yaml", account_name: str | None = None) -> None:
+async def interactive_login(
+    config_path: str = "config.yaml",
+    account_name: str | None = None,
+    allow_country_mismatch: bool = False,
+    confirm_country: CountryConfirm | None = None,
+) -> None:
     """Launch Camoufox headfully on YouTube so user can log in once to save cookies.
 
     The browser starts with the same options as automated runs (proxy, prefs, pinned fingerprint). When the
@@ -110,7 +232,7 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
     """
     cfg = load_config(config_path)
     cfg.browser.headless = False
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
 
@@ -127,16 +249,23 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
                 proxy_url = cfg_acc.proxy_url
             else:
                 session_dir = cfg.browser.session_root / account_name
-                proxy_url = cfg.browser.proxy
         else:
             session_dir = Path(acc.session_path)
-            proxy_url = acc.proxy_url
     else:
         session_dir = cfg.browser.session_root / "youtube"
-        proxy_url = cfg.browser.proxy
+    owner = acc if acc is not None else (None if account_name else await db.get_account("default"))
+    if owner is not None:  # only the account's own proxy, never a global one; unreadable: no login at all
+        try:
+            proxy_url = resolve_account_proxy(owner)
+        except ProxyUnavailableError as exc:
+            logger.error("{}", exc)
+            await db.close()
+            return
 
     if acc is not None and acc.expected_country:
-        allowed, _ = await _login_country_allowed(acc.name, acc.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+        allowed, _ = await _login_country_allowed(
+            acc.name, acc.expected_country, proxy_url, allow_country_mismatch, confirm_country,
+        )
         if not allowed:
             await db.close()
             return
@@ -155,7 +284,7 @@ async def interactive_login(config_path: str = "config.yaml", account_name: str 
         cfg.browser,
         _resolve_youtube_target(cfg),
         session_dir=session_dir,
-        proxy=resolve_account_proxy(proxy_url, cfg.browser.proxy),
+        proxy=proxy_url,
         account_name=account_name or "default",
         locale=acc.locale if acc is not None else None,
         engine=engine,
@@ -219,7 +348,7 @@ async def add_account_cli(
             sys.exit(1)
         geo["locale"] = tag
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
@@ -235,6 +364,7 @@ async def add_account_cli(
             f"[OK] Account {account.name!r} registered successfully "
             f"(id={account.id}, session={account.session_path}, proxy={mask_proxy_url(account.proxy_url) or 'direct'})"
         )
+        await _warn_without_project(db, [account])
     finally:
         await db.close()
 
@@ -263,9 +393,11 @@ async def _register_credentials_account(
     proxy_url: str | None = None,
     country: str | None = None,
     locale: str | None = None,
+    default_mode: str | None = None,
 ) -> AccountRecord:
     """Register `email:password:totp[...]`. A known account keeps its session path, proxy, active flag, expected country
-    and locale unless told otherwise."""
+    and locale unless told otherwise. The age mode comes from the line's `mode=` or else `default_mode`; without
+    either a known account keeps its mode and a new one is "auto"."""
     parsed = parse_account_line(spec, proxy=proxy_url, country=country, locale=locale)
     account_name = (name or parsed.default_name).strip()
     existing = await db.get_account(account_name)
@@ -289,6 +421,10 @@ async def _register_credentials_account(
     account = await db.upsert_account(**upsert_args)
     if new_engine != "camoufox":
         account = await db.set_account_engine(account.id, new_engine)
+    mode = parsed.lifecycle_mode or default_mode
+    if mode is not None and mode != account.lifecycle_mode:
+        await db.set_account_lifecycle_mode(account.id, mode)
+        account = account.model_copy(update={"lifecycle_mode": mode})
     return account
 
 
@@ -311,7 +447,7 @@ async def add_credentials_account_cli(
 ) -> bool:
     """`--add-account email:password:totp_secret[:recovery_email]`: register the account with status `pending`."""
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         try:
             account = await _register_credentials_account(db, cfg, spec, name, session_path, proxy_url, country, locale)
         except ValueError as exc:
@@ -323,22 +459,36 @@ async def add_credentials_account_cli(
             f"country={account.expected_country or '-'}, locale={account.locale or '-'}). "
             f"Next: --auth-account {account.name}"
         )
+        await _warn_without_project(db, [account])
         return True
 
 
-async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRecord) -> bool:
+async def _authenticate_account(
+    db: Database,
+    cfg: AppConfig,
+    account: AccountRecord,
+    allow_country_mismatch: bool = False,
+    confirm_country: CountryConfirm | None = None,
+) -> bool:
     """Sign the account in. `failed` is stored only when Google refused (GoogleAuthError); a browser, proxy or
-    network failure is logged and leaves the stored status alone."""
+    network failure is logged and leaves the stored status alone. A proxy exit country that differs from the expected
+    one is confirmed first (`_login_country_allowed`)."""
     if not account.email or not account.password:
         logger.error("У аккаунта {!r} не заданы email/пароль: добавьте его через --add-account email:password:totp", account.name)
         return False
     simulator = InteractionSimulator(InteractionConfig(key_delay_ms_min=50, key_delay_ms_max=100))
     owner = read_session_owner(account.session_path)
     force_relogin = owner is not None and owner != account.email.lower()  # the saved session is another account's
-    proxy = resolve_account_proxy(account.proxy_url, cfg.browser.proxy)
+    try:
+        proxy = resolve_account_proxy(account)
+    except ProxyUnavailableError as exc:  # fail closed: never sign in from the own IP instead
+        logger.error("{}", exc)
+        return False
     exit_country: str | None = None
     if account.auth_status != "authenticated" or force_relogin:  # a real sign-in follows: the country must match first
-        allowed, exit_country = await _login_country_allowed(account.name, account.expected_country, proxy)
+        allowed, exit_country = await _login_country_allowed(
+            account.name, account.expected_country, proxy, allow_country_mismatch, confirm_country
+        )
         if not allowed:
             return False
     else:
@@ -403,6 +553,9 @@ async def _authenticate_account(db: Database, cfg: AppConfig, account: AccountRe
 
 
 INTRO_WARM_UP_SECONDS = 60.0
+# Spare comment candidates fetched beyond the replies wanted: a target YouTube gives no Reply button is skipped, and
+# targets other accounts already answered are skipped too; without spares the run ends with nothing posted.
+EXTRA_CANDIDATES = 4
 
 
 async def _intro_warm_up(db: Database, cfg: AppConfig, account: AccountRecord) -> None:
@@ -423,18 +576,24 @@ async def _find_account(db: Database, identifier: str) -> AccountRecord | None:
     return next((a for a in await db.list_accounts() if a.email and a.email.lower() == wanted), None)
 
 
-async def auth_account_cli(identifier: str, config_path: str = "config.yaml", headless: bool | None = None) -> bool:
+async def auth_account_cli(
+    identifier: str,
+    config_path: str = "config.yaml",
+    headless: bool | None = None,
+    allow_country_mismatch: bool = False,
+    confirm_country: CountryConfirm | None = None,
+) -> bool:
     """`--auth-account <name_or_email>`: sign the account into YouTube (proxy and fingerprint come from the account)."""
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found. Add it with --add-account email:password:totp", file=sys.stderr)
             return False
-        ok = await _authenticate_account(db, cfg, account)
-        print(f"[{'OK' if ok else 'FAILED'}] {account.name}: {'authenticated' if ok else 'authentication failed'}")
+        ok = await _authenticate_account(db, cfg, account, allow_country_mismatch, confirm_country)
+        print(f"[{'OK' if ok else 'FAILED'}] {account.name}:{'authenticated' if ok else 'authentication failed'}")
         return ok
 
 
@@ -453,9 +612,11 @@ class AccountImportResult:
 
 
 async def register_account_lines(
-    db: Database, cfg: AppConfig, lines: Iterable[str], skip_existing: bool = False
+    db: Database, cfg: AppConfig, lines: Iterable[str], skip_existing: bool = False, default_mode: str | None = None
 ) -> AccountImportResult:
     """Register every account line (blank lines and `#` comments are ignored); one bad line never stops the rest.
+
+    `default_mode` ("auto" / "mature" / "unlimited") is the age mode of every line without its own `mode=`.
 
     With `skip_existing` a line whose account is already in the database (or repeated earlier in the batch) is
     reported as skipped instead of overwriting its credentials.
@@ -473,7 +634,7 @@ async def register_account_lines(
                 if parsed.email.lower() in known_emails or await db.get_account(parsed.default_name) is not None:
                     result.skipped.append((number, "аккаунт уже есть"))
                     continue
-            account = await _register_credentials_account(db, cfg, line)
+            account = await _register_credentials_account(db, cfg, line, default_mode=default_mode)
             result.added.append(account)
             if account.email:
                 known_emails.add(account.email.lower())
@@ -483,7 +644,11 @@ async def register_account_lines(
 
 
 async def import_accounts_file_cli(
-    path: str, config_path: str = "config.yaml", headless: bool | None = None, force: bool = False
+    path: str,
+    config_path: str = "config.yaml",
+    headless: bool | None = None,
+    force: bool = False,
+    allow_country_mismatch: bool = False,
 ) -> bool:
     """`--import-accounts-file`: register every line of the file, then sign the accounts in one by one.
 
@@ -498,13 +663,14 @@ async def import_accounts_file_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         imported = await register_account_lines(db, cfg, lines)
         registered = {account.id: account for account in imported.added}
         failed_lines = len(imported.errors)
         for number, reason in imported.errors:
             print(f"[ERROR] line {number}: {reason}", file=sys.stderr)
         print(f"[OK] Registered {len(registered)} account(s), skipped {failed_lines} invalid line(s)")
+        await _warn_without_project(db, list(registered.values()))
 
         queue = [a for a in registered.values() if force or a.auth_status != "authenticated"]
         if len(queue) < len(registered):
@@ -514,7 +680,7 @@ async def import_accounts_file_cli(
             if index:
                 await asyncio.sleep(_pause_between_accounts(account))
             logger.info("Авторизация аккаунта {!r} ({}/{})", account.name, index + 1, len(queue))
-            if not await _authenticate_account(db, cfg, account):
+            if not await _authenticate_account(db, cfg, account, allow_country_mismatch):
                 failed_auth += 1
         print(f"[{'OK' if not failed_auth else 'FAILED'}] Authenticated {len(queue) - failed_auth} of {len(queue)}")
     return not failed_lines and not failed_auth
@@ -523,7 +689,7 @@ async def import_accounts_file_cli(
 async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml", online: bool = False) -> bool:
     """Session status from the profile's LOGIN_INFO cookie; with `online` also asks YouTube over HTTP (no browser)."""
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         if identifier and identifier != "ALL":
             account = await _find_account(db, identifier)
             if account is None:
@@ -549,7 +715,7 @@ async def heartbeat_cli(identifier: str | None, config_path: str = "config.yaml"
         for acc in accounts:
             if online:
                 res = await check_account_heartbeat(
-                    acc, default_proxy=cfg.browser.proxy, locale=cfg.browser.locale, require_proxy=cfg.browser.require_proxy
+                    acc, locale=cfg.browser.locale, require_proxy=cfg.browser.require_proxy
                 )
             else:
                 res = check_session_offline(acc.session_path, acc.name, acc.engine)
@@ -574,7 +740,7 @@ async def warm_up_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
@@ -590,7 +756,7 @@ async def apply_profile_cli(identifier: str, config_path: str = "config.yaml", h
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         account = await _find_account(db, identifier)
         if account is None:
             print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
@@ -615,7 +781,7 @@ async def warm_quarantined_cli(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         targets = warm_candidates(await db.list_active_accounts())
         if not targets:
             print("[INFO] No authenticated accounts in quarantine or aging.")
@@ -657,6 +823,7 @@ async def warm_selected_cli(
     duration: float = 45.0,
     headless: bool | None = None,
     report: Callable[[str], None] = print,
+    allow_country_mismatch: bool = False,
 ) -> list[WarmUpResult]:
     """Wizard «прогрев выбранных»: the accounts called `names`, in that order.
 
@@ -669,7 +836,7 @@ async def warm_selected_cli(
         cfg.browser.headless = headless
     results: list[WarmUpResult] = []
     worked = False  # something already ran: the next account waits first (a skipped one costs no pause)
-    async with Database(cfg.app.db_path) as db:
+    async with _open_db(cfg) as db:
         for name in names:
             account = await db.get_account(name)
             needs_sign_in = account is not None and account.auth_status != "authenticated"
@@ -679,7 +846,7 @@ async def warm_selected_cli(
                 results.append(WarmUpResult(name, False, None, 0.0, "account not found"))
             elif needs_sign_in:
                 worked = True
-                ok = await _authenticate_account(db, cfg, account)
+                ok = await _authenticate_account(db, cfg, account, allow_country_mismatch)
                 results.append(WarmUpResult(account.name, ok, None, 0.0, "signed in" if ok else "sign-in failed"))
             elif warm_candidates([account]):
                 worked = True
@@ -690,44 +857,169 @@ async def warm_selected_cli(
     return results
 
 
-async def lifecycle_cli(config_path: str = "config.yaml") -> None:
-    """`--lifecycle`: account ages, stages, quarantine hours left and today's comment quota."""
+async def run_cookie_robot(
+    config_path: str,
+    names: list[str],
+    on_progress: Callable[[str, int, int, str], None] | None = None,
+    headless: bool | None = None,
+    report: Callable[[str], None] = print,
+) -> list[CookieRobotResult]:
+    """Wizard / UI «куки-робот»: the accounts called `names`, one after another (a pause between them).
+
+    `on_progress(account_name, step, total_steps, site)` is called as each site starts; `report` gets one line per account.
+    """
     cfg = load_config(config_path)
-    async with Database(cfg.app.db_path) as db:
+    if headless is not None:
+        cfg.browser.headless = headless
+    robot = CookieRobot(cfg.browser)
+    results: list[CookieRobotResult] = []
+    worked = False  # a browser already ran: the next account waits first (a missing account costs no pause)
+    async with _open_db(cfg) as db:
+        for name in names:
+            account = await db.get_account(name)
+            if account is None:
+                results.append(CookieRobotResult(name, False, (), (), 0.0, "account not found"))
+            else:
+                if worked:
+                    await asyncio.sleep(_pause_between_accounts(account))
+                worked = True
+                progress = None if on_progress is None else (lambda step, total, site, who=account.name: on_progress(who, step, total, site))
+                results.append(await robot.run(account, progress))
+            report(f"[{'OK' if results[-1].success else 'FAILED'}] {results[-1].account_name}: {results[-1].details}")
+    return results
+
+
+async def lifecycle_cli(config_path: str = "config.yaml") -> None:
+    """`--lifecycle`: ages, stages, quarantine hours left, today's quota, mode, on/off and auto warm-up per account."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
         accounts = await db.list_accounts()
         now = datetime.now(timezone.utc)
-        width = 100
+        width = 128
         print("\n" + "=" * width)
-        print("                                 ACCOUNT LIFECYCLE")
+        print("                                           ACCOUNT LIFECYCLE")
         print("=" * width)
         if not accounts:
             print("  No accounts found in database.")
         else:
             print(
                 f"{'Account':<16} | {'Auth':<13} | {'Age':>7} | {'Stage':<11} | {'Quarantine':>10} | "
-                f"{'Today':>7} | {'Errors':>6} | {'Warm-ups':>8}"
+                f"{'Today':>7} | {'Errors':>6} | {'Warm-ups':>8} | {'Mode':<9} | {'Active':<6} | {'AutoWarm':<8}"
             )
             print("-" * width)
             for acc in accounts:
                 view = AccountLifecycleEngine.summarize(acc, now)
-                stage = view.stage
                 if view.age_hours is None:
                     age, left, quota = "-", "-", "-"
                 else:
                     age = f"{view.age_hours:.1f}h"
                     left = f"{view.quarantine_left:.1f}h"
-                    quota = f"{view.quota_done}/{view.quota_limit}"
+                    quota = f"{view.quota_done}/{'inf' if view.quota_limit is None else view.quota_limit}"
                 print(
-                    f"{acc.name:<16} | {acc.auth_status:<13} | {age:>7} | {stage:<11} | {left:>10} | "
-                    f"{quota:>7} | {acc.consecutive_errors:>6} | {acc.warmup_sessions_done:>8}"
+                    f"{acc.name:<16} | {acc.auth_status:<13} | {age:>7} | {_stage_text(view):<11} | {left:>10} | "
+                    f"{quota:>7} | {acc.consecutive_errors:>6} | {acc.warmup_sessions_done:>8} | "
+                    f"{AccountLifecycleEngine.mode_of(acc):<9} | {'yes' if acc.is_active else 'NO':<6} | "
+                    f"{'on' if acc.auto_warmup else 'off':<8}"
                 )
+            print("-" * width)
+            print("  Mode: auto = by age, mature = already warmed up (stage shown as mature*), unlimited = no stages and limits.")
         print("=" * width + "\n")
+
+
+_ON_OFF = {"on": True, "off": False, "1": True, "0": False, "yes": True, "no": False, "да": True, "нет": False}
+
+
+def _stage_text(view: Any) -> str:
+    """Stage column of `--lifecycle`: «mature*» when the mode, not the age, makes the account mature."""
+    return "mature*" if view.mode == "mature" and view.stage == "mature" else view.stage
+
+
+async def apply_account_settings(
+    db: Database,
+    accounts: Iterable[AccountRecord],
+    *,
+    lifecycle_mode: str | None = None,
+    auto_warmup: bool | None = None,
+    is_active: bool | None = None,
+) -> int:
+    """Set the given work settings (None = leave) on every account; returns how many accounts were changed.
+
+    Shared by the wizard (single and bulk changes). The config.yaml sync never overwrites these in the database.
+    """
+    changed = 0
+    for account in accounts:
+        if lifecycle_mode is not None:
+            await db.set_account_lifecycle_mode(account.id, lifecycle_mode)
+        if auto_warmup is not None:
+            await db.set_account_auto_warmup(account.id, auto_warmup)
+        if is_active is not None:
+            await db.set_account_active(account.id, is_active)
+        changed += 1
+    return changed
+
+
+async def _account_setting_cli(
+    identifier: str, config_path: str, change: Callable[[Database, AccountRecord], Awaitable[str]]
+) -> bool:
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Account {identifier!r} not found.", file=sys.stderr)
+            return False
+        print(f"[OK] {account.name}: {await change(db, account)}")
+        return True
+
+
+async def set_mode_cli(identifier: str, mode: str, config_path: str = "config.yaml") -> bool:
+    """`--set-mode NAME auto|mature|unlimited`: the account's age mode."""
+    if mode not in LIFECYCLE_MODES:
+        print(f"[ERROR] Unknown mode {mode!r}: use {', '.join(LIFECYCLE_MODES)}.", file=sys.stderr)
+        return False
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        await db.set_account_lifecycle_mode(account.id, mode)
+        return f"mode = {mode} ({MODE_LABELS[mode]})"
+
+    return await _account_setting_cli(identifier, config_path, change)
+
+
+async def set_auto_warmup_cli(identifier: str, enabled: bool, config_path: str = "config.yaml") -> bool:
+    """`--auto-warmup NAME on|off`: whether a run may start a background warm-up of the account."""
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        await db.set_account_auto_warmup(account.id, enabled)
+        return f"auto warm-up {'on' if enabled else 'off'}"
+
+    return await _account_setting_cli(identifier, config_path, change)
+
+
+async def set_active_cli(identifier: str, enabled: bool, config_path: str = "config.yaml") -> bool:
+    """`--set-active NAME on|off`: «В работе»; a switched-off account is not used for a run and not warmed up."""
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        await db.set_account_active(account.id, enabled)
+        return "in work" if enabled else "switched off"
+
+    return await _account_setting_cli(identifier, config_path, change)
+
+
+async def reset_restricted_cli(identifier: str, config_path: str = "config.yaml") -> bool:
+    """`--reset-restricted NAME`: lift the circuit breaker (the error streak and the stage restart)."""
+
+    async def change(db: Database, account: AccountRecord) -> str:
+        if account.consecutive_errors < CIRCUIT_BREAKER_ERRORS:
+            return "not restricted, nothing to reset"
+        await release_restriction(db, account)
+        return "restriction lifted"
+
+    return await _account_setting_cli(identifier, config_path, change)
 
 
 async def print_accounts_table(config_path: str = "config.yaml") -> None:
     """Pretty-print a table of all accounts with stats from DB."""
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
@@ -748,15 +1040,18 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
         if not accounts:
             print("  No accounts found in database or configuration.")
         else:
+            in_projects = await _projects_by_account(db)
             header = (
                 f"{'ID':<4} | {'Name':<16} | {'Status':<8} | {'Auth':<13} | {'Geo':<12} | {'Exp':<3} | {'Locale':<7} | {'Replies':<8} | "
-                f"{'Email':<24} | {'Proxy':<30} | {'Session Path'}"
+                f"{'Email':<24} | {'Proxy':<30} | {'Projects':<20} | {'Session Path'}"
             )
             print(header)
             print("-" * 123)
             for acc in accounts:
                 status = "ACTIVE" if acc.is_active else "DISABLED"
                 proxy_display = mask_proxy_url(acc.proxy_url) if acc.proxy_url else "direct (no proxy)"
+                if acc.proxy_unavailable:
+                    proxy_display = "UNREADABLE: re-assign"
                 geo_display = acc.geo_country or "-"
                 if len(proxy_display) > 30:
                     proxy_display = proxy_display[:27] + "..."  # the masked form: never cut credentials open
@@ -771,6 +1066,7 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
                     f"{acc.total_replies:<8} | "
                     f"{mask_email(acc.email):<24} | "
                     f"{proxy_display:<30} | "
+                    f"{(', '.join(in_projects.get(acc.id, [])) or '— без проекта')[:20]:<20} | "
                     f"{acc.session_path}"
                 )
                 print(row)
@@ -781,6 +1077,108 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
         await db.close()
 
 
+async def _project_by_name(db: Database, name: str | None) -> ProjectRecord | None:
+    """The project named `name` (without regard to case); without a name «Основной». Logs what is missing."""
+    wanted = name or DEFAULT_PROJECT_NAME
+    project = await db.get_project_by_name(wanted)
+    if project is None:
+        names = ", ".join(f"«{p.name}»" for p in await db.list_projects()) or "нет"
+        hint = "" if name else " — укажите проект: --project ИМЯ"
+        logger.error("Проект «{}» не найден{} (проекты: {})", wanted, hint, names)
+    return project
+
+
+# --------------------------------------------------------------------------- projects (CLI)
+
+
+async def _warn_without_project(db: Database, accounts: Iterable[AccountRecord]) -> None:
+    """Decision of the projects: a new account joins no project and does not work until it does — say so."""
+    loose = [account.name for account in accounts if not await db.projects_of_account(account.id)]
+    if loose:
+        print(
+            f"[!] Без проекта (не работают, пока не добавлены в проект): {', '.join(loose)} — "
+            f"--project-accounts ПРОЕКТ {','.join(loose)} или вкладка «Проекты»"
+        )
+
+
+async def _projects_by_account(db: Database) -> dict[int, list[str]]:
+    names: dict[int, list[str]] = {}
+    for project in await db.list_projects():
+        for account in await db.list_project_accounts(project.id):
+            names.setdefault(account.id, []).append(project.name)
+    return names
+
+
+async def print_projects_table(config_path: str = "config.yaml") -> None:
+    """`--list-projects`: every project in queue order with its launch flag, members, topics, links and replies."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        projects = await db.list_projects()
+        print("\n" + "=" * 90)
+        print("                        ПРОЕКТЫ (по порядку запуска)")
+        print("=" * 90)
+        print(f"{'ID':<4} | {'Название':<24} | {'Запуск':<6} | {'Акк.':<4} | {'Тем':<3} | {'Ссылки':<9} | {'Ответы':<14} | Лимит")
+        print("-" * 90)
+        for p in projects:
+            replies = "ИИ" if p.reply_mode == "ai" else f"шаблоны {len(p.custom_replies)}"
+            print(
+                f"{p.id:<4} | {p.name[:24]:<24} | {'да' if p.enabled else 'нет':<6} | {p.accounts_count:<4} | "
+                f"{len(p.search_topics):<3} | {f'{p.links_waiting}/{p.links_total}':<9} | {replies:<14} | "
+                f"{p.daily_per_account or '-'}"
+            )
+        print("=" * 90 + "\n")
+
+
+async def project_add_cli(name: str, config_path: str = "config.yaml") -> bool:
+    """`--project-add NAME`: a new project (AI replies, no topics, no accounts) at the end of the queue."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        try:
+            project = await db.create_project(name)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return False
+    print(f"[OK] Проект «{project.name}» создан (id={project.id}). Аккаунты: --project-accounts \"{project.name}\" acc1,acc2")
+    return True
+
+
+async def _project_and_accounts(db: Database, name: str, accounts: str) -> tuple[ProjectRecord, list[AccountRecord]] | None:
+    project = await db.get_project_by_name(name)
+    if project is None:
+        print(f"[ERROR] Проект «{name}» не найден (--list-projects)", file=sys.stderr)
+        return None
+    found: list[AccountRecord] = []
+    for identifier in [part.strip() for part in accounts.split(",") if part.strip()]:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Аккаунт {identifier!r} не найден (--list-accounts)", file=sys.stderr)
+            return None
+        found.append(account)
+    if not found:
+        print("[ERROR] Аккаунты не указаны: имена через запятую", file=sys.stderr)
+        return None
+    return project, found
+
+
+async def project_accounts_cli(name: str, accounts: str, config_path: str = "config.yaml", add: bool = True) -> bool:
+    """`--project-accounts NAME acc1,acc2` adds the accounts to the project; `--project-remove-account` takes them out.
+    Nothing changes when the project or one of the accounts is unknown."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        resolved = await _project_and_accounts(db, name, accounts)
+        if resolved is None:
+            return False
+        project, found = resolved
+        ids = [account.id for account in found]
+        if add:
+            changed = await db.add_project_accounts(project.id, ids)
+            print(f"[OK] «{project.name}»: добавлено {changed} из {len(ids)} (уже были: {len(ids) - changed})")
+        else:
+            changed = await db.remove_project_accounts(project.id, ids)
+            print(f"[OK] «{project.name}»: убрано {changed} из {len(ids)}")
+    return True
+
+
 async def run_video_pool_cli(
     config_path: str = "config.yaml",
     videos_file: str | Path | None = None,
@@ -788,8 +1186,10 @@ async def run_video_pool_cli(
     account_mode: str | None = None,
     dry_run: bool = False,
     headless: bool | None = None,
+    project: str | None = None,
 ) -> int:
-    """Reply under the video pool with all active accounts; returns the number of replies posted.
+    """Load `videos_file` into a project's own links (`project`, else «Основной») and reply under that project's
+    waiting links with its members and its settings; returns the number of replies posted (0: no such project).
 
     concurrency / account_mode default to limits.max_concurrent_sessions / limits.account_mode.
     """
@@ -799,9 +1199,14 @@ async def run_video_pool_cli(
     if headless is not None:
         cfg.browser.headless = headless
 
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
+    record = await _project_by_name(db, project)
+    if record is None:
+        await db.close()
+        return 0
+    await log_proxy_routes(db, [acc.name for acc in await db.list_project_accounts(record.id, active_only=True)])
 
     orchestrator = MultiAccountOrchestrator(
         config_or_path=cfg,
@@ -810,6 +1215,7 @@ async def run_video_pool_cli(
         dry_run=dry_run,
         headless=headless,
         account_mode=account_mode,
+        project=record,
     )
     try:
         return await orchestrator.run_video_pool(videos_file=videos_file)
@@ -817,11 +1223,287 @@ async def run_video_pool_cli(
         await orchestrator.close()
 
 
+class ProjectsRunSummary(NamedTuple):
+    """A launch over projects: one result per project reached, and where it stopped early (Ctrl+C or an error)."""
+
+    results: list[Any]  # ProjectRunResult
+    stopped_at: str | None = None  # the project the launch stopped on; None: every project had its turn
+    error: str | None = None
+
+
+def _project_skip_reason(project: ProjectRecord, topics: list[str] | None) -> str:
+    """Why a project is not started at all ("" = start it): no members, nothing to look at, no templates."""
+    if not project.accounts_count:
+        return "нет аккаунтов"
+    plan = project_plan(project if topics is None else project.model_copy(update={"search_topics": topics}))
+    if not plan.steps:
+        return plan.reason
+    if project.reply_mode == "custom" and not project.custom_replies:
+        return "нет шаблонов"
+    return ""
+
+
+def _log_projects_summary(summary: ProjectsRunSummary) -> None:
+    for res in summary.results:
+        if res.skipped:
+            logger.warning("Проект «{}»: пропущен — {}", res.project, res.skipped)
+        else:
+            logger.info("Проект «{}»: видео {} · ответов {}", res.project, res.found, res.replies)
+    if summary.stopped_at:
+        logger.error("Запуск остановлен на проекте «{}»{}", summary.stopped_at, f": {summary.error}" if summary.error else "")
+
+
+async def run_projects(
+    config_path: str = "config.yaml",
+    dry_run: bool = False,
+    project_ids: list[int] | None = None,
+    *,
+    headless: bool | None = None,
+    concurrency: int | None = None,
+    account_mode: str | None = None,
+    topics: list[str] | None = None,
+    progress: dict[str, Any] | None = None,
+) -> ProjectsRunSummary:
+    """Run the projects one after another: those «в запуске» in queue order, or exactly `project_ids` (in queue
+    order too). Each one gets its own orchestrator (its members, pool, target and replies), closed before the next;
+    the comments taken are shared, so one comment gets one reply from the whole launch. A project without members,
+    videos or templates is skipped with the reason. An error stops the launch on that project (the next ones do not
+    start); Ctrl+C closes the current one and propagates. `topics` replaces the projects' topics for this launch only
+    (nothing is saved); `progress["project"]` names the project running now (the interface reports a Ctrl+C with it).
+    """
+    from modules.multi_account_orchestrator import MultiAccountOrchestrator, ProjectRunResult, WarmupLedger
+
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    async with _open_db(cfg) as db:
+        projects = await db.list_projects()
+        await log_proxy_routes(db)
+    wanted = None if project_ids is None else set(project_ids)
+    queue = [p for p in projects if (p.id in wanted if wanted is not None else p.enabled)]
+    if not queue:
+        logger.warning("Нет проектов в запуске: отметьте проект «в запуске» во вкладке «Проекты»")
+    claimed: set[str] = set()
+    warmups = WarmupLedger()
+    summary = ProjectsRunSummary([])
+    for project in queue:
+        reason = _project_skip_reason(project, topics)
+        if reason:
+            summary.results.append(ProjectRunResult(project.name, 0, 0, 0, reason))
+            continue
+        if progress is not None:
+            progress["project"] = project.name
+        orchestrator = MultiAccountOrchestrator(
+            config_or_path=cfg,
+            db=_open_db(cfg),
+            concurrency=concurrency or cfg.limits.max_concurrent_sessions,
+            dry_run=dry_run,
+            headless=headless,
+            account_mode=account_mode,
+            project=project,
+            claimed=claimed,
+            warmups=warmups,
+        )
+        try:
+            summary.results.append(await orchestrator.run_project(topics))
+        except Exception as exc:
+            logger.exception("Проект «{}» завершился ошибкой: {}", project.name, exc)
+            summary = summary._replace(stopped_at=project.name, error=f"{type(exc).__name__}: {exc}")
+            break
+        except BaseException:  # Ctrl+C: the project is closed below, the next ones do not start
+            logger.warning("Запуск прерван на проекте «{}»", project.name)
+            raise
+        finally:
+            await orchestrator.close()
+    _log_projects_summary(summary)
+    return summary
+
+
+async def run_search_cli(
+    query: str,
+    config_path: str = "config.yaml",
+    *,
+    min_views: int = 0,
+    max_views: int | None = None,
+    max_age_hours: int | None = None,
+    max_videos: int = 5,
+    comments_per_video: int = 2,
+    dry_run: bool = False,
+    headless: bool | None = None,
+    concurrency: int | None = None,
+    account_mode: str | None = None,
+    target_mode: str | None = None,
+    reply_mode: str | None = None,
+    custom_reply: str | None = None,
+) -> Any:
+    """Topic search through the accounts, the same way as the own links: every active account,
+    concurrency / account_mode (default limits.max_concurrent_sessions / limits.account_mode) and the
+    lifecycle limits. max_age_hours None = any age (the caller resolves the config value).
+    Returns SearchRunResult(accounts, found, replies).
+    """
+    from modules.multi_account_orchestrator import MultiAccountOrchestrator, SearchRunResult
+
+    cfg = load_config(config_path)
+    if headless is not None:
+        cfg.browser.headless = headless
+    db = _open_db(cfg)
+    await db.connect()
+    await db.init_schema()
+    settings = await _settings_without_project(db, cfg)
+    if settings is None:
+        await db.close()
+        return SearchRunResult(0, 0, 0)
+    cfg = settings
+    if target_mode:
+        cfg.collector.target_mode = target_mode
+    if custom_reply and custom_reply.strip():
+        cfg.processor.reply_mode = "custom"
+        cfg.processor.custom_replies = [custom_reply.strip()]
+    elif reply_mode:
+        cfg.processor.reply_mode = reply_mode
+    if cfg.processor.reply_mode == "custom" and not [r for r in cfg.processor.custom_replies if r and r.strip()]:
+        logger.error("Включен режим 'Свой текст' (custom), но список шаблонов пуст и --custom-reply не передан")
+        await db.close()
+        return SearchRunResult(0, 0, 0)
+    await log_proxy_routes(db)
+
+    orchestrator = MultiAccountOrchestrator(
+        config_or_path=cfg,
+        db=db,
+        concurrency=concurrency or cfg.limits.max_concurrent_sessions,
+        dry_run=dry_run,
+        headless=headless,
+        account_mode=account_mode,
+        custom_reply=custom_reply,  # an explicit text bypasses the template deck
+        deck_project_id=await _deck_project_id(db),  # the project whose templates this run uses: same deck as --video
+    )
+    try:
+        return await orchestrator.run_search(
+            query,
+            min_views=min_views,
+            max_views=max_views,
+            max_age_hours=max_age_hours,
+            max_videos=max_videos,
+            comments_per_video=comments_per_video,
+        )
+    finally:
+        await orchestrator.close()
+
+
+async def run_projects_cli(
+    config_path: str = "config.yaml",
+    project: str | None = None,
+    *,
+    dry_run: bool = False,
+    headless: bool | None = None,
+    concurrency: int | None = None,
+    account_mode: str | None = None,
+    topics: list[str] | None = None,
+) -> ProjectsRunSummary | None:
+    """`run_projects` for the command line: `project` (a name) runs only that one, else every project «в запуске».
+    None when the named project does not exist."""
+    project_ids = None
+    if project is not None:
+        cfg = load_config(config_path)
+        async with _open_db(cfg) as db:
+            record = await _project_by_name(db, project)
+        if record is None:
+            return None
+        project_ids = [record.id]
+    return await run_projects(
+        config_path, dry_run, project_ids, headless=headless, concurrency=concurrency, account_mode=account_mode,
+        topics=topics,
+    )
+
+
+_PROJECT_OVERRIDE_FLAGS = (
+    "min_views", "max_views", "max_age_hours", "max_videos", "comments_per_video", "target_mode", "reply_mode",
+    "custom_reply",
+)
+
+
+def run_projects_from_args(args: argparse.Namespace, topics: list[str] | None = None) -> None:
+    """A launch over projects from the command line; exits 1 for an unknown project or a launch stopped by an error."""
+    ignored = [f"--{flag.replace('_', '-')}" for flag in _PROJECT_OVERRIDE_FLAGS if getattr(args, flag, None) is not None]
+    if ignored:
+        logger.warning("Фильтры и ответы берутся из проекта: {} не действуют", ", ".join(ignored))
+    summary = asyncio.run(run_projects_cli(
+        args.config,
+        args.project,
+        dry_run=args.dry_run,
+        headless=True if args.headless else None,
+        concurrency=args.concurrency,
+        account_mode=args.account_mode,
+        topics=topics,
+    ))
+    if summary is None or summary.stopped_at:
+        sys.exit(1)
+
+
+def search_options(args: argparse.Namespace, cfg: AppConfig) -> dict[str, Any]:
+    """Filters of a CLI topic search: a flag wins, else collector.* of config.yaml.
+
+    0 turns a limit off: --max-views 0 (no upper view limit), --max-age-hours 0 (any age).
+    """
+    col = cfg.collector
+    return {
+        "min_views": col.min_views if args.min_views is None else args.min_views,
+        "max_views": col.max_views if args.max_views is None else (args.max_views or None),
+        "max_age_hours": col.max_age_hours if args.max_age_hours is None else (args.max_age_hours or None),
+        "max_videos": col.max_videos if args.max_videos is None else args.max_videos,
+        "comments_per_video": col.comments_per_video if args.comments_per_video is None else args.comments_per_video,
+    }
+
+
+def run_search_from_args(args: argparse.Namespace, cfg: AppConfig, query: str) -> None:
+    """`--search` (or collector.search_query): through the accounts; with --account only that account."""
+    opts = search_options(args, cfg)
+    target_mode = args.target_mode or cfg.collector.target_mode
+    if args.account is not None:
+        kwargs: dict[str, Any] = {
+            "config_path": args.config,
+            "min_views": opts["min_views"],
+            "max_views": opts["max_views"],
+            "max_age_hours": opts["max_age_hours"] or 0,  # 0 = any age (None would mean the config value)
+            "max_videos": opts["max_videos"],
+            "comments_per_video": opts["comments_per_video"],
+            "target_mode": target_mode,
+            "dry_run": args.dry_run,
+            "account_name": args.account,
+        }
+        if args.headless:
+            kwargs["headless"] = True
+        if args.reply_mode is not None:
+            kwargs["reply_mode"] = args.reply_mode
+        if args.custom_reply is not None:
+            kwargs["custom_reply"] = args.custom_reply
+        asyncio.run(run_multi_video_pipeline(query, **kwargs))
+        return
+    asyncio.run(run_search_cli(
+        query,
+        args.config,
+        **opts,
+        dry_run=args.dry_run,
+        headless=True if args.headless else None,
+        concurrency=args.concurrency,
+        account_mode=args.account_mode,
+        target_mode=target_mode,
+        reply_mode=args.reply_mode,
+        custom_reply=args.custom_reply,
+    ))
+
+
 async def list_sub_comments(video_url: str, config_path: str = "config.yaml", limit: int = 10) -> None:
     """Fetch and list comments under comments for a YouTube video."""
     cfg = load_config(config_path)
     try:
-        async with YouTubeCollector(cfg.collector, cfg.browser.proxy) as collector:
+        async with _open_db(cfg) as db:
+            search_proxy = await db.search_proxy_url()
+    except ProxyUnavailableError as exc:
+        logger.error("{}", exc)
+        return
+    try:
+        async with YouTubeCollector(cfg.collector, search_proxy) as collector:
             sub_comments = await collector.fetch_video_sub_comments(video_url, max_sub_comments=limit)
     except CollectorError as exc:
         logger.error("Не удалось получить ответы под комментариями: {}", exc)
@@ -858,9 +1540,14 @@ async def run_reply_bot(
     cfg = load_config(config_path)
     if headless is not None:
         cfg.browser.headless = headless
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
+    settings = await _settings_without_project(db, cfg)
+    if settings is None:
+        await db.close()
+        return
+    cfg = settings
 
     rng = random.Random()
     effective_mode = "custom" if custom_reply else (reply_mode or getattr(cfg.processor, "reply_mode", "ai"))
@@ -895,6 +1582,7 @@ async def run_reply_bot(
         if effective_mode == "ai" or should_paraphrase(cfg.deepseek, cfg.processor)
         else None
     )
+    deck = ReplyDeck(db, rng, project_id=await _deck_project_id(db))
     simulator = InteractionSimulator(rng=rng)
 
     session_dir: str | Path | None = None
@@ -908,42 +1596,45 @@ async def run_reply_bot(
             cfg_acc = next((a for a in getattr(cfg.browser, "accounts", []) if a.name == account_name), None)
             if cfg_acc:
                 session_dir = cfg_acc.session_path
-                proxy_url = cfg_acc.proxy_url
                 resolved_acc_name = cfg_acc.name
             else:
                 session_dir = str(cfg.browser.session_root / account_name)
-                proxy_url = cfg.browser.proxy
                 resolved_acc_name = account_name
-            acc_record = await db.upsert_account(
-                name=resolved_acc_name,
-                session_path=str(session_dir),
-                proxy_url=proxy_url,
-                is_active=True,
-            )
+            upsert_args: dict[str, Any] = {"name": resolved_acc_name, "session_path": str(session_dir), "is_active": True}
+            if cfg_acc and cfg_acc.proxy_url:
+                upsert_args["proxy_url"] = cfg_acc.proxy_url
+            acc_record = await db.upsert_account(**upsert_args)
         else:
             session_dir = acc_record.session_path
-            proxy_url = acc_record.proxy_url
             resolved_acc_name = acc_record.name
 
-    # comments are fetched through the proxy the account posts from; no proxy anywhere: direct, as before
-    collector = YouTubeCollector(cfg.collector, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+    # the account posts only through its own proxy (or directly); comments are read through the search proxy.
+    # Without --account the main profile is the «default» account's.
+    owner = acc_record if account_name else await db.get_account("default")
+    try:
+        proxy_url = resolve_account_proxy(owner) if owner is not None else None
+        search_proxy = await db.search_proxy_url()
+    except ProxyUnavailableError as exc:
+        logger.error("{}", exc)
+        await db.close()
+        return
+    await log_proxy_routes(db, [owner.name] if owner is not None else [])
+    collector = YouTubeCollector(cfg.collector, search_proxy)
+    visibility = VisibilityWatcher(make_visibility_checker(cfg, collector), db)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
         "rng": rng,
+        "proxy": proxy_url,  # explicit: YouTubeRunner must not fall back to browser.proxy
     }
     if session_dir is not None:
         runner_kwargs["session_dir"] = session_dir
-    if proxy_url is not None:
-        runner_kwargs["proxy"] = proxy_url
     if account_name is not None:
         runner_kwargs["account_name"] = resolved_acc_name
     if acc_record is not None:
         if acc_record.locale:
             runner_kwargs["locale"] = acc_record.locale
-        await warn_if_exit_mismatch(
-            acc_record.name, acc_record.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy)
-        )
+        await warn_if_exit_mismatch(acc_record.name, acc_record.expected_country, proxy_url)
 
     runner = YouTubeRunner(cfg.browser, yt_target, **runner_kwargs)
 
@@ -962,14 +1653,14 @@ async def run_reply_bot(
         if effective_target_mode in ("popular_parent", "sub_comment", "mixed", "first_reply", "first_sub_comment"):
             logger.info("Сбор комментариев для {} (режим={})", video_url, effective_target_mode)
             try:
-                items = await collector.fetch_popular_comments(video_url, limit=limit * 2, target_mode=effective_target_mode)
+                items = await collector.fetch_popular_comments(video_url, limit=limit * 2 + EXTRA_CANDIDATES, target_mode=effective_target_mode)
             except Exception as exc:
                 logger.debug("Сбор популярных комментариев завершился ошибкой, резервный метод: {}", exc)
         else:
             logger.info("Сбор комментариев для {} (режим=first_reply)", video_url)
 
         if not items:
-            items = await collector.collect_from_videos([video_url], max_items=limit * 2)
+            items = await collector.collect_from_videos([video_url], max_items=limit * 2 + EXTRA_CANDIDATES)
 
         if not items:
             logger.warning("Не найдено подходящих комментариев по фильтрам для {}", video_url)
@@ -1004,16 +1695,21 @@ async def run_reply_bot(
                 logger.info("   ↳ в ответ на {}: {!r}", p_auth, item.parent_text[:60])
 
             # Generate response via DeepSeek or resolve custom text
+            deck_card = None  # the custom template taken from this account's deck; burned only after a real post
             try:
                 if effective_mode == "custom":
-                    reply_text = resolve_reply_text(
+                    prepared = await prepare_reply(
                         item,
+                        deck=deck,
+                        account=resolved_acc_name,
+                        text_settings=cfg.processor,
+                        processor=processor,
                         custom_reply=custom_reply,
                         custom_replies=getattr(cfg.processor, "custom_replies", None),
+                        dry_run=dry_run,
                         rng=rng,
                     )
-                    if processor is not None:
-                        reply_text = await processor.paraphrase(reply_text)
+                    reply_text, deck_card = prepared.text, prepared.card
                     logger.success("💬 НАШ ОТВЕТ: «{}»", reply_text)
                 else:
                     reply_text = await processor.generate(item)
@@ -1037,6 +1733,7 @@ async def run_reply_bot(
                         error=f"{db_err_label} failed: {exc}",
                         duration_sec=None,
                         payload_id=payload.id if payload else None,
+                        account_id=owner.id if owner is not None else None,
                     )
                 )
                 logger.error("{} завершилась ошибкой для {}: {}", ru_err_label, item.external_id, exc)
@@ -1050,6 +1747,7 @@ async def run_reply_bot(
                     payload_id=None,
                     dry_run=True,
                 )
+                await deck.settle(deck_card, posted=False)  # a dry run never burns a template
                 status = "simulated" if sub_res.success else "failed"
                 await db.log_activity(
                     ActivityLogCreate(
@@ -1065,6 +1763,7 @@ async def run_reply_bot(
                         error=sub_res.error if not sub_res.success else None,
                         duration_sec=sub_res.duration_seconds,
                         payload_id=None,
+                        account_id=owner.id if owner is not None else None,
                     )
                 )
                 if sub_res.success:
@@ -1082,6 +1781,7 @@ async def run_reply_bot(
                         dry_run=False,
                     )
                 except Exception as exc:
+                    await deck.settle(deck_card, posted=False)
                     await db.mark_payload_failed(payload.id, f"Execution failed: {exc}")
                     await db.log_activity(
                         ActivityLogCreate(
@@ -1097,16 +1797,18 @@ async def run_reply_bot(
                             error=str(exc),
                             duration_sec=None,
                             payload_id=payload.id,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
                     logger.exception("Ошибка при отправке ответа для {}: {}", item.external_id, exc)
                     continue
 
                 if sub_res.success:
+                    await deck.settle(deck_card, posted=True)  # really posted: the template leaves the deck
                     if acc_record is not None:
                         await db.increment_account_stats(acc_record.id, replies=1)
                     await db.mark_payload_submitted(payload.id, sub_res.remote_id)
-                    await db.log_activity(
+                    log_entry = await db.log_activity(
                         ActivityLogCreate(
                             video_id=video_id,
                             video_title=None,
@@ -1120,12 +1822,21 @@ async def run_reply_bot(
                             error=None,
                             duration_sec=sub_res.duration_seconds,
                             payload_id=payload.id,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
                     logger.success("Ответ успешно опубликован и сохранен в базе (ID={})", sub_res.remote_id)
+                    visibility.schedule(
+                        log_entry.id, video_id, sub_res.remote_id, owner.name if owner is not None else "default"
+                    )
                     processed += 1
                 else:
-                    await db.mark_payload_failed(payload.id, sub_res.error or "submission failed")
+                    await deck.settle(deck_card, posted=False)
+                    no_reply_button = bool(getattr(sub_res, "reply_unavailable", False))
+                    fail_text = (
+                        f"{REPLY_UNAVAILABLE_MARK}: {sub_res.error}" if no_reply_button else (sub_res.error or "submission failed")
+                    )
+                    await db.mark_payload_failed(payload.id, fail_text)
                     await db.log_activity(
                         ActivityLogCreate(
                             video_id=video_id,
@@ -1137,11 +1848,15 @@ async def run_reply_bot(
                             reply_text=reply_text,
                             mode="live",
                             status="failed",
-                            error=sub_res.error or "submission failed",
+                            error=fail_text,
                             duration_sec=sub_res.duration_seconds,
                             payload_id=payload.id,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
+                    if no_reply_button:  # the target, not the account: take the next candidate at once, no pause
+                        logger.warning("Комментарий {} пропущен: ответить на него нельзя", item.external_id)
+                        continue
                     logger.error("Не удалось отправить ответ: {}", sub_res.error)
 
             if processed < limit:
@@ -1150,12 +1865,18 @@ async def run_reply_bot(
                 await asyncio.sleep(pause)
 
         logger.info("Обработка видео завершена: отправлено {} ответов.", processed)
+    except BaseException:
+        await visibility.cancel()  # Ctrl+C / a crash: do not wait out the check delay
+        raise
     finally:
-        await runner.close()
-        await collector.close()
-        if processor is not None:
-            await processor.close()
-        await db.close()
+        try:
+            await visibility.finish()  # the checks use the collector and the database: wait before closing them
+        finally:
+            await runner.close()
+            await collector.close()
+            if processor is not None:
+                await processor.close()
+            await db.close()
 
 
 async def run_multi_video_pipeline(
@@ -1178,15 +1899,22 @@ async def run_multi_video_pipeline(
     Search videos by query, iterate through matched videos,
     and reply to popular comments under each video.
 
-    max_age_hours (default: collector.max_age_hours) keeps only videos published within that many hours.
+    Used for `--search --account NAME` (one named account); without --account a topic search goes
+    through the accounts (run_search_cli).
+    max_age_hours keeps only videos published within that many hours: None = collector.max_age_hours, 0 = any age.
     """
     cfg = load_config(config_path)
-    max_age_hours = max_age_hours or cfg.collector.max_age_hours
     if headless is not None:
         cfg.browser.headless = headless
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
+    settings = await _settings_without_project(db, cfg)
+    if settings is None:
+        await db.close()
+        return
+    cfg = settings
+    max_age_hours = cfg.collector.max_age_hours if max_age_hours is None else (max_age_hours or None)
 
     rng = random.Random()
     effective_mode = "custom" if custom_reply else (reply_mode or getattr(cfg.processor, "reply_mode", "ai"))
@@ -1220,6 +1948,7 @@ async def run_multi_video_pipeline(
         if effective_mode == "ai" or should_paraphrase(cfg.deepseek, cfg.processor)
         else None
     )
+    deck = ReplyDeck(db, rng, project_id=await _deck_project_id(db))
     simulator = InteractionSimulator(rng=rng)
 
     session_dir: str | Path | None = None
@@ -1233,42 +1962,45 @@ async def run_multi_video_pipeline(
             cfg_acc = next((a for a in getattr(cfg.browser, "accounts", []) if a.name == account_name), None)
             if cfg_acc:
                 session_dir = cfg_acc.session_path
-                proxy_url = cfg_acc.proxy_url
                 resolved_acc_name = cfg_acc.name
             else:
                 session_dir = str(cfg.browser.session_root / account_name)
-                proxy_url = cfg.browser.proxy
                 resolved_acc_name = account_name
-            acc_record = await db.upsert_account(
-                name=resolved_acc_name,
-                session_path=str(session_dir),
-                proxy_url=proxy_url,
-                is_active=True,
-            )
+            upsert_args: dict[str, Any] = {"name": resolved_acc_name, "session_path": str(session_dir), "is_active": True}
+            if cfg_acc and cfg_acc.proxy_url:
+                upsert_args["proxy_url"] = cfg_acc.proxy_url
+            acc_record = await db.upsert_account(**upsert_args)
         else:
             session_dir = acc_record.session_path
-            proxy_url = acc_record.proxy_url
             resolved_acc_name = acc_record.name
 
-    # comments are fetched through the proxy the account posts from; no proxy anywhere: direct, as before
-    collector = YouTubeCollector(cfg.collector, resolve_account_proxy(proxy_url, cfg.browser.proxy))
+    # the account posts only through its own proxy (or directly); comments are read through the search proxy.
+    # Without --account the main profile is the «default» account's.
+    owner = acc_record if account_name else await db.get_account("default")
+    try:
+        proxy_url = resolve_account_proxy(owner) if owner is not None else None
+        search_proxy = await db.search_proxy_url()
+    except ProxyUnavailableError as exc:
+        logger.error("{}", exc)
+        await db.close()
+        return
+    await log_proxy_routes(db, [owner.name] if owner is not None else [])
+    collector = YouTubeCollector(cfg.collector, search_proxy)
+    visibility = VisibilityWatcher(make_visibility_checker(cfg, collector), db)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
         "rng": rng,
+        "proxy": proxy_url,  # explicit: YouTubeRunner must not fall back to browser.proxy
     }
     if session_dir is not None:
         runner_kwargs["session_dir"] = session_dir
-    if proxy_url is not None:
-        runner_kwargs["proxy"] = proxy_url
     if account_name is not None:
         runner_kwargs["account_name"] = resolved_acc_name
     if acc_record is not None:
         if acc_record.locale:
             runner_kwargs["locale"] = acc_record.locale
-        await warn_if_exit_mismatch(
-            acc_record.name, acc_record.expected_country, resolve_account_proxy(proxy_url, cfg.browser.proxy)
-        )
+        await warn_if_exit_mismatch(acc_record.name, acc_record.expected_country, proxy_url)
 
     runner = YouTubeRunner(cfg.browser, yt_target, **runner_kwargs)
 
@@ -1297,7 +2029,11 @@ async def run_multi_video_pipeline(
             max_age_hours=max_age_hours,
         )
         if not videos:
-            logger.warning("Не найдено видео по запросу {!r} с заданными критериями", query)
+            logger.warning(
+                "Не найдено видео по запросу {!r} с заданными фильтрами: {}",
+                query,
+                empty_search_hint(min_views, max_views, max_age_hours),
+            )
             return
 
         logger.info("Найдено подходящих видео: {}. Запуск процесса ответов...", len(videos))
@@ -1322,7 +2058,7 @@ async def run_multi_video_pipeline(
             try:
                 items = await collector.fetch_popular_comments(
                     vid_url,
-                    limit=comments_per_video * 2,
+                    limit=comments_per_video * 2 + EXTRA_CANDIDATES,
                     target_mode=effective_target_mode,
                 )
             except Exception as exc:
@@ -1331,7 +2067,7 @@ async def run_multi_video_pipeline(
 
             if not items:
                 try:
-                    items = await collector.collect_from_videos([vid_url], max_items=comments_per_video * 2)
+                    items = await collector.collect_from_videos([vid_url], max_items=comments_per_video * 2 + EXTRA_CANDIDATES)
                 except Exception as exc:
                     logger.debug("Резервный сбор комментариев завершился ошибкой для {}: {}", vid_id, exc)
 
@@ -1370,16 +2106,21 @@ async def run_multi_video_pipeline(
                     p_auth = format_author(item.parent_author) if item.parent_author else "unknown"
                     logger.info("   ↳ в ответ на {}: {!r}", p_auth, item.parent_text[:60])
 
+                deck_card = None  # the custom template taken from this account's deck; burned only after a real post
                 try:
                     if effective_mode == "custom":
-                        reply_text = resolve_reply_text(
+                        prepared = await prepare_reply(
                             item,
+                            deck=deck,
+                            account=resolved_acc_name,
+                            text_settings=cfg.processor,
+                            processor=processor,
                             custom_reply=custom_reply,
                             custom_replies=getattr(cfg.processor, "custom_replies", None),
+                            dry_run=dry_run,
                             rng=rng,
                         )
-                        if processor is not None:
-                            reply_text = await processor.paraphrase(reply_text)
+                        reply_text, deck_card = prepared.text, prepared.card
                         logger.success("💬 НАШ ОТВЕТ: «{}»", reply_text)
                     else:
                         reply_text = await processor.generate(item)
@@ -1403,6 +2144,7 @@ async def run_multi_video_pipeline(
                             error=f"{db_err_label} failed: {exc}",
                             duration_sec=None,
                             payload_id=payload.id if payload else None,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
                     logger.error("{} завершилась ошибкой для {}: {}", ru_err_label, item.external_id, exc)
@@ -1415,6 +2157,7 @@ async def run_multi_video_pipeline(
                         payload_id=None,
                         dry_run=True,
                     )
+                    await deck.settle(deck_card, posted=False)  # a dry run never burns a template
                     status = "simulated" if sub_res.success else "failed"
                     await db.log_activity(
                         ActivityLogCreate(
@@ -1430,6 +2173,7 @@ async def run_multi_video_pipeline(
                             error=sub_res.error if not sub_res.success else None,
                             duration_sec=sub_res.duration_seconds,
                             payload_id=None,
+                            account_id=owner.id if owner is not None else None,
                         )
                     )
                     if sub_res.success:
@@ -1448,6 +2192,7 @@ async def run_multi_video_pipeline(
                             dry_run=False,
                         )
                     except Exception as exc:
+                        await deck.settle(deck_card, posted=False)
                         await db.mark_payload_failed(payload.id, f"Execution failed: {exc}")
                         await db.log_activity(
                             ActivityLogCreate(
@@ -1463,16 +2208,18 @@ async def run_multi_video_pipeline(
                                 error=str(exc),
                                 duration_sec=None,
                                 payload_id=payload.id,
+                                account_id=owner.id if owner is not None else None,
                             )
                         )
                         logger.exception("Ошибка при отправке ответа для {}: {}", item.external_id, exc)
                         continue
 
                     if sub_res.success:
+                        await deck.settle(deck_card, posted=True)  # really posted: the template leaves the deck
                         if acc_record is not None:
                             await db.increment_account_stats(acc_record.id, replies=1)
                         await db.mark_payload_submitted(payload.id, sub_res.remote_id)
-                        await db.log_activity(
+                        log_entry = await db.log_activity(
                             ActivityLogCreate(
                                 video_id=vid_id,
                                 video_title=vid_title,
@@ -1486,13 +2233,24 @@ async def run_multi_video_pipeline(
                                 error=None,
                                 duration_sec=sub_res.duration_seconds,
                                 payload_id=payload.id,
+                                account_id=owner.id if owner is not None else None,
                             )
                         )
                         logger.success("Ответ успешно опубликован и сохранен в базе (ID={})", sub_res.remote_id)
+                        visibility.schedule(
+                            log_entry.id, vid_id, sub_res.remote_id, owner.name if owner is not None else "default"
+                        )
                         processed_for_video += 1
                         total_replies += 1
                     else:
-                        await db.mark_payload_failed(payload.id, sub_res.error or "submission failed")
+                        await deck.settle(deck_card, posted=False)
+                        no_reply_button = bool(getattr(sub_res, "reply_unavailable", False))
+                        fail_text = (
+                            f"{REPLY_UNAVAILABLE_MARK}: {sub_res.error}"
+                            if no_reply_button
+                            else (sub_res.error or "submission failed")
+                        )
+                        await db.mark_payload_failed(payload.id, fail_text)
                         await db.log_activity(
                             ActivityLogCreate(
                                 video_id=vid_id,
@@ -1504,11 +2262,15 @@ async def run_multi_video_pipeline(
                                 reply_text=reply_text,
                                 mode="live",
                                 status="failed",
-                                error=sub_res.error or "submission failed",
+                                error=fail_text,
                                 duration_sec=sub_res.duration_seconds,
                                 payload_id=payload.id,
+                                account_id=owner.id if owner is not None else None,
                             )
                         )
+                        if no_reply_button:  # the target, not the account: take the next candidate at once, no pause
+                            logger.warning("Комментарий {} пропущен: ответить на него нельзя", item.external_id)
+                            continue
                         logger.error("Не удалось отправить ответ: {}", sub_res.error)
 
                 if processed_for_video < comments_per_video:
@@ -1529,12 +2291,32 @@ async def run_multi_video_pipeline(
             total_replies,
             len(videos),
         )
+    except BaseException:
+        await visibility.cancel()  # Ctrl+C / a crash: do not wait out the check delay
+        raise
     finally:
-        await runner.close()
-        await collector.close()
-        if processor is not None:
-            await processor.close()
-        await db.close()
+        try:
+            await visibility.finish()  # the checks use the collector and the database: wait before closing them
+        finally:
+            await runner.close()
+            await collector.close()
+            if processor is not None:
+                await processor.close()
+            await db.close()
+
+
+_HISTORY_WIDTH = 120
+_VISIBILITY_TEXT = {"seen": ("виден", "32"), "unseen": ("НЕ ВИДЕН", "33"), "unknown": ("?", "33")}
+
+
+def history_visibility_cell(state: str | None, width: int = 8, color: bool | None = None) -> str:
+    """The «Видим.» column of the history table: виден / НЕ ВИДЕН / ? / —, coloured (green / yellow) only on a
+    terminal that wants colour (a tty and no NO_COLOR)."""
+    if color is None:
+        color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    word, code = _VISIBILITY_TEXT.get(state or "", ("—", ""))
+    cell = word.ljust(width)
+    return f"\033[{code}m{cell}\033[0m" if color and code else cell
 
 
 async def print_activity_history(
@@ -1544,36 +2326,38 @@ async def print_activity_history(
 ) -> None:
     """Print the database audit log of replies in a table."""
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
         entries = await db.list_activity_logs(page=1, page_size=limit, status_filter=status_filter)
-        print("\n" + "=" * 90)
+        project_names = {p.id: p.name for p in await db.list_projects()}
+        print("\n" + "=" * _HISTORY_WIDTH)
         print("                        ЖУРНАЛ ОТРАБОТОК (ACTIVITY AUDIT LOG)")
-        print("=" * 90)
+        print("=" * _HISTORY_WIDTH)
         if not entries:
             print(" Журнал отработок пуст.")
-            print("=" * 90 + "\n")
+            print("=" * _HISTORY_WIDTH + "\n")
             return
 
-        header = f"{'ID':<5} | {'Время (UTC)':<19} | {'Статус':<9} | {'Режим':<7} | {'Автор':<15} | {'Видео':<12} | {'Ответ (фрагмент)'}"
+        header = f"{'ID':<5} | {'Время (UTC)':<19} | {'Статус':<9} | {'Видим.':<8} | {'Режим':<7} | {'Проект':<12} | {'Автор':<15} | {'Видео':<12} | {'Ответ (фрагмент)'}"
         print(header)
-        print("-" * 90)
+        print("-" * _HISTORY_WIDTH)
         for e in entries:
             t = e.created_at[:19].replace("T", " ") if e.created_at else "---"
+            project = "—" if e.project_id is None else project_names.get(e.project_id, "удалён")
             author = (e.target_author or "@unknown")[:14]
             vid = (e.video_title or e.video_id)[:11]
             reply = (e.reply_text or e.error or "")[:25].replace("\n", " ")
-            print(f"{e.id:<5} | {t:<19} | {e.status:<9} | {e.mode:<7} | {author:<15} | {vid:<12} | {reply}...")
-        print("=" * 90 + "\n")
+            print(f"{e.id:<5} | {t:<19} | {e.status:<9} | {history_visibility_cell(e.visibility)} | {e.mode:<7} | {project[:12]:<12} | {author:<15} | {vid:<12} | {reply}...")
+        print("=" * _HISTORY_WIDTH + "\n")
     finally:
         await db.close()
 
 
 async def print_status(config_path: str = "config.yaml") -> None:
     cfg = load_config(config_path)
-    db = Database(cfg.app.db_path)
+    db = _open_db(cfg)
     await db.connect()
     await db.init_schema()
     try:
@@ -1600,17 +2384,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="YouTube Comments-Under-Comments AI Reply Bot")
     parser.add_argument("--video", type=str, default=None, help="YouTube video URL or ID")
     parser.add_argument("--search", type=str, default=None, help="Search query to find YouTube videos by topic")
-    parser.add_argument("--min-views", type=int, default=0, help="Minimum views required for videos in search")
-    parser.add_argument("--max-views", type=int, default=None, help="Maximum views allowed for videos in search")
-    parser.add_argument("--max-age-hours", type=int, default=None, help="Search only videos published within N hours (e.g. 12, 24, 48, 168)")
-    parser.add_argument("--max-videos", type=int, default=5, help="Maximum number of videos to process in search")
-    parser.add_argument("--comments-per-video", type=int, default=2, help="Number of comments to answer per video")
+    parser.add_argument("--min-views", type=int, default=None, help="Minimum views of searched videos (default: collector.min_views)")
+    parser.add_argument("--max-views", type=int, default=None, help="Maximum views of searched videos, 0 = no limit (default: collector.max_views)")
+    parser.add_argument("--max-age-hours", type=int, default=None, help="Search only videos published within N hours (e.g. 12, 24, 48, 168), 0 = any age (default: collector.max_age_hours)")
+    parser.add_argument("--max-videos", type=int, default=None, help="Videos taken per search run (default: collector.max_videos)")
+    parser.add_argument("--comments-per-video", type=int, default=None, help="Replies per video (default: collector.comments_per_video)")
     parser.add_argument(
         "--target-mode",
         type=str,
-        choices=["popular_parent", "sub_comment", "mixed"],
+        choices=["first_reply", "popular_parent", "sub_comment", "mixed"],
         default=None,
-        help="Target comments mode: popular top-level comments, sub-comments, or mixed",
+        help="Target comments: first_reply (a reply under a top comment), popular_parent (top comments), sub_comment (replies), mixed (default: collector.target_mode)",
     )
     parser.add_argument(
         "--reply-mode",
@@ -1645,9 +2429,10 @@ def main() -> None:
     parser.add_argument("--auth-account", type=str, default=None, metavar="NAME_OR_EMAIL", help="Sign the account into YouTube (Camoufox with its proxy and fixed fingerprint, TOTP 2FA)")
     parser.add_argument("--import-accounts-file", type=str, default=None, metavar="FILE", help="Import accounts from a text file (one email:password:totp[:recovery_email][:proxy][:country=PL][:locale=pl-PL] per line) and authenticate them one by one; accounts that are already authenticated are skipped")
     parser.add_argument("--force", action="store_true", help="With --import-accounts-file: sign in accounts that are already authenticated too")
+    parser.add_argument("--allow-country-mismatch", action="store_true", help="With --auth-account, --import-accounts-file, --login --account: sign in even when the proxy's exit country differs from the account's expected one (or cannot be determined), without asking; without the flag the console asks «отменить или продолжить», and with no console the sign-in is cancelled")
     parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (http://user:pass@ip:port or ip:port:user:pass) for adding account or session override")
     parser.add_argument("--session", type=str, default=None, help="Session directory path for adding account")
-    parser.add_argument("--country", type=str, default=None, help="With --add-account: the account's expected country (PL or Poland); a sign-in is refused when the proxy exits elsewhere")
+    parser.add_argument("--country", type=str, default=None, help="With --add-account: the account's expected country (PL or Poland); before a sign-in the proxy's exit country is compared with it (see --allow-country-mismatch)")
     parser.add_argument("--locale", type=str, default=None, help="With --add-account: browser language of the account (e.g. pl-PL); default is browser.locale")
     parser.add_argument("--heartbeat", "--check-session", dest="heartbeat", nargs="?", const="ALL", default=None, metavar="NAME_OR_ALL", help="Show session status from the LOGIN_INFO cookie, no network (default: all active accounts)")
     parser.add_argument("--heartbeat-online", action="store_true", help="With --heartbeat: also verify the session with an HTTP request to YouTube (Firefox-like, through the account proxy)")
@@ -1656,8 +2441,17 @@ def main() -> None:
     parser.add_argument("--apply-profile", type=str, default=None, metavar="NAME_OR_EMAIL", help="Publish the channel profile saved in the wizard (nickname, description, avatar) to the account's YouTube channel")
     parser.add_argument("--lifecycle", action="store_true", help="Show account ages, lifecycle stages, quarantine hours left and daily comment quota")
     parser.add_argument("--warm-quarantined", action="store_true", help="Run organic warm-up, one account after another, for every account in quarantine or aging (uses --warm-up-duration)")
-    parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats from DB")
-    parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt)")
+    parser.add_argument("--set-mode", nargs=2, default=None, metavar=("NAME", "MODE"), help="Account age mode: auto (by age), mature (already warmed up: 5/day, 45-90 min) or unlimited (no stages and limits)")
+    parser.add_argument("--auto-warmup", nargs=2, default=None, metavar=("NAME", "on|off"), help="Allow (on) or forbid (off) the background warm-up of the account during a run")
+    parser.add_argument("--set-active", nargs=2, default=None, metavar=("NAME", "on|off"), help="Put the account in work (on) or switch it off (off): runs skip it and it is not warmed up")
+    parser.add_argument("--reset-restricted", type=str, default=None, metavar="NAME", help="Lift the circuit breaker of a restricted account (3 errors in a row)")
+    parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats and projects from DB")
+    parser.add_argument("--list-projects", action="store_true", help="List the projects in launch order: in the launch, accounts, topics, links, replies, daily limit")
+    parser.add_argument("--project-add", type=str, default=None, metavar="NAME", help="Create a project (AI replies, no topics, no accounts)")
+    parser.add_argument("--project-accounts", nargs=2, default=None, metavar=("NAME", "ACC1,ACC2"), help="Add accounts (names or emails, comma-separated) to a project")
+    parser.add_argument("--project-remove-account", nargs=2, default=None, metavar=("NAME", "ACC"), help="Take accounts (comma-separated) out of a project")
+    parser.add_argument("--videos-file", type=str, default=None, help="Path to videos pool file (e.g. videos.txt): the links go into --project (default «Основной») and that project runs its waiting links")
+    parser.add_argument("--project", type=str, default=None, metavar="NAME", help="Run only this project (its topics, reference links and own links, its accounts and replies); without it a run with no --search/--video/--account goes through every project «в запуске» one after another. With --search: the topic replaces the project's topics for this run only (nothing is saved)")
     parser.add_argument("--concurrency", "-j", type=int, default=None, help="Accounts working at the same time (default: limits.max_concurrent_sessions)")
     parser.add_argument("--account-mode", choices=("each", "share"), default=None, help="each: every account passes the whole video list; share: the list is split (default: limits.account_mode)")
     parser.add_argument("--list-replies", action="store_true", help="List comments under comments and exit")
@@ -1669,6 +2463,7 @@ def main() -> None:
     args = parser.parse_args()
     setup_cli_logging(args.log_level)
     bind_to_kill_on_close_job()  # browser children die with this process, even on a crash
+    run_config_proxy_migration(args.config)  # proxies leave config.yaml for the encrypted library (idempotent)
 
     if args.heartbeat is not None:
         ok = asyncio.run(heartbeat_cli(args.heartbeat, args.config, online=args.heartbeat_online))
@@ -1694,6 +2489,19 @@ def main() -> None:
         asyncio.run(lifecycle_cli(args.config))
         return
 
+    if args.set_mode:
+        sys.exit(0 if asyncio.run(set_mode_cli(args.set_mode[0], args.set_mode[1].lower(), args.config)) else 1)
+
+    for switch, handler in ((args.auto_warmup, set_auto_warmup_cli), (args.set_active, set_active_cli)):
+        if switch:
+            if switch[1].lower() not in _ON_OFF:
+                print(f"[ERROR] Expected on or off, got {switch[1]!r}.", file=sys.stderr)
+                sys.exit(1)
+            sys.exit(0 if asyncio.run(handler(switch[0], _ON_OFF[switch[1].lower()], args.config)) else 1)
+
+    if args.reset_restricted:
+        sys.exit(0 if asyncio.run(reset_restricted_cli(args.reset_restricted, args.config)) else 1)
+
     if args.warm_quarantined:
         ok = asyncio.run(
             warm_quarantined_cli(args.config, duration=args.warm_up_duration, headless=args.headless or None)
@@ -1703,6 +2511,17 @@ def main() -> None:
     if args.list_accounts:
         asyncio.run(print_accounts_table(args.config))
         return
+
+    if args.list_projects:
+        asyncio.run(print_projects_table(args.config))
+        return
+
+    if args.project_add:
+        sys.exit(0 if asyncio.run(project_add_cli(args.project_add, args.config)) else 1)
+
+    for pair, add in ((args.project_accounts, True), (args.project_remove_account, False)):
+        if pair:
+            sys.exit(0 if asyncio.run(project_accounts_cli(pair[0], pair[1], args.config, add=add)) else 1)
 
     if args.add_account:
         account_spec: str = args.add_account
@@ -1733,10 +2552,20 @@ def main() -> None:
         return
 
     if args.auth_account:
-        sys.exit(0 if asyncio.run(auth_account_cli(args.auth_account, args.config, args.headless or None)) else 1)
+        ok = asyncio.run(
+            auth_account_cli(
+                args.auth_account, args.config, args.headless or None, allow_country_mismatch=args.allow_country_mismatch
+            )
+        )
+        sys.exit(0 if ok else 1)
 
     if args.import_accounts_file:
-        ok = asyncio.run(import_accounts_file_cli(args.import_accounts_file, args.config, args.headless or None, args.force))
+        ok = asyncio.run(
+            import_accounts_file_cli(
+                args.import_accounts_file, args.config, args.headless or None, args.force,
+                allow_country_mismatch=args.allow_country_mismatch,
+            )
+        )
         sys.exit(0 if ok else 1)
 
     if args.status:
@@ -1748,7 +2577,9 @@ def main() -> None:
         return
 
     if args.login:
-        asyncio.run(interactive_login(args.config, account_name=args.account))
+        asyncio.run(
+            interactive_login(args.config, account_name=args.account, allow_country_mismatch=args.allow_country_mismatch)
+        )
         return
 
     if args.videos_file:
@@ -1760,6 +2591,7 @@ def main() -> None:
                 account_mode=args.account_mode,
                 dry_run=args.dry_run,
                 headless=args.headless if args.headless else None,
+                **({"project": args.project} if args.project else {}),
             )
         )
         return
@@ -1775,29 +2607,13 @@ def main() -> None:
         return
 
     search_query = args.search or getattr(cfg.collector, "search_query", None)
-    target_mode = args.target_mode or getattr(cfg.collector, "target_mode", "first_reply")
+
+    if args.search and args.project:
+        run_projects_from_args(args, topics=[" ".join(args.search.split())])
+        return
 
     if args.search:
-        search_kwargs: dict[str, Any] = {
-            "config_path": args.config,
-            "min_views": args.min_views,
-            "max_views": args.max_views,
-            "max_videos": args.max_videos,
-            "comments_per_video": args.comments_per_video,
-            "target_mode": target_mode,
-            "dry_run": args.dry_run,
-        }
-        if args.account is not None:
-            search_kwargs["account_name"] = args.account
-        if args.headless:
-            search_kwargs["headless"] = True
-        if args.reply_mode is not None:
-            search_kwargs["reply_mode"] = args.reply_mode
-        if args.custom_reply is not None:
-            search_kwargs["custom_reply"] = args.custom_reply
-        if args.max_age_hours is not None:
-            search_kwargs["max_age_hours"] = args.max_age_hours
-        asyncio.run(run_multi_video_pipeline(args.search, **search_kwargs))
+        run_search_from_args(args, _cli_settings(args, cfg), args.search)
         return
 
     # Check if user explicitly provided a CLI action or if interactive wizard should open
@@ -1813,6 +2629,7 @@ def main() -> None:
         or args.auth_account is not None
         or args.import_accounts_file is not None
         or args.list_accounts
+        or args.project is not None
     )
 
     if args.wizard or (not has_cli_action and sys.stdin.isatty()):
@@ -1820,30 +2637,18 @@ def main() -> None:
         run_wizard_app(args.config)
         return
 
+    if not args.video and args.account is None:
+        run_projects_from_args(args)
+        return
+
+    if args.project:
+        logger.warning("--project не действует вместе с --video / --account: запуск без проектов")
+
+    cfg = _cli_settings(args, cfg)
+    search_query = cfg.collector.search_query
+    default_limit = cfg.limits.max_iterations_per_session or 2
     if not args.video and search_query:
-        min_v = args.min_views if args.min_views != 0 else getattr(cfg.collector, "min_views", 0)
-        max_v = args.max_views if args.max_views is not None else getattr(cfg.collector, "max_views", None)
-        c_per_v = args.comments_per_video if args.comments_per_video != 2 else getattr(cfg.collector, "comments_per_video", 2)
-        fallback_kwargs: dict[str, Any] = {
-            "config_path": args.config,
-            "min_views": min_v,
-            "max_views": max_v,
-            "max_videos": args.max_videos,
-            "comments_per_video": c_per_v,
-            "target_mode": target_mode,
-            "dry_run": args.dry_run,
-        }
-        if args.account is not None:
-            fallback_kwargs["account_name"] = args.account
-        if args.headless:
-            fallback_kwargs["headless"] = True
-        if args.reply_mode is not None:
-            fallback_kwargs["reply_mode"] = args.reply_mode
-        if args.custom_reply is not None:
-            fallback_kwargs["custom_reply"] = args.custom_reply
-        if args.max_age_hours is not None:
-            fallback_kwargs["max_age_hours"] = args.max_age_hours
-        asyncio.run(run_multi_video_pipeline(search_query, **fallback_kwargs))
+        run_search_from_args(args, cfg, search_query)
         return
 
     video_url = args.video or default_video

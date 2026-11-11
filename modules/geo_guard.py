@@ -214,13 +214,21 @@ def _lookup_exit_geo(proxy_url: str | None) -> ExitGeo | None:
     The database is not downloaded here. When it is missing or unreadable the IP is still returned (geo fields None):
     the proxy provably answers. A failing IP lookup raises.
     """
-    from camoufox.geolocation import get_mmdb_path, load_geoip_config
     from camoufox.ip import public_ip
 
     from modules.session_heartbeat import curl_proxy_url
 
     lookup = getattr(public_ip, "__wrapped__", public_ip)  # Camoufox caches an IP per proxy forever; the TTL here is ours
-    ip = lookup(curl_proxy_url(proxy_url))
+    return _geo_for_ip(lookup(curl_proxy_url(proxy_url)))
+
+
+def _geo_for_ip(ip: str) -> ExitGeo:
+    """Blocking: country, time zone and coordinates of an IP from Camoufox's GeoIP database (no network).
+
+    A missing or unreadable database gives an ExitGeo with only the IP.
+    """
+    from camoufox.geolocation import get_mmdb_path, load_geoip_config
+
     config = load_geoip_config()
     paths = config.get("paths") or {}
     path = get_mmdb_path("ipv6" if ":" in ip else "ipv4", config)
@@ -235,6 +243,11 @@ def _lookup_exit_geo(proxy_url: str | None) -> ExitGeo | None:
         logger.debug("GeoIP-базу прочитать не удалось: {}", type(exc).__name__)
         return ExitGeo(ip, None, None, None, None)
     return _geo_from_record(ip, record, paths)
+
+
+def _country_for_ip(ip: str) -> str | None:
+    """Blocking: ISO country of an IP from Camoufox's GeoIP database; None when the database is missing or silent."""
+    return _geo_for_ip(ip).country
 
 
 def _lookup_exit_country(proxy_url: str | None) -> str | None:
@@ -283,6 +296,39 @@ async def resolve_exit_country(proxy_url: str | None, timeout: float = EXIT_LOOK
     if country:
         _EXIT_CACHE[key] = (_now(), country)
     return country
+
+
+async def country_for_ip(ip: str | None, timeout: float = EXIT_LOOKUP_TIMEOUT) -> str | None:
+    """ISO country of `ip` from the same GeoIP database as `resolve_exit_country` (no network). Failure: None."""
+    if not ip:
+        return None
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_country_for_ip, ip), timeout)
+    except Exception as exc:
+        logger.debug("Страну IP определить не удалось: {}", type(exc).__name__)
+        return None
+
+
+def remember_exit_country(proxy_url: str | None, country: str | None) -> None:
+    """Seed the exit-country cache with a result found elsewhere (a proxy check), so a sign-in right after reuses it."""
+    if country:
+        _EXIT_CACHE[proxy_url or ""] = (_now(), country)
+
+
+def geoip_database_status() -> tuple[bool, str]:
+    """(ready, Russian text): is Camoufox's GeoIP database downloaded? Without it no country is ever known, and an
+    account with an expected country cannot sign in. The hint names the command that downloads it."""
+    hint = "скачайте её командой: .venv\\Scripts\\python.exe -m camoufox fetch (около 120 МБ)"
+    try:
+        from camoufox.geolocation import get_mmdb_path, load_geoip_config
+
+        path = get_mmdb_path("ipv4", load_geoip_config())
+    except Exception as exc:
+        logger.debug("Гео-база Camoufox недоступна: {}", type(exc).__name__)
+        return False, f"Гео-база Camoufox недоступна (страна прокси не определится): {hint}"
+    if not path.exists():
+        return False, f"Гео-база Camoufox не скачана (страна прокси не определится): {hint}"
+    return True, "Гео-база Camoufox на месте"
 
 
 def _lookup_host_ip() -> str:
@@ -482,10 +528,13 @@ __all__ = [
     "check_account_exit",
     "check_expected_country",
     "check_geo_lock",
+    "country_for_ip",
     "ensure_network_ready",
+    "geoip_database_status",
     "normalize_country",
     "normalize_locale",
     "read_session_geo",
+    "remember_exit_country",
     "resolve_exit_country",
     "resolve_exit_geo",
     "resolve_host_ip",
