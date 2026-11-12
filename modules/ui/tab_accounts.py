@@ -843,20 +843,38 @@ def add_field(ctx: AppContext) -> Step:
             return None if not text.strip() else Notice("warn", "Строк с аккаунтами нет")
         modes = [MODE_LABELS[m].lower() for m in _MODES]
         return Confirm([Cell(f"Аккаунтов {total}. Режим для новых (mode= в строке важнее):")], modes,
-                       lambda i: register(ctx, lines, _MODES[i], total))
+                       lambda i: engine_question(ctx, lines, _MODES[i], total))
 
     return Field("строки «почта пароль 2FA» или путь к файлу", submit, multiline=True,
                  preview=lambda lines: add_preview(lines, known))
 
 
-def register(ctx: AppContext, lines: list[str], mode: str, total: int) -> Step:
+ENGINES = ("camoufox", "chrome")
+
+
+def engine_question(ctx: AppContext, lines: list[str], mode: str, total: int) -> Step:
+    """«Браузер для входа»: ←→ picks Camoufox or Google Chrome, Enter confirms; the config default is under the cursor.
+
+    The choice is the browser of the new accounts: their profile, sign-in, warm-up and runs all use it."""
+    try:
+        default = ENGINES.index(getattr(ctx.cfg().browser, "default_engine", "camoufox"))
+    except Exception:  # an unreadable config or an unknown value: the usual Camoufox
+        default = 0
+    choices = [f"{engine_icon(e)} {engine_title(e)}" for e in ENGINES]
+    return Confirm([Cell("Браузер для входа новых аккаунтов (←→ выбрать, Enter):")], choices,
+                   lambda i: register(ctx, lines, mode, total, ENGINES[i]), selected=default)
+
+
+def register(ctx: AppContext, lines: list[str], mode: str, total: int, engine: str | None = None) -> Step:
     from modules.wizard import _setup_register
 
     try:
-        result = _setup_register(ctx.config_path, lines, mode)
+        result = _setup_register(ctx.config_path, lines, mode, engine)
     except Exception as exc:
         return Notice("err", f"Не добавлено ({exc.__class__.__name__}) — часть аккаунтов могла добавиться, проверьте список")
     text = f"Добавлено {len(result.added)} из {total}"
+    if engine is not None and result.added:
+        text += f" · {engine_title(engine)}"
     if result.skipped:
         text += f" · уже были: {len(result.skipped)}"
     if result.errors:

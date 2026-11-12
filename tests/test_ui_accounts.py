@@ -249,6 +249,8 @@ class TestAddAndBulk(AccountsTabCase):
         self.assertIn("Режим для новых", self.screen(c))
         c.press("right")  # уже прогрет
         c.press("enter")
+        self.assertIn("Браузер для входа", self.screen(c))
+        c.press("enter")  # Camoufox, the one under the cursor
         self.assertIn("куки-робот", self.screen(c))
         c.press("enter")  # «Нет»
         self.assertIn("Войти и прогреть", self.screen(c))
@@ -264,8 +266,55 @@ class TestAddAndBulk(AccountsTabCase):
         c.press("enter")
         c.press("right")
         c.press("enter")
+        c.press("enter")  # the browser question: Camoufox
         self.assertIn("Нагулять профиль перед входом", self.screen(c))
         return c
+
+    def pick_browser(self, presses: list[str], default: str | None = None) -> Controller:
+        if default:
+            data = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+            data["browser"]["default_engine"] = default
+            self.config_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+        c = self.shell()
+        c.press("+")
+        c.press("paste:new1@x.com pass111\n")
+        c.press("enter")
+        c.press("enter")  # the mode
+        self.assertIn("Браузер для входа", self.screen(c))
+        for key in presses:
+            c.press(key)
+        return c
+
+    def test_browser_question_shows_both_browsers_and_starts_on_camoufox(self):
+        c = self.pick_browser([])
+        screen = self.screen(c)
+        self.assertIn("▸ F Camoufox", screen)
+        self.assertIn("C Google Chrome", screen)
+        self.assertEqual(c.confirm.selected, 0)
+
+    def test_arrows_pick_chrome_and_the_new_account_uses_it(self):
+        c = self.pick_browser(["right"])
+        self.assertIn("▸ C Google Chrome", self.screen(c))
+        c.press("enter")
+        self.assertEqual(self.account("new1@x.com").engine, "chrome")
+        c.press("enter")  # cookie robot: «Нет»
+        c.press("enter")  # sign in: «Позже»
+        self.assertIn("Добавлено 1 из 1 · Google Chrome", self.screen(c))
+
+    def test_arrows_wrap_around_and_camoufox_stays_the_default_pick(self):
+        c = self.pick_browser(["left", "left"])  # Chrome, then back
+        c.press("enter")
+        self.assertEqual(self.account("new1@x.com").engine, "camoufox")
+
+    def test_config_default_chrome_is_under_the_cursor(self):
+        c = self.pick_browser([], default="chrome")
+        self.assertEqual(c.confirm.selected, 1)
+        c.press("enter")
+        self.assertEqual(self.account("new1@x.com").engine, "chrome")
+
+    def test_escape_on_the_browser_question_adds_nothing(self):
+        c = self.pick_browser(["escape"])
+        self.assertIsNone(self.account("new1@x.com"))
 
     def test_cookie_robot_question_yes_runs_the_robot_then_asks_to_sign_in(self):
         from modules.cookie_robot import CookieRobotResult

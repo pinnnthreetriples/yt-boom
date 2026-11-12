@@ -269,7 +269,11 @@ def socks5_host_resolver_rule(proxy_url: str | None) -> str | None:
     return "MAP * ~NOTFOUND , " + ", ".join(f"EXCLUDE {name}" for name in excluded)
 
 
-def get_chrome_args(locale: str = "en-US", account_name: str | None = None, proxy_url: str | None = None) -> list[str]:
+def get_chrome_args(
+    locale: str = "en-US", account_name: str | None = None, proxy_url: str | None = None, http2: bool = True,
+) -> list[str]:
+    """Command line on top of patchright's own. `http2=False` (`--disable-http2`, Chrome speaks only HTTP/1.1) is a
+    fallback for a proxy that stalls Google over HTTP/2: it is not a usual Chrome fingerprint, so it is never the default."""
     width, height = get_window_size(account_name)
     args = [
         "--no-first-run",
@@ -292,6 +296,8 @@ def get_chrome_args(locale: str = "en-US", account_name: str | None = None, prox
     rule = socks5_host_resolver_rule(proxy_url)
     if rule:
         args.append(f"--host-resolver-rules={rule}")
+    if not http2:
+        args.append("--disable-http2")
     return args
 
 

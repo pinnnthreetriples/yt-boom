@@ -350,10 +350,13 @@ def _setup_remove_from_config(config_path: Path, name: str) -> None:
         config_path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
-def _setup_register(config_path: Path, lines: list[str], default_mode: str | None = None) -> Any:
+def _setup_register(
+    config_path: Path, lines: list[str], default_mode: str | None = None, engine: str | None = None,
+) -> Any:
     """Register the account lines through the CLI importer (existing accounts are skipped, not overwritten).
 
-    `default_mode` is the age mode of the lines that have no `mode=` of their own.
+    `default_mode` is the age mode of the lines that have no `mode=` of their own; `engine` the browser of the new
+    accounts ("camoufox" / "chrome", None = the config default).
     """
     from config import load_config
     from youtube_bot import register_account_lines
@@ -361,7 +364,7 @@ def _setup_register(config_path: Path, lines: list[str], default_mode: str | Non
     cfg = load_config(config_path)
     return _pools_db(
         config_path,
-        lambda db: register_account_lines(db, cfg, lines, skip_existing=True, default_mode=default_mode),
+        lambda db: register_account_lines(db, cfg, lines, skip_existing=True, default_mode=default_mode, engine=engine),
     )
 
 
