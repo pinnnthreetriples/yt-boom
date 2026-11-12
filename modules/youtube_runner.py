@@ -99,7 +99,9 @@ class YouTubeRunner:
         locale: str | None = None,
         engine: EngineType = "camoufox",
         geo_country: str | None = None,
+        http2: bool = True,
     ) -> None:
+        self._http2 = http2  # Chrome only: False = HTTP/1.1, the fallback for a proxy that stalls Google over HTTP/2
         self._cfg = browser_settings
         self._target = target
         self._account_name = account_name
@@ -252,7 +254,8 @@ class YouTubeRunner:
         await self._check_geo_lock(geo.country)
         await asyncio.to_thread(ensure_chrome_executable)
         await asyncio.to_thread(prepare_chrome_profile, self._session_dir, geo.locale)  # the profile language follows the launch locale
-        chrome_args = get_chrome_args(locale=geo.locale, account_name=self._account_name, proxy_url=self._proxy)
+        chrome_args = get_chrome_args(locale=geo.locale, account_name=self._account_name, proxy_url=self._proxy,
+                                      **({} if self._http2 else {"http2": False}))
         launch_options: dict[str, Any] = {
             "user_data_dir": str(self._session_dir),
             "channel": "chrome",

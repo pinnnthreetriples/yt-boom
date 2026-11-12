@@ -539,6 +539,126 @@ class TestInteractiveLogin(_DbCase):
         _, account = await self._login(login_info=False)
         self.assertEqual(account.auth_status, "pending")
 
+    async def test_a_page_that_does_not_load_keeps_the_window_open_until_the_person_closes_it(self):
+        # goto fails, then the checks fail too: the loop must go on until the page is closed by the person
+        page = MagicMock(is_closed=MagicMock(side_effect=[False, False, False, True]))
+        page.goto = AsyncMock(side_effect=TimeoutError("net::ERR_TIMED_OUT"))
+        cookies = AsyncMock(side_effect=[RuntimeError("navigating"), RuntimeError("navigating"),
+                                         [{"name": "LOGIN_INFO", "value": "x", "domain": ".youtube.com", "expires": -1}]])
+        context = MagicMock(pages=[page], cookies=cookies)
+        closed = []
+        camoufox = MagicMock()
+        camoufox.return_value.__aenter__ = AsyncMock(return_value=context)
+        camoufox.return_value.__aexit__ = AsyncMock(side_effect=lambda *a: closed.append(a[0]))
+        cfg = _cfg(self.root)
+        with patch("youtube_bot.load_config", return_value=cfg), \
+             patch("camoufox.async_api.AsyncCamoufox", camoufox), \
+             patch("modules.youtube_runner.get_or_create_fingerprint", return_value={"pinned": True}), \
+             patch("youtube_bot.asyncio.sleep", AsyncMock()):
+            await youtube_bot.interactive_login("unused.yaml", account_name="alice")
+        self.assertEqual(closed, [None])  # left the browser normally, not through an exception
+        self.assertEqual(page.is_closed.call_count, 4)  # it kept looking after every failure
+        async with Database(cfg.app.db_path) as db:
+            self.assertEqual((await db.get_account("alice")).auth_status, "authenticated")
+
+
+class TestChromeLoginHttp1Fallback(_DbCase):
+    """Manual sign-in in Chrome: YouTube that does not open is retried once over HTTP/1.1, then the window stays."""
+
+    async def _login(self, gotos: list):
+        async with Database(self.root / "metrics.db") as db:
+            await db.upsert_account("alice", str(self.root / "sessions" / "alice"))
+            await db.set_account_engine((await db.get_account("alice")).id, "chrome")
+        started: list[dict] = []
+        pages: list[MagicMock] = []
+
+        def runner(*args, **kwargs):
+            started.append(kwargs)
+            return MagicMock()
+
+        @contextlib.asynccontextmanager
+        async def browser(_runner, _engine):
+            page = MagicMock(is_closed=MagicMock(side_effect=[False, True]))
+            page.goto = AsyncMock(side_effect=gotos[len(pages)])
+            pages.append(page)
+            yield MagicMock(pages=[page], cookies=AsyncMock(return_value=[]))
+
+        with patch("youtube_bot.load_config", return_value=_cfg(self.root)), \
+             patch("youtube_bot.YouTubeRunner", runner), patch("youtube_bot._login_browser", browser), \
+             patch("youtube_bot.asyncio.sleep", AsyncMock()):
+            await youtube_bot.interactive_login("unused.yaml", account_name="alice")
+        return started, pages
+
+    async def test_a_healthy_start_is_one_normal_chrome(self):
+        started, pages = await self._login([None])
+        self.assertEqual(len(started), 1)
+        self.assertNotIn("http2", started[0])
+        self.assertEqual(pages[0].goto.await_args.kwargs["timeout"], youtube_bot.CHROME_FIRST_LOAD_MS)
+
+    async def test_a_page_that_does_not_load_restarts_chrome_over_http1_once(self):
+        started, pages = await self._login([TimeoutError("t"), None])
+        self.assertEqual([k.get("http2", True) for k in started], [True, False])
+        self.assertNotIn("timeout", pages[1].goto.await_args.kwargs)  # the retry has the usual patience
+
+    async def test_when_the_retry_fails_too_the_window_stays_open(self):
+        started, pages = await self._login([TimeoutError("t"), TimeoutError("t")])
+        self.assertEqual(len(started), 2)  # no third start
+        self.assertEqual(pages[1].is_closed.call_count, 2)  # it waited for the person to close the window
+
+    async def test_camoufox_is_never_retried(self):
+        page = MagicMock(is_closed=MagicMock(side_effect=[False, True]))
+        page.goto = AsyncMock(side_effect=TimeoutError("t"))
+        camoufox = MagicMock()
+        camoufox.return_value.__aenter__ = AsyncMock(return_value=MagicMock(pages=[page], cookies=AsyncMock(return_value=[])))
+        camoufox.return_value.__aexit__ = AsyncMock(return_value=None)
+        with patch("youtube_bot.load_config", return_value=_cfg(self.root)), \
+             patch("camoufox.async_api.AsyncCamoufox", camoufox), \
+             patch("modules.youtube_runner.get_or_create_fingerprint", return_value={"pinned": True}), \
+             patch("youtube_bot.asyncio.sleep", AsyncMock()):
+            await youtube_bot.interactive_login("unused.yaml", account_name="alice")
+        self.assertEqual(camoufox.call_count, 1)
+
+
+class TestRegisterWithChosenEngine(_DbCase):
+    async def _register(self, engine, lines=("a@x.com:pw1:JBSWY3DPEHPK3PXP",)):
+        cfg = _cfg(self.root)
+        async with Database(cfg.app.db_path) as db:
+            result = await youtube_bot.register_account_lines(db, cfg, list(lines), engine=engine)
+            return result, [a.engine for a in await db.list_accounts()]
+
+    async def test_chosen_browser_is_the_browser_of_the_new_account(self):
+        for engine in ("chrome", "camoufox"):
+            with self.subTest(engine):
+                self.setUp_db_again()
+                result, engines = await self._register(engine)
+                self.assertEqual((len(result.added), engines), (1, [engine]))
+
+    def setUp_db_again(self):
+        (self.root / "metrics.db").unlink(missing_ok=True)
+
+    async def test_without_a_choice_the_config_default_applies(self):
+        _, engines = await self._register(None)
+        self.assertEqual(engines, ["camoufox"])
+
+    async def test_unknown_browser_is_an_error_not_a_silent_camoufox(self):
+        result, engines = await self._register("firefox")
+        self.assertEqual((len(result.added), len(result.errors), engines), (0, 1, []))
+
+    async def test_a_known_account_keeps_its_browser(self):
+        await self._register("chrome")
+        cfg = _cfg(self.root)
+        async with Database(cfg.app.db_path) as db:
+            again = await youtube_bot._register_credentials_account(db, cfg, "a@x.com:pw2:JBSWY3DPEHPK3PXP", engine="camoufox")
+        self.assertEqual(again.engine, "chrome")
+
+
+class TestChromeHttp2Flag(unittest.TestCase):
+    def test_http2_is_on_by_default_and_off_only_when_asked(self):
+        from modules.chrome_launcher import get_chrome_args
+
+        self.assertNotIn("--disable-http2", get_chrome_args("en-US", "alice"))
+        self.assertIn("--disable-http2", get_chrome_args("en-US", "alice", http2=False))
+
 
 class TestFingerprintOs(unittest.TestCase):
     def setUp(self):

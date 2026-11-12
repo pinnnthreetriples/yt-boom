@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from loguru import logger
 
 
@@ -51,17 +52,13 @@ def russian_file_formatter(record: dict[str, Any]) -> str:
     return "{time:YYYY-MM-DD HH:mm:ss} | {extra[ru_level]: <8} | {module: <18} | {message}\n{exception}"
 
 
-def setup_bot_logging(
-    level: str = "INFO",
-    log_file: str | Path | None = None,
-    rotation: str = "10 MB",
-    retention: str = "14 days",
-) -> None:
-    """Configure loguru with Russian level tags, full-line colors, and optional disk logging."""
-    configure_windows_encoding()
-    logger.remove()
+_console_sink: int | None = None  # loguru id of the stderr handler made by `setup_bot_logging`
+_console_level = "INFO"
+_held = False
 
-    logger.add(
+
+def _add_console_sink(level: str) -> int:
+    return logger.add(
         sys.stderr,
         level=level,
         format=russian_console_formatter,
@@ -69,6 +66,48 @@ def setup_bot_logging(
         backtrace=False,
         diagnose=False,
     )
+
+
+@contextmanager
+def console_held() -> Iterator[None]:
+    """Keep log lines off the console while a menu is drawn in place, and print them when it is closed.
+
+    A line written to the terminal under a running prompt_toolkit screen breaks its redraw: the tab line is
+    overwritten and the rows are drawn twice. Without a console handler (tests, nothing set up) it does nothing.
+    """
+    global _console_sink, _held
+    if _console_sink is None or _held:
+        yield
+        return
+    held: list[str] = []
+    logger.remove(_console_sink)
+    buffer = logger.add(held.append, level=_console_level, format=russian_console_formatter, colorize=True,
+                        backtrace=False, diagnose=False)
+    _held = True
+    try:
+        yield
+    finally:
+        _held = False
+        logger.remove(buffer)
+        _console_sink = _add_console_sink(_console_level)
+        for text in held:
+            sys.stderr.write(text)
+        sys.stderr.flush()
+
+
+def setup_bot_logging(
+    level: str = "INFO",
+    log_file: str | Path | None = None,
+    rotation: str = "10 MB",
+    retention: str = "14 days",
+) -> None:
+    """Configure loguru with Russian level tags, full-line colors, and optional disk logging."""
+    global _console_sink, _console_level
+    configure_windows_encoding()
+    logger.remove()
+
+    _console_level = level
+    _console_sink = _add_console_sink(level)
 
     if log_file:
         file_path = Path(log_file)
@@ -87,6 +126,7 @@ def setup_bot_logging(
 
 
 __all__ = [
+    "console_held",
     "configure_windows_encoding",
     "russian_console_formatter",
     "russian_file_formatter",

@@ -117,6 +117,7 @@ def setup_cli_logging(level: str = "INFO", log_file: str | None = None) -> None:
 
 
 CountryConfirm = Callable[[str], "bool | Awaitable[bool]"]  # gets the explanation, answers "continue the sign-in?"
+CHROME_FIRST_LOAD_MS = 20_000  # a manual sign-in in Chrome waits this long for YouTube before the HTTP/1.1 retry
 
 
 def _stdin_is_interactive() -> bool:
@@ -280,36 +281,61 @@ async def interactive_login(
     logger.info("Папка сохранения сессии: {}", session_dir)
     logger.info("Пожалуйста, выполните вход в свой аккаунт YouTube в открывшемся окне. После входа закройте браузер.")
 
-    runner = YouTubeRunner(
-        cfg.browser,
-        _resolve_youtube_target(cfg),
-        session_dir=session_dir,
-        proxy=proxy_url,
-        account_name=account_name or "default",
-        locale=acc.locale if acc is not None else None,
-        engine=engine,
-        geo_country=(acc.geo_country or acc.expected_country) if acc is not None else None,
-    )
+    def make_runner(http2: bool) -> YouTubeRunner:
+        return YouTubeRunner(
+            cfg.browser,
+            _resolve_youtube_target(cfg),
+            session_dir=session_dir,
+            proxy=proxy_url,
+            account_name=account_name or "default",
+            locale=acc.locale if acc is not None else None,
+            engine=engine,
+            geo_country=(acc.geo_country or acc.expected_country) if acc is not None else None,
+            **({} if http2 else {"http2": False}),
+        )
+
     authenticator = GoogleAuthenticator(InteractionSimulator(), chrome_profile_dir=session_dir if engine == "chrome" else None)
     logged_in = False
 
     try:
-        async with _login_browser(runner, engine) as context:
-            pages = getattr(context, "pages", [])
-            page = pages[0] if pages else await context.new_page()
-            await page.goto("https://www.youtube.com", wait_until="domcontentloaded")
-            logger.info("Окно браузера открыто. Ожидание завершения авторизации пользователем...")
-            saved_chrome_state = False
-            try:
+        # Chrome: a first start that cannot open YouTube is repeated once over HTTP/1.1 (a proxy may stall Google over
+        # HTTP/2); only then the window stays as it is. Everyone else gets the usual Chrome, never HTTP/1.1 by default.
+        for http2 in ((True, False) if engine == "chrome" else (True,)):
+            async with _login_browser(make_runner(http2), engine) as context:
+                pages = getattr(context, "pages", [])
+                page = pages[0] if pages else await context.new_page()
+                first_try = engine == "chrome" and http2
+                try:
+                    await page.goto("https://www.youtube.com", wait_until="domcontentloaded",
+                                    **({"timeout": CHROME_FIRST_LOAD_MS} if first_try else {}))
+                except Exception as exc:
+                    if first_try:
+                        logger.warning(
+                            "YouTube не загрузился ({}): перезапускаю Chrome по HTTP/1.1 — так проходят прокси, "
+                            "у которых Google зависает на HTTP/2", exc.__class__.__name__,
+                        )
+                        continue  # leaving the block closes this Chrome; the next round opens it with HTTP/1.1
+                    # The window belongs to the person: a page that does not load (proxy, network) must not close it
+                    logger.warning(
+                        "YouTube не загрузился ({}): окно остаётся открытым, откройте сайт сами и войдите; "
+                        "закроется оно только когда вы его закроете", exc.__class__.__name__,
+                    )
+                logger.info("Окно браузера открыто. Ожидание завершения авторизации пользователем...")
+                saved_chrome_state = False
                 while any(not p.is_closed() for p in getattr(context, "pages", [])):
-                    logged_in = logged_in or await authenticator.is_session_authenticated(context)
-                    if logged_in and engine == "chrome" and not saved_chrome_state:
-                        await authenticator._save_chrome_state(context)  # the window may be closed any moment
-                        saved_chrome_state = True
+                    try:
+                        logged_in = logged_in or await authenticator.is_session_authenticated(context)
+                        if logged_in and engine == "chrome" and not saved_chrome_state:
+                            await authenticator._save_chrome_state(context)  # the window may be closed any moment
+                            saved_chrome_state = True
+                    except Exception as exc:  # a tab in the middle of a navigation: look again, never leave the loop
+                        logger.debug("Проверка входа пропущена, окно остаётся открытым: {}", exc)
                     await asyncio.sleep(0.5)
-                logged_in = logged_in or await authenticator.is_session_authenticated(context)
-            except Exception:
-                pass
+                try:
+                    logged_in = logged_in or await authenticator.is_session_authenticated(context)
+                except Exception as exc:
+                    logger.debug("Проверка входа после закрытия окна не удалась: {}", exc)
+            break
         logger.success("Сессия авторизации успешно сохранена в {}", session_dir)
 
         upsert_args: dict[str, Any] = {"name": account_name or "default", "session_path": str(session_dir)}
@@ -394,15 +420,20 @@ async def _register_credentials_account(
     country: str | None = None,
     locale: str | None = None,
     default_mode: str | None = None,
+    engine: str | None = None,
 ) -> AccountRecord:
     """Register `email:password:totp[...]`. A known account keeps its session path, proxy, active flag, expected country
     and locale unless told otherwise. The age mode comes from the line's `mode=` or else `default_mode`; without
-    either a known account keeps its mode and a new one is "auto"."""
+    either a known account keeps its mode and a new one is "auto". A new account gets the browser `engine`
+    ("camoufox" / "chrome"; None: `browser.default_engine`); a known one keeps its own."""
+    if engine not in (None, "camoufox", "chrome"):
+        raise ValueError(f"unknown browser: {engine!r}")
     parsed = parse_account_line(spec, proxy=proxy_url, country=country, locale=locale)
     account_name = (name or parsed.default_name).strip()
     existing = await db.get_account(account_name)
-    # only a new account takes the default engine (anything but "chrome" means Camoufox)
-    new_engine = "chrome" if existing is None and getattr(cfg.browser, "default_engine", None) == "chrome" else "camoufox"
+    # only a new account takes the chosen / default engine (anything but "chrome" means Camoufox)
+    wanted = engine or getattr(cfg.browser, "default_engine", None)
+    new_engine = "chrome" if existing is None and wanted == "chrome" else "camoufox"
     validate_proxy_for_engine(parsed.proxy, new_engine)
     upsert_args: dict[str, Any] = {
         "name": account_name,
@@ -613,11 +644,13 @@ class AccountImportResult:
 
 
 async def register_account_lines(
-    db: Database, cfg: AppConfig, lines: Iterable[str], skip_existing: bool = False, default_mode: str | None = None
+    db: Database, cfg: AppConfig, lines: Iterable[str], skip_existing: bool = False, default_mode: str | None = None,
+    engine: str | None = None,
 ) -> AccountImportResult:
     """Register every account line (blank lines and `#` comments are ignored); one bad line never stops the rest.
 
     `default_mode` ("auto" / "mature" / "unlimited") is the age mode of every line without its own `mode=`.
+    `engine` ("camoufox" / "chrome") is the browser of the new accounts (None: `browser.default_engine`).
 
     With `skip_existing` a line whose account is already in the database (or repeated earlier in the batch) is
     reported as skipped instead of overwriting its credentials.
@@ -635,7 +668,7 @@ async def register_account_lines(
                 if parsed.email.lower() in known_emails or await db.get_account(parsed.default_name) is not None:
                     result.skipped.append((number, "аккаунт уже есть"))
                     continue
-            account = await _register_credentials_account(db, cfg, line, default_mode=default_mode)
+            account = await _register_credentials_account(db, cfg, line, default_mode=default_mode, engine=engine)
             result.added.append(account)
             if account.email:
                 known_emails.add(account.email.lower())

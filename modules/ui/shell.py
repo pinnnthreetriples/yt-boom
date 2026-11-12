@@ -736,6 +736,8 @@ def _loop(controller: Controller, on_run: Callable[[Run], Step], clear: Callable
     from prompt_toolkit.layout import HSplit, Layout, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
 
+    from modules.logger_config import console_held
+
     while not controller.quit:
         clear()
         app: Application[None] = Application(
@@ -744,7 +746,8 @@ def _loop(controller: Controller, on_run: Callable[[Run], Step], clear: Callable
             key_bindings=kb, style=style, full_screen=False, mouse_support=False, erase_when_done=True,
         )
         app.ttimeoutlen = 0.05
-        app.run()
+        with console_held():  # a log line under the screen (e.g. «движок chrome») would break its redraw
+            app.run()
         if controller.pending_run and not controller.quit:
             run = controller.pending_run
             clear()
