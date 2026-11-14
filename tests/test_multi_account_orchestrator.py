@@ -147,7 +147,7 @@ class TestMultiAccountOrchestrator(unittest.IsolatedAsyncioTestCase):
             return runner
 
         mock_collector = MagicMock()
-        async def mock_fetch_popular(video_url, limit=4, target_mode="first_reply"):
+        async def mock_fetch_popular(video_url, limit=4, target_mode="first_reply", skip=()):
             vid = video_url.split("v=")[-1]
             return [
                 CollectedItem(
@@ -244,6 +244,27 @@ class TestMultiAccountOrchestrator(unittest.IsolatedAsyncioTestCase):
         statuses = [l.status for l in logs]
         self.assertIn("failed", statuses)
         self.assertIn("success", statuses)
+
+    async def test_collector_gets_the_targets_answered_before(self) -> None:
+        """The collector is told which targets under the video were answered (in an earlier launch), so it reads
+        further comment pages instead of returning them again; it is asked for spare targets, not four times more."""
+        await self.db.upsert_account("acc_skip", str(self.base_dir / "skip"))
+        await self.db.add_video_to_pool("https://www.youtube.com/watch?v=skipvid1111", comments_target=3)
+        node = await self.db.upsert_test_node("youtube", "https://www.youtube.com")
+        old = await self.db.reserve_payload(node_id=node.id, source_ref="skipvid1111#p#old", language="ru")
+        await self.db.mark_payload_submitted(old.id, "remote")
+        collector = MagicMock()
+        collector.fetch_popular_comments = AsyncMock(return_value=[])
+        collector.collect_from_videos = AsyncMock(return_value=[])
+        collector.close = AsyncMock()
+        orchestrator = MultiAccountOrchestrator(
+            self.config, db=self.db, concurrency=1, account_mode="share", collector=collector,
+            runner_factory=lambda acc: MagicMock(run=AsyncMock(), close=AsyncMock()),
+        )
+        await orchestrator.execute_video_pool()
+        kwargs = collector.fetch_popular_comments.await_args.kwargs
+        self.assertEqual(kwargs["skip"], {"skipvid1111#p#old"})
+        self.assertEqual(kwargs["limit"], 6)
 
     async def test_target_without_reply_button_is_skipped_not_blamed_on_the_account(self) -> None:
         """A comment YouTube gives no Reply button: next candidate is tried, the account gets no error, the target is remembered."""
@@ -401,7 +422,7 @@ class TestMultiAccountOrchestrator(unittest.IsolatedAsyncioTestCase):
     # ----------------------------------------------------------- Account modes
     def _mode_collector(self, videos: list[str]) -> MagicMock:
         """Collector with two comments under each of `videos` (ids <video>#c0 / #c1)."""
-        def items(video_url, limit=4, target_mode="first_reply"):
+        def items(video_url, limit=4, target_mode="first_reply", skip=()):
             vid = video_url.split("v=")[-1]
             return [
                 CollectedItem(
@@ -955,7 +976,7 @@ class TestSearchThroughAccounts(unittest.IsolatedAsyncioTestCase):
         col = MagicMock()
         col.search_videos = AsyncMock(return_value=found)
 
-        async def fetch(url, limit=10, target_mode="first_reply"):
+        async def fetch(url, limit=10, target_mode="first_reply", skip=()):
             return list(comments.get(url.split("v=")[-1], []))
 
         col.fetch_popular_comments = AsyncMock(side_effect=fetch)
@@ -1146,7 +1167,7 @@ class TestShareDealsVideosToAccounts(unittest.IsolatedAsyncioTestCase):
             runner.close = AsyncMock(side_effect=close)
             return runner
 
-        async def fetch(url, limit=10, target_mode="first_reply"):
+        async def fetch(url, limit=10, target_mode="first_reply", skip=()):
             vid = url.split("v=")[-1]
             return [_search_item(vid, f"c{n}") for n in range(12)]
 

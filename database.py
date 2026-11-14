@@ -1575,6 +1575,18 @@ class Database:
         # a target without a Reply button counts as handled too: no account can answer it
         return await self.is_reply_unavailable(source_ref)
 
+    async def handled_refs(self, video_id: str) -> set[str]:
+        """Every target under `video_id` that `has_replied_to` would skip: replied (or being replied) to, or found
+        without a Reply button lately. The collector leaves them out, so it reads further pages for fresh ones."""
+        prefix = f"{video_id}#"
+        rows = await self._fetch_all(
+            "SELECT source_ref FROM payloads WHERE substr(source_ref, 1, ?) = ? AND ("
+            "status IN ('pending', 'submitted', 'validated')"
+            " OR (status = 'failed' AND error LIKE ? AND created_at > ?))",
+            (len(prefix), prefix, f"{REPLY_UNAVAILABLE_MARK}%", time.time() - REPLY_UNAVAILABLE_TTL_SECONDS),
+        )
+        return {row["source_ref"] for row in rows}
+
     async def is_reply_unavailable(self, source_ref: str) -> bool:
         """True when a recent run found that YouTube hides the Reply button on this comment."""
         count = await self._count(

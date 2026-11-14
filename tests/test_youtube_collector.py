@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from config import CollectorEndpoint, CollectorSettings
 from modules.collector import Collector
 from modules.youtube_collector import (
+    BARREN_PAGES_MAX,
     YouTubeCollector,
     YouTubeSubComment,
     extract_video_id,
@@ -664,3 +665,165 @@ class SearchPagingTest(unittest.TestCase):
         self.assertEqual(empty_search_hint(1_000_000), "меньше просмотров (от 1 млн) или другая тема")
         self.assertEqual(empty_search_hint(0, 5000), "больше просмотров (до 5 тыс) или другая тема")
         self.assertEqual(empty_search_hint(), "другая тема")
+
+
+class CommentPagingTest(unittest.IsolatedAsyncioTestCase):
+    """fetch_popular_comments reads the comment pages one after another until it has enough fresh targets."""
+
+    VIDEO = "dQw4w9WgXcQ"
+
+    def setUp(self):
+        self.collector = YouTubeCollector(CollectorSettings(
+            languages=["ru"], minimum_confidence=0.5, min_text_length=2, max_text_length=500,
+            endpoints=[CollectorEndpoint(name="test", url=f"https://www.youtube.com/watch?v={self.VIDEO}")],
+        ))
+        self.pages: dict[str, dict] = {}
+        self.replies: dict[str, dict] = {}
+        self.posted: list[str] = []
+
+    @staticmethod
+    def thread(parent: str, likes: int, reply_token: str | None) -> dict:
+        renderer = {
+            "comment": {"commentRenderer": {
+                "commentId": parent, "authorText": {"simpleText": "a"},
+                "contentText": {"runs": [{"text": f"комментарий {parent}"}]}, "voteCount": {"simpleText": str(likes)},
+            }},
+        }
+        if reply_token:
+            renderer["replies"] = {"commentRepliesRenderer": {"contents": [{"continuationItemRenderer": {
+                "continuationEndpoint": {"continuationCommand": {"token": reply_token}}}}]}}
+        return {"commentThreadRenderer": renderer}
+
+    def page(self, token: str, threads: list[dict], next_token: str | None) -> None:
+        items = list(threads)
+        if next_token:
+            items.append({"continuationItemRenderer": {"continuationEndpoint": {
+                "continuationCommand": {"token": next_token}}}})
+        self.pages[token] = {"onResponseReceivedEndpoints": [
+            {"reloadContinuationItemsCommand": {"continuationItems": [{"commentsHeaderRenderer": {}}]}},
+            {"reloadContinuationItemsCommand" if token == "p1" else "appendContinuationItemsAction":
+                {"continuationItems": items}},
+        ]}
+
+    def reply(self, token: str, reply_id: str) -> None:
+        self.replies[token] = {"frameworkUpdates": {"entityBatchUpdate": {"mutations": [{"payload": {
+            "commentEntityPayload": {
+                "properties": {"commentId": reply_id, "content": {"content": f"ответ {reply_id}"}},
+                "author": {"displayName": "b"}, "toolbar": {"likeCountNotliked": "1"},
+            }}}]}}}
+
+    def wire(self) -> None:
+        html = ('<script>var ytInitialData = {"continuationCommand": {"token": "p1"}};</script>'
+                '<script>"INNERTUBE_API_KEY":"k"</script>')
+        session = AsyncMock()
+        session.get.return_value = MagicMock(status_code=200, text=html)
+
+        async def post(url, json=None, headers=None):
+            token = json["continuation"]
+            self.posted.append(token)
+            data = self.pages.get(token) or self.replies.get(token) or {}
+            return MagicMock(status_code=200, json=MagicMock(return_value=data))
+
+        session.post.side_effect = post
+        self.collector._session = session
+
+    async def fetch(self, **kwargs):
+        with patch.object(self.collector, "open", new_callable=AsyncMock), \
+             patch.object(self.collector, "_detect_language", return_value=("ru", 0.9)):
+            return await self.collector.fetch_popular_comments(self.VIDEO, target_mode="first_reply", **kwargs)
+
+    def ref(self, parent: str, reply_id: str) -> str:
+        return f"{self.VIDEO}#{parent}#{reply_id}"
+
+    async def test_answered_targets_send_it_to_the_next_page(self):
+        self.page("p1", [self.thread("A", 50, "rA"), self.thread("B", 40, None)], "p2")
+        self.page("p2", [self.thread("C", 30, "rC"), self.thread("D", 20, "rD")], "p3")
+        self.page("p3", [self.thread("E", 10, "rE")], None)
+        for token, reply_id in (("rA", "a1"), ("rC", "c1"), ("rD", "d1"), ("rE", "e1")):
+            self.reply(token, reply_id)
+        self.wire()
+        items = await self.fetch(limit=2, skip={self.ref("A", "a1")})
+        self.assertEqual([i.external_id for i in items], [self.ref("C", "c1"), self.ref("D", "d1")])
+        self.assertNotIn("p3", self.posted)  # enough after two pages
+
+    async def test_reads_until_the_comments_end(self):
+        self.page("p1", [self.thread("A", 5, "rA")], "p2")
+        self.page("p2", [self.thread("B", 4, "rB")], None)
+        self.reply("rA", "a1")
+        self.reply("rB", "b1")
+        self.wire()
+        items = await self.fetch(limit=10)
+        self.assertEqual(len(items), 2)
+        self.assertEqual([t for t in self.posted if t.startswith("p")], ["p1", "p2"])
+
+    async def test_page_cap_and_a_repeated_token_stop_it(self):
+        self.page("p1", [self.thread("A", 5, None)], "p2")
+        self.page("p2", [self.thread("B", 4, None)], "p3")
+        self.page("p3", [self.thread("C", 3, None)], "p1")  # YouTube sending the first page again
+        self.wire()
+        self.assertEqual(await self.fetch(limit=5, max_pages=2), [])
+        self.assertEqual(self.posted, ["p1", "p2"])
+        self.posted.clear()
+        self.assertEqual(await self.fetch(limit=5), [])
+        self.assertEqual(self.posted, ["p1", "p2", "p3"])
+
+    async def test_a_failing_later_page_keeps_what_was_found(self):
+        self.page("p1", [self.thread("A", 5, "rA")], "p2")
+        self.reply("rA", "a1")
+        self.wire()
+        session = self.collector._session
+        first_post = session.post.side_effect
+
+        async def post(url, json=None, headers=None):
+            if json["continuation"] == "p2":
+                return MagicMock(status_code=503)
+            return await first_post(url, json=json, headers=headers)
+
+        session.post.side_effect = post
+        items = await self.fetch(limit=5)
+        self.assertEqual([i.external_id for i in items], [self.ref("A", "a1")])
+
+    def test_next_page_token_ignores_the_reply_continuations(self):
+        self.page("p1", [self.thread("A", 5, "rA")], None)
+        self.assertIsNone(YouTubeCollector._next_threads_token(self.pages["p1"]))
+        self.page("p1", [self.thread("A", 5, "rA")], "p2")
+        self.assertEqual(YouTubeCollector._next_threads_token(self.pages["p1"]), "p2")
+        self.assertIsNone(YouTubeCollector._next_threads_token({}))
+
+    async def test_a_later_page_without_json_keeps_what_was_found(self):
+        self.page("p1", [self.thread("A", 5, "rA")], "p2")
+        self.reply("rA", "a1")
+        self.wire()
+        session = self.collector._session
+        first_post = session.post.side_effect
+
+        async def post(url, json=None, headers=None):
+            if json["continuation"] == "p2":  # a consent page served with HTTP 200
+                return MagicMock(status_code=200, json=MagicMock(side_effect=ValueError("Expecting value")))
+            return await first_post(url, json=json, headers=headers)
+
+        session.post.side_effect = post
+        items = await self.fetch(limit=5)
+        self.assertEqual([i.external_id for i in items], [self.ref("A", "a1")])
+
+    async def test_pages_the_filters_refuse_stop_the_reading(self):
+        """A video in another language: fresh targets page after page, none taken. It stops after
+        BARREN_PAGES_MAX pages instead of spending ~20 requests on each of COMMENT_PAGES_MAX pages."""
+        for n in range(1, 8):
+            self.page(f"p{n}", [self.thread(f"T{n}", 10 - n, f"r{n}")], f"p{n + 1}")
+            self.reply(f"r{n}", f"x{n}")
+        self.wire()
+        with patch.object(self.collector, "open", new_callable=AsyncMock), \
+             patch.object(self.collector, "_detect_language", return_value=("en", 0.9)):
+            items = await self.collector.fetch_popular_comments(self.VIDEO, target_mode="first_reply", limit=5)
+        self.assertEqual(items, [])
+        self.assertEqual([t for t in self.posted if t.startswith("p")], [f"p{n}" for n in range(1, BARREN_PAGES_MAX + 1)])
+
+    async def test_pages_of_answered_targets_do_not_stop_the_reading(self):
+        for n in range(1, 6):
+            self.page(f"p{n}", [self.thread(f"T{n}", 10 - n, f"r{n}")], f"p{n + 1}" if n < 5 else None)
+            self.reply(f"r{n}", f"x{n}")
+        self.wire()
+        answered = {self.ref(f"T{n}", f"x{n}") for n in range(1, 5)}
+        items = await self.fetch(limit=1, skip=answered)
+        self.assertEqual([i.external_id for i in items], [self.ref("T5", "x5")])

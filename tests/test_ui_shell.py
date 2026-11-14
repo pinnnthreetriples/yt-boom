@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from modules.ui import icons
+from modules.ui import icons, shell
 from modules.ui.shell import (
     Back, Cell, Confirm, Controller, Field, GoTab, Hotkey, Menu, Notice, Row, Run, Screen, Tab, View, fit, frags_text,
     render, width,
@@ -131,6 +131,45 @@ class ShellCase(unittest.TestCase):
         self.keys("enter")
         self.assertEqual(self.c.notice.text, "Имя: Иван")
 
+    def test_field_cursor_moves_and_inserts_in_the_middle(self):
+        self.keys("enter", "down", "enter")
+        for ch in "Иан":
+            self.keys(ch)
+        self.keys("left", "left", "в")
+        self.assertEqual((self.c.edit.text, self.c.edit.buffer.cursor), ("Иван", 2))
+        self.assertIn("› Иван", screen(self.c))
+        self.assertNotIn("▏", screen(self.c))  # the cursor is drawn on «а», not after the text
+        self.keys("end", "!", "home", "c-right", "delete")
+        self.assertEqual(self.c.edit.text, "Иван")
+        self.keys("enter")
+        self.assertEqual(self.c.notice.text, "Имя: Иван")
+
+    def test_field_emoji_typed_pasted_and_deleted_whole(self):
+        self.keys("enter", "down", "enter", "a", "b", "left")
+        for ch in "👨‍👩‍👧":  # an emoji family typed piece by piece, the joiner included
+            self.keys(ch)
+        self.assertEqual(self.c.edit.text, "a👨‍👩‍👧b")
+        self.keys("paste:❤️")
+        self.assertEqual(self.c.edit.text, "a👨‍👩‍👧❤️b")
+        self.keys("backspace", "backspace")
+        self.assertEqual(self.c.edit.text, "ab")
+
+    def test_long_text_wraps_inside_the_window(self):
+        self.keys("enter", "down", "enter", "paste:" + "слово " * 30)
+        lines = [ln for ln in screen(self.c).splitlines() if "слово" in ln]
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(width(ln) <= shell.WIDTH for ln in lines))
+        self.assertTrue(lines[0].lstrip().startswith("› "))
+        self.keys("up")  # the row above, not out of the field
+        self.assertIsNotNone(self.c.edit)
+        self.assertLess(self.c.edit.buffer.cursor, len(self.c.edit.text))
+
+    def test_cursor_keys_do_nothing_outside_a_field(self):
+        before = self.c.current_id()
+        self.keys("home", "end", "c-left", "c-w")
+        self.assertEqual(self.c.current_id(), before)
+        self.assertIsNone(self.c.edit)
+
     def test_field_escape_cancels(self):
         self.keys("enter", "down", "enter", "a", "escape")
         self.assertIsNone(self.c.edit)
@@ -163,6 +202,17 @@ class ShellCase(unittest.TestCase):
         self.assertIn("разобрано 3", out)
         self.keys("e", "e", "enter", "enter")
         self.assertEqual(self.texts, ["one 1\ntwo 2\nthree"])
+
+    def test_pasted_tabs_become_spaces_and_lines_split_at_the_cursor(self):
+        """A row copied from a spreadsheet («почта<Tab>пароль») keeps its words apart, on one line or several."""
+        self.keys("down", "down", "down", "enter", "paste:mail@x.ru\tpass\t2fa")
+        self.assertEqual(self.c.edit.text, "mail@x.ru pass 2fa")
+        self.keys("enter", "paste:AB")
+        self.keys("left", "paste:1\tx\n2\ty\n3")  # at a mid-line cursor: the text after it ends the last line
+        self.assertEqual(self.c.edit.lines, ["mail@x.ru pass 2fa", "A1 x", "2 y"])
+        self.assertEqual((self.c.edit.text, self.c.edit.buffer.cursor), ("3B", 1))
+        self.keys("enter", "enter")
+        self.assertEqual(self.texts, ["mail@x.ru pass 2fa\nA1 x\n2 y\n3B"])
 
     def test_run_waits_for_the_outer_loop(self):
         self.keys("up", "up", "enter")  # «работа»
