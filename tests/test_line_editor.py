@@ -89,6 +89,21 @@ class EditCase(unittest.TestCase):
         e.press("c-delete")
         self.assertEqual(e.text, "один, ")
 
+    def test_word_keys_stay_quick_on_a_long_text(self):
+        """Ctrl+arrows split the text into characters once: on 5000 characters the old per-character rescan took
+        many seconds per key."""
+        import time
+
+        e = LineEditor("слово " * 1000)
+        started = time.monotonic()
+        e.press("c-left")
+        e.press("home")
+        e.press("c-right")
+        e.press("c-delete")
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(e.cursor, len("слово"))
+        self.assertTrue(e.text.startswith("слово слово"))
+
     def test_kill_to_start_and_end(self):
         e = LineEditor("начало|конец")
         e.cursor = 6

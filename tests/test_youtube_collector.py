@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from config import CollectorEndpoint, CollectorSettings
 from modules.collector import Collector
 from modules.youtube_collector import (
+    BARREN_PAGES_MAX,
     YouTubeCollector,
     YouTubeSubComment,
     extract_video_id,
@@ -788,3 +789,41 @@ class CommentPagingTest(unittest.IsolatedAsyncioTestCase):
         self.page("p1", [self.thread("A", 5, "rA")], "p2")
         self.assertEqual(YouTubeCollector._next_threads_token(self.pages["p1"]), "p2")
         self.assertIsNone(YouTubeCollector._next_threads_token({}))
+
+    async def test_a_later_page_without_json_keeps_what_was_found(self):
+        self.page("p1", [self.thread("A", 5, "rA")], "p2")
+        self.reply("rA", "a1")
+        self.wire()
+        session = self.collector._session
+        first_post = session.post.side_effect
+
+        async def post(url, json=None, headers=None):
+            if json["continuation"] == "p2":  # a consent page served with HTTP 200
+                return MagicMock(status_code=200, json=MagicMock(side_effect=ValueError("Expecting value")))
+            return await first_post(url, json=json, headers=headers)
+
+        session.post.side_effect = post
+        items = await self.fetch(limit=5)
+        self.assertEqual([i.external_id for i in items], [self.ref("A", "a1")])
+
+    async def test_pages_the_filters_refuse_stop_the_reading(self):
+        """A video in another language: fresh targets page after page, none taken. It stops after
+        BARREN_PAGES_MAX pages instead of spending ~20 requests on each of COMMENT_PAGES_MAX pages."""
+        for n in range(1, 8):
+            self.page(f"p{n}", [self.thread(f"T{n}", 10 - n, f"r{n}")], f"p{n + 1}")
+            self.reply(f"r{n}", f"x{n}")
+        self.wire()
+        with patch.object(self.collector, "open", new_callable=AsyncMock), \
+             patch.object(self.collector, "_detect_language", return_value=("en", 0.9)):
+            items = await self.collector.fetch_popular_comments(self.VIDEO, target_mode="first_reply", limit=5)
+        self.assertEqual(items, [])
+        self.assertEqual([t for t in self.posted if t.startswith("p")], [f"p{n}" for n in range(1, BARREN_PAGES_MAX + 1)])
+
+    async def test_pages_of_answered_targets_do_not_stop_the_reading(self):
+        for n in range(1, 6):
+            self.page(f"p{n}", [self.thread(f"T{n}", 10 - n, f"r{n}")], f"p{n + 1}" if n < 5 else None)
+            self.reply(f"r{n}", f"x{n}")
+        self.wire()
+        answered = {self.ref(f"T{n}", f"x{n}") for n in range(1, 5)}
+        items = await self.fetch(limit=1, skip=answered)
+        self.assertEqual([i.external_id for i in items], [self.ref("T5", "x5")])

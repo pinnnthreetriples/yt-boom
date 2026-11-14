@@ -203,6 +203,17 @@ class ShellCase(unittest.TestCase):
         self.keys("e", "e", "enter", "enter")
         self.assertEqual(self.texts, ["one 1\ntwo 2\nthree"])
 
+    def test_pasted_tabs_become_spaces_and_lines_split_at_the_cursor(self):
+        """A row copied from a spreadsheet («почта<Tab>пароль») keeps its words apart, on one line or several."""
+        self.keys("down", "down", "down", "enter", "paste:mail@x.ru\tpass\t2fa")
+        self.assertEqual(self.c.edit.text, "mail@x.ru pass 2fa")
+        self.keys("enter", "paste:AB")
+        self.keys("left", "paste:1\tx\n2\ty\n3")  # at a mid-line cursor: the text after it ends the last line
+        self.assertEqual(self.c.edit.lines, ["mail@x.ru pass 2fa", "A1 x", "2 y"])
+        self.assertEqual((self.c.edit.text, self.c.edit.buffer.cursor), ("3B", 1))
+        self.keys("enter", "enter")
+        self.assertEqual(self.texts, ["mail@x.ru pass 2fa\nA1 x\n2 y\n3B"])
+
     def test_run_waits_for_the_outer_loop(self):
         self.keys("up", "up", "enter")  # «работа»
         self.assertIsNotNone(self.c.pending_run)

@@ -21,6 +21,7 @@ from modules.session_heartbeat import curl_proxy_url
 _WHITESPACE = re.compile(r"\s+")
 _VIDEO_ID_REGEX = re.compile(r"(?:v=|\/shorts\/|youtu\.be\/|embed\/)([A-Za-z0-9_-]{11})")
 COMMENT_PAGES_MAX = 25  # comment pages (about 20 threads each) one fetch reads at most; it stops once it has enough
+BARREN_PAGES_MAX = 3  # pages in a row whose fresh targets the filters all refuse (another language): stop reading
 
 
 def _external_id(video_id: str, candidate: dict[str, Any]) -> str:
@@ -1070,7 +1071,7 @@ class YouTubeCollector:
         taken: set[str] = set(skip)  # external ids that must not come back: answered before, or taken already
         results: list[CollectedItem] = []
         used_tokens: set[str] = set()
-        pages = 0
+        pages = barren = 0
         while token and token not in used_tokens and pages < max(1, max_pages) and len(results) < limit:
             used_tokens.add(token)
             pages += 1
@@ -1086,6 +1087,7 @@ class YouTubeCollector:
                 next_url, client_version, video_id, target_mode, parent_comments, reply_tokens,
                 wanted=limit - len(results), taken=taken,
             )
+            found_before = len(results)
             for candidate in candidates:
                 if len(results) >= limit:
                     break
@@ -1094,6 +1096,12 @@ class YouTubeCollector:
                     continue
                 taken.add(item.external_id)
                 results.append(item)
+            # a page of answered targets only is no reason to stop, but fresh ones the language or text filters
+            # refuse page after page mean the video is not for us: each further page costs up to ~20 requests
+            barren = barren + 1 if candidates and len(results) == found_before else 0
+            if barren >= BARREN_PAGES_MAX:
+                logger.debug("Видео {}: {} страниц подряд без подходящих комментариев, дальше не читаем", video_id, barren)
+                break
             token = self._next_threads_token(threads_data)
 
         logger.debug(
@@ -1116,7 +1124,13 @@ class YouTubeCollector:
             raise CollectorError(f"failed to fetch YouTube comment threads: {exc}") from exc
         if resp.status_code != 200:
             raise CollectorError(f"InnerTube comment threads request returned HTTP {resp.status_code}")
-        return resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:  # a consent or captcha page served with HTTP 200
+            raise CollectorError(f"InnerTube comment threads request returned no JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise CollectorError("InnerTube comment threads request returned no JSON object")
+        return data
 
     @staticmethod
     def _next_threads_token(threads_data: dict[str, Any]) -> str | None:
@@ -1297,6 +1311,7 @@ class YouTubeCollector:
 
 
 __all__ = [
+    "BARREN_PAGES_MAX",
     "COMMENT_PAGES_MAX",
     "TITLE_KEYWORDS_MAX",
     "YouTubeCollector",

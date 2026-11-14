@@ -5,7 +5,7 @@ regional letters), a heart with its emoji selector (❤️), a letter with a com
 inside one, Backspace and Delete remove one whole, and the text wraps by terminal columns (an emoji takes two).
 
 Keys (names as `Controller.press` gets them): ←/→ one character, Ctrl+←/→ one word, Home/End (Ctrl+A/Ctrl+E) the
-start/end, ↑/↓ the row above/below of a wrapped text, Backspace/Delete one character, Ctrl+W (Ctrl+Backspace) the word
+start/end, ↑/↓ the row above/below of a wrapped text, Backspace/Delete one character, Ctrl+W the word
 before the cursor, Ctrl+Delete the word after it, Ctrl+U everything before the cursor, Ctrl+K everything after it.
 """
 from __future__ import annotations
@@ -97,9 +97,14 @@ class LineEditor:
     def _next(self) -> int:
         return min((b for b in self._stops() if b > self.cursor), default=len(self.text))
 
+    def _pieces(self) -> list[tuple[int, str]]:
+        """Every visible character with its start index (one pass over the text: the word keys stay quick on a
+        long text)."""
+        stops = self._stops()
+        return [(a, self.text[a:b]) for a, b in zip(stops, stops[1:])]
+
     def _word_left(self) -> int:
-        stops = [b for b in self._stops() if b < self.cursor]
-        pieces = [(b, self.text[b:self._after(b)]) for b in stops]
+        pieces = [piece for piece in self._pieces() if piece[0] < self.cursor]
         index = len(pieces) - 1
         while index >= 0 and not _is_word(pieces[index][1]):
             index -= 1
@@ -108,17 +113,13 @@ class LineEditor:
         return pieces[index + 1][0] if index + 1 < len(pieces) else self.cursor
 
     def _word_right(self) -> int:
-        stops = [b for b in self._stops() if b >= self.cursor and b < len(self.text)]
-        pieces = [(b, self.text[b:self._after(b)]) for b in stops]
+        pieces = [piece for piece in self._pieces() if piece[0] >= self.cursor]
         index = 0
         while index < len(pieces) and not _is_word(pieces[index][1]):
             index += 1
         while index < len(pieces) and _is_word(pieces[index][1]):
             index += 1
         return pieces[index][0] if index < len(pieces) else len(self.text)
-
-    def _after(self, stop: int) -> int:
-        return min((b for b in self._stops() if b > stop), default=len(self.text))
 
     # ---- editing
 

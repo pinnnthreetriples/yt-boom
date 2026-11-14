@@ -470,7 +470,9 @@ class Controller:
         if key.startswith("paste:"):
             from config import repair_text
 
-            parts = repair_text(key[6:]).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            # a tab is a control code `insert` would drop, gluing «почта\tпароль» from a spreadsheet: it becomes a space
+            text = repair_text(key[6:]).replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+            parts = text.split("\n")
             if edit.field.multiline and len(parts) > 1:
                 tail = buffer.text[buffer.cursor:]
                 buffer.set(buffer.text[: buffer.cursor] + parts[0])
