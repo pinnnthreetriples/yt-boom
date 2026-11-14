@@ -222,6 +222,17 @@ class TemplatesTest(RepliesTabCase):
         self.keys("escape")
         self.assertIn("шаблоны 1", self.screen())
 
+    def test_edit_a_template_in_the_middle(self):
+        self.ctx.update_project(self.project().id, custom_replies=["Секрет в нике"])
+        self.open()
+        self.keys("enter")  # the template opens with the cursor at its end
+        self.keys("home", "c-right")
+        self.type(" 🔥")
+        self.keys("c-right", "c-right", "backspace", "backspace", "backspace", "backspace")
+        self.type("моём нике")
+        self.keys("enter")
+        self.assertEqual(self.project().custom_replies, ["Секрет 🔥 в моём нике"])
+
     def test_delete_defaults_to_no(self):
         self.ctx.update_project(self.project().id, custom_replies=["a", "b"])
         self.open()

@@ -16,7 +16,7 @@ edges:
   - target: context/conventions.md
     condition: when extending or modifying module code
 grounds_to: []
-last_updated: 2026-11-11
+last_updated: 2026-11-14
 mex:
   id: mx_01M69V83DQFH77W8JJ4KS4EWP9
   type: component
@@ -47,7 +47,7 @@ The `modules/` directory contains the core implementation layer of the YouTube c
 - **`processor.py` & `interaction_simulator.py`**: DeepSeek AI text payload generation, typography formatting, and human-like Bezier cursor/keyboard simulation.
 - **`multi_account_orchestrator.py` & `pool_manager.py`**: Target queue coordination across multiple browser contexts and accounts.
 - **`cookie_robot.py`**: pre-sign-in profile warming — `plan_sites` (4-5 random sites, google.com with a search first or second), `CookieRobot.run` over `YouTubeRunner` (saved fingerprint, own proxy, always `runner.close()`), `format_progress_bar`; consent banners via `CMP_ACCEPT_SELECTORS` in `page_helpers.py`.
-- **`modules/ui/`, `wizard.py`, `account_menu_logic.py`, `proxy_screen.py` & `tui.py`**: Terminal UI. `ui/app.py:run_app` opens one screen with six tabs (`ui/tab_launch.py`, `tab_accounts.py`, `tab_proxies.py`, `tab_projects.py`, `tab_target.py`, `tab_replies.py`; «Цель» / «Ответы» edit the current project) rendered by `ui/shell.py` (Controller / render / `run_shell`; keys handled in a worker thread because tabs call `asyncio.run`; `ui/icons.py` picks emoji or plain symbols). `wizard.py` is now only shared helpers (config writes, sessions, accounts, target labels, country question, `run_wizard_app`); `account_menu_logic.py` holds the pure parts of the «Аккаунты» tab (warm-up pick, import summary, card rows, profile pending fields); `proxy_screen.py` is proxy logic for the «Прокси» tab (no screens).
+- **`modules/ui/`, `wizard.py`, `account_menu_logic.py`, `proxy_screen.py` & `tui.py`**: Terminal UI. `ui/app.py:run_app` opens one screen with six tabs (`ui/tab_launch.py`, `tab_accounts.py`, `tab_proxies.py`, `tab_projects.py`, `tab_target.py`, `tab_replies.py`; «Цель» / «Ответы» edit the current project) rendered by `ui/shell.py` (Controller / render / `run_shell`; keys handled in a worker thread because tabs call `asyncio.run`; `ui/icons.py` picks emoji or plain symbols). A text `Field` is edited through `ui/line_editor.py:LineEditor`: a cursor over whole visible characters (emoji ZWJ sequences, skin tones, flags, `❤️` never split), ←→ / Ctrl+←→ / Home / End / ↑↓ over wrapped rows, Backspace / Delete / Ctrl+W / Ctrl+Delete / Ctrl+U / Ctrl+K; typing and pasting go in at the cursor and the text wraps to the window (`edit_columns`) instead of running off the right edge. `wizard.py` is now only shared helpers (config writes, sessions, accounts, target labels, country question, `run_wizard_app`); `account_menu_logic.py` holds the pure parts of the «Аккаунты» tab (warm-up pick, import summary, card rows, profile pending fields); `proxy_screen.py` is proxy logic for the «Прокси» tab (no screens).
 
 <!-- mex:entity
 id: mx_01M69V83D1FY43YN45W86J7DN9

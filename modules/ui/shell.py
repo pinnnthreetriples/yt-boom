@@ -2,6 +2,8 @@
 
 Keys are the same everywhere: Tab / Shift+Tab (or the tab's number) switch tabs, ↑↓ move, ←→ change the value of the row,
 Space shows the row's details, Enter opens its actions, Esc goes back, ? lists the keys, Q quits.
+In a text field the keys edit the text instead: ←→ (Ctrl: by words), Home/End and ↑↓ move the cursor, typing and
+pasting go in at it, Backspace/Delete remove a whole character (an emoji included) — see `line_editor`.
 
 A tab builds a `View` (rows and hotkeys) from the current data. Enter on a row returns a step: an inline `Menu`
 under the row, an inline `Field` or `Confirm`, a nested `Screen`, a `Notice`, or a `Run` — blocking work (a browser,
@@ -15,6 +17,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Union
 
 from prompt_toolkit.utils import get_cwidth
+
+from modules.ui.line_editor import LineEditor, char_width, chars, typeable
 
 BASE_WIDTH = 76  # the layout is drawn for this many columns
 WIDTH = BASE_WIDTH  # run_shell stretches it to the window; cells marked `grow` take the extra room
@@ -176,12 +180,25 @@ def frags_text(frags: list[Frag]) -> str:
 # --------------------------------------------------------------------------- state
 
 
+EDIT_INDENT = "      "
+EDIT_MARK = "› "
+
+
+def edit_columns() -> int:
+    """Columns a field's text wraps at: the window less the indent, the «› » mark and one spare column."""
+    return max(10, WIDTH - width(EDIT_INDENT) - width(EDIT_MARK) - 1)
+
+
 @dataclass
 class _Edit:
     row_id: str
     field: Field
-    text: str
+    buffer: LineEditor
     lines: list[str]
+
+    @property
+    def text(self) -> str:
+        return self.buffer.text
 
 
 class Controller:
@@ -270,7 +287,7 @@ class Controller:
             self.menu, self.menu_row, self.menu_sel = step, row_id, 0
             self.edit, self.confirm = None, None
         elif isinstance(step, Field):
-            self.edit = _Edit(row_id, step, step.initial, [])
+            self.edit = _Edit(row_id, step, LineEditor(step.initial), [])
             self.confirm = None
         elif isinstance(step, Confirm):
             self.confirm, self.confirm_row = step, row_id
@@ -314,7 +331,8 @@ class Controller:
 
     def press(self, key: str) -> None:
         """One key: 'up', 'down', 'left', 'right', 'enter', 'space', 'escape', 'tab', 's-tab', 'backspace',
-        'delete', or a printable character; pasted text arrives as 'paste:<text>'."""
+        'delete', a text field's 'home' / 'end' / 'c-left' / 'c-right' / 'c-w' / 'c-delete' / 'c-u' / 'c-k' / 'c-a' /
+        'c-e', or a printable character; pasted text arrives as 'paste:<text>'."""
         if key != "paste" and not key.startswith("paste:"):
             self.notice = None if not (self.edit or self.confirm) else self.notice
         if self.help:
@@ -444,37 +462,42 @@ class Controller:
             self.confirm = None
 
     def _key_edit(self, key: str) -> None:
+        """A key in a text field: typing and pasting go in at the cursor, which the arrows, Home/End and the word
+        keys move (see `LineEditor`); Enter saves (a multi-line field: keeps the line), Esc cancels."""
         assert self.edit is not None
         edit = self.edit
+        buffer = edit.buffer
         if key.startswith("paste:"):
             from config import repair_text
 
             parts = repair_text(key[6:]).replace("\r\n", "\n").replace("\r", "\n").split("\n")
-            if edit.field.multiline:
-                edit.text += parts[0]
+            if edit.field.multiline and len(parts) > 1:
+                tail = buffer.text[buffer.cursor:]
+                buffer.set(buffer.text[: buffer.cursor] + parts[0])
                 for part in parts[1:]:
-                    if edit.text.strip():
-                        edit.lines.append(edit.text.strip())
-                    edit.text = part
+                    if buffer.text.strip():
+                        edit.lines.append(buffer.text.strip())
+                    buffer.set(part)
+                buffer.text, buffer.cursor = buffer.text + tail, len(buffer.text)
             else:
-                edit.text += " ".join(p for p in parts if p)
-        elif key == "backspace":
-            edit.text = edit.text[:-1]
+                buffer.insert(" ".join(p for p in parts if p))
         elif key == "escape":
             self.edit = None
         elif key == "enter":
-            if edit.field.multiline and edit.text.strip():
-                edit.lines.append(edit.text.strip())
-                edit.text = ""
+            if edit.field.multiline and buffer.text.strip():
+                edit.lines.append(buffer.text.strip())
+                buffer.set("")
                 return
-            value = "\n".join(edit.lines) if edit.field.multiline else edit.text.strip()
+            value = "\n".join(edit.lines) if edit.field.multiline else buffer.text.strip()
             self.edit = None
             self.menu = None
             self.apply(edit.field.submit(value), edit.row_id)
         elif key == "space":
-            edit.text += " "
-        elif len(key) == 1 and key.isprintable():
-            edit.text += key
+            buffer.insert(" ")
+        elif buffer.press(key, edit_columns()):
+            pass
+        elif len(key) == 1 and typeable(key):
+            buffer.insert(key)
 
 
 # --------------------------------------------------------------------------- render
@@ -602,21 +625,50 @@ def _confirm_frags(confirm: Confirm) -> list[Frag]:
 
 
 def _render_edit(edit: _Edit, line: Callable[[list[Frag]], None]) -> None:
+    """The field: its prompt, the lines already given (a multi-line field), then the text being typed, wrapped by
+    whole characters to the window, with the cursor drawn on the character it stands before («▏» at the end)."""
     field_ = edit.field
-    line([("", "      "), ("class:accent", "+ " if field_.multiline else ""), ("class:dim", field_.prompt)])
+    line([("", EDIT_INDENT), ("class:accent", "+ " if field_.multiline else ""), ("class:dim", field_.prompt)])
     for done in edit.lines:
-        line([("", "      "), ("class:accent", "› "), ("", "•" * len(done) if field_.secret else done)])
-    shown = "•" * len(edit.text) if field_.secret else edit.text
-    line([("", "      "), ("class:accent", "› "), ("", shown), ("class:cursor", "▏")])
+        line([("", EDIT_INDENT), ("class:accent", EDIT_MARK), ("", _masked(done) if field_.secret else done)])
+    buffer = edit.buffer
+    rows = buffer.rows(edit_columns())
+    if len(rows) > 1 and rows[-1][0] == rows[-1][1] == len(buffer.text) and buffer.cursor != len(buffer.text):
+        rows = rows[:-1]  # the spare row only holds a cursor standing at the very end
+    for index, (start, end) in enumerate(rows):
+        mark = ("class:accent", EDIT_MARK) if index == 0 else ("", " " * width(EDIT_MARK))
+        frags: list[Frag] = [("", EDIT_INDENT), mark]
+        before, after = buffer.text[start:min(max(buffer.cursor, start), end)], ""
+        on_row = start <= buffer.cursor < end or (buffer.cursor == end and index == len(rows) - 1)
+        if not on_row:
+            frags.append(("", _shown(buffer.text[start:end], field_.secret)))
+        elif buffer.cursor == len(buffer.text):
+            frags += [("", _shown(before, field_.secret)), ("class:cursor", "▏")]
+        else:
+            under = chars(buffer.text[buffer.cursor:end])[0]
+            after = buffer.text[buffer.cursor + len(under):end]
+            frags += [("", _shown(before, field_.secret)), ("class:cursor-on", _shown(under, field_.secret)),
+                      ("", _shown(after, field_.secret))]
+        line(frags)
     if field_.preview:
-        lines = [*edit.lines, *([edit.text.strip()] if edit.text.strip() else [])]
+        lines = [*edit.lines, *([buffer.text.strip()] if buffer.text.strip() else [])]
         for p in field_.preview(lines):
-            line([("", "      ")] + cells_frags(p))
+            line([("", EDIT_INDENT)] + cells_frags(p))
+
+
+def _masked(text: str) -> str:
+    return "•" * len(chars(text))
+
+
+def _shown(text: str, secret: bool) -> str:
+    return _masked(text) if secret else text
 
 
 def _keys_hint(c: Controller) -> str:
     if c.edit:
-        return "Enter — строка · пустая Enter — готово · Esc" if c.edit.field.multiline else "Enter сохранить · Esc отмена"
+        if c.edit.field.multiline:
+            return "←→ курсор · Enter — строка · пустая Enter — готово · Esc"
+        return "←→ курсор · Home/End · Enter сохранить · Esc отмена"
     if c.confirm:
         return "←→ выбор · Enter"
     if c.menu:
@@ -650,7 +702,7 @@ HELP: list[tuple[str, str]] = [
 STYLE = {
     "ok": "ansigreen", "warn": "ansiyellow", "err": "ansired bold", "dim": "ansibrightblack",
     "accent": "ansicyan", "key": "ansiyellow bold", "marker": "ansicyan bold", "selected": "bg:#3a3a3a",
-    "tab": "", "tab-on": "bg:#4e4e4e", "cursor": "ansicyan",
+    "tab": "", "tab-on": "bg:#4e4e4e", "cursor": "ansicyan", "cursor-on": "reverse",
 }
 
 
@@ -675,7 +727,10 @@ def run_shell(controller: Controller, on_run: Callable[[Run], Step], clear: Call
             event.app.exit()
 
     names = {"up": "up", "down": "down", "left": "left", "right": "right", "enter": "enter", "c-m": "enter",
-             "tab": "tab", "s-tab": "s-tab", "backspace": "backspace", "c-h": "backspace", "delete": "delete"}
+             "tab": "tab", "s-tab": "s-tab", "backspace": "backspace", "c-h": "backspace", "delete": "delete",
+             # the text field's cursor keys (`LineEditor`); elsewhere they do nothing
+             "home": "home", "end": "end", "c-left": "c-left", "c-right": "c-right", "c-delete": "c-delete",
+             "c-w": "c-w", "c-u": "c-u", "c-k": "c-k", "c-a": "c-a", "c-e": "c-e"}
     for pt_key, name in names.items():
         kb.add(pt_key)(lambda e, n=name: feed(n, e))
     kb.add(" ")(lambda e: feed("space", e))
@@ -704,10 +759,13 @@ def run_shell(controller: Controller, on_run: Callable[[Run], Step], clear: Call
             data, high[:] = repair_text(high[0] + data), []
         if len(data) == 1 and 0xDC00 <= ord(data) <= 0xDFFF:
             return  # a lone half
-        if len(data) == 1 and data.isprintable():
-            feed(data if controller.edit else ("?" if data == "?" else normalize_key(data)), event)
-        elif len(data) > 1 and controller.edit:  # a paste without bracketed paste mode
-            feed("paste:" + data, event)
+        if controller.edit:
+            if len(data) == 1 and typeable(data):
+                feed(data, event)  # the zero-width joiner of an emoji family is not `isprintable`, yet belongs here
+            elif len(data) > 1:  # a paste without bracketed paste mode, or an emoji sequence sent at once
+                feed("paste:" + data, event)
+        elif len(data) == 1 and data.isprintable():
+            feed("?" if data == "?" else normalize_key(data), event)
 
     def draw() -> list[Frag]:
         global WIDTH

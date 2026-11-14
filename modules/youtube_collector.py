@@ -5,7 +5,7 @@ import base64
 import json
 import re
 import unicodedata
-from typing import Any
+from typing import Any, Collection
 from urllib.parse import parse_qs, urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -20,6 +20,14 @@ from modules.session_heartbeat import curl_proxy_url
 
 _WHITESPACE = re.compile(r"\s+")
 _VIDEO_ID_REGEX = re.compile(r"(?:v=|\/shorts\/|youtu\.be\/|embed\/)([A-Za-z0-9_-]{11})")
+COMMENT_PAGES_MAX = 25  # comment pages (about 20 threads each) one fetch reads at most; it stops once it has enough
+
+
+def _external_id(video_id: str, candidate: dict[str, Any]) -> str:
+    """The target's id in payloads and the activity log: «video#comment», or «video#parent#reply» for a reply."""
+    if candidate["is_reply"]:
+        return f"{video_id}#{candidate['parent_id']}#{candidate['comment_id']}"
+    return f"{video_id}#{candidate['comment_id']}"
 
 
 def extract_video_id(url_or_id: str) -> str | None:
@@ -1008,13 +1016,21 @@ class YouTubeCollector:
         *,
         limit: int = 10,
         target_mode: str = "popular_parent",
+        skip: Collection[str] = (),
+        max_pages: int = COMMENT_PAGES_MAX,
     ) -> list[CollectedItem]:
         """
-        Fetch comments for a video, sorted by popularity (like count DESC).
+        Up to `limit` reply targets under a video, the most popular first.
         Supported target modes:
           - 'popular_parent': Top-level popular comments (most upvoted comments on the video)
           - 'sub_comment': Replies under comments (sub-comments), sorted by likes
           - 'mixed': Combined top-level comments and replies, sorted by likes
+          - 'first_reply' / 'first_sub_comment': the most liked reply under each popular comment (one per thread)
+
+        YouTube gives the comment section in pages of about 20 threads («Популярные» order). The pages are read one
+        after another until `limit` targets are found, the comments end, or `max_pages` pages were read. A target
+        whose external id is in `skip` (already answered) is left out and does not count, so a video answered before
+        still yields fresh targets from its next pages. Within a page the targets go most liked first.
         """
         video_id = extract_video_id(video_url_or_id)
         if not video_id:
@@ -1051,210 +1067,207 @@ class YouTubeCollector:
             return []
 
         next_url = f"https://www.youtube.com/youtubei/v1/next?key={api_key}"
-        threads_payload = {
-            "context": {"client": {"clientName": "WEB", "clientVersion": client_version}},
-            "continuation": token,
-        }
-
-        try:
-            threads_resp = await self._session.post(
-                next_url,
-                json=threads_payload,
-                headers={"Content-Type": "application/json"},
+        taken: set[str] = set(skip)  # external ids that must not come back: answered before, or taken already
+        results: list[CollectedItem] = []
+        used_tokens: set[str] = set()
+        pages = 0
+        while token and token not in used_tokens and pages < max(1, max_pages) and len(results) < limit:
+            used_tokens.add(token)
+            pages += 1
+            try:
+                threads_data = await self._post_next(next_url, client_version, token)
+            except CollectorError:
+                if pages == 1:
+                    raise
+                logger.warning("Страница {} комментариев видео {} не получена: дальше не читаем", pages, video_id)
+                break
+            parent_comments, reply_tokens = self._parse_comment_threads(threads_data, video_id)
+            candidates = await self._page_candidates(
+                next_url, client_version, video_id, target_mode, parent_comments, reply_tokens,
+                wanted=limit - len(results), taken=taken,
             )
+            for candidate in candidates:
+                if len(results) >= limit:
+                    break
+                item = await self._candidate_item(candidate, video_id)
+                if item is None or item.external_id in taken:
+                    continue
+                taken.add(item.external_id)
+                results.append(item)
+            token = self._next_threads_token(threads_data)
+
+        logger.debug(
+            "Найдено {} комментариев для видео {} (режим={}, страниц: {}, пропущено отвеченных: {})",
+            len(results),
+            video_id,
+            target_mode,
+            pages,
+            len(skip),
+        )
+        return results
+
+    async def _post_next(self, next_url: str, client_version: str, token: str) -> dict[str, Any]:
+        """One InnerTube `next` request for a continuation token (a comment page or a thread's replies)."""
+        assert self._session is not None
+        payload = {"context": {"client": {"clientName": "WEB", "clientVersion": client_version}}, "continuation": token}
+        try:
+            resp = await self._session.post(next_url, json=payload, headers={"Content-Type": "application/json"})
         except RequestException as exc:
             raise CollectorError(f"failed to fetch YouTube comment threads: {exc}") from exc
+        if resp.status_code != 200:
+            raise CollectorError(f"InnerTube comment threads request returned HTTP {resp.status_code}")
+        return resp.json()
 
-        if threads_resp.status_code != 200:
-            raise CollectorError(f"InnerTube comment threads request returned HTTP {threads_resp.status_code}")
+    @staticmethod
+    def _next_threads_token(threads_data: dict[str, Any]) -> str | None:
+        """The token of the next comment page: the `continuationItemRenderer` that ends the page's thread list.
 
-        threads_data = threads_resp.json()
-        parent_comments, reply_tokens = self._parse_comment_threads(threads_data, video_id)
+        Only the top level of the list is read: a thread's own «show replies» continuation sits inside its
+        `commentThreadRenderer` and is not a page."""
+        endpoints = threads_data.get("onResponseReceivedEndpoints") or []
+        for endpoint in reversed(endpoints if isinstance(endpoints, list) else []):
+            if not isinstance(endpoint, dict):
+                continue
+            for key in ("appendContinuationItemsAction", "reloadContinuationItemsCommand"):
+                items = (endpoint.get(key) or {}).get("continuationItems") or []
+                for item in reversed(items):
+                    renderer = item.get("continuationItemRenderer") if isinstance(item, dict) else None
+                    if not renderer:
+                        continue
+                    for command in _find_keys(renderer, "continuationCommand"):
+                        if isinstance(command, dict) and command.get("token"):
+                            return str(command["token"])
+        return None
 
+    async def _thread_replies(
+        self, next_url: str, client_version: str, video_id: str, parent_id: str, parent: dict[str, Any], token: str
+    ) -> list[YouTubeSubComment]:
+        """The replies of one thread; [] when they cannot be read (one thread never stops the collection)."""
+        try:
+            replies_data = await self._post_next(next_url, client_version, token)
+        except Exception as exc:
+            logger.debug("Failed to fetch replies for thread {}: {}", parent_id, exc)
+            return []
+        return self._parse_replies(
+            replies_data,
+            video_id=video_id,
+            parent_id=parent_id,
+            parent_text=parent.get("text", ""),
+            parent_author=parent.get("author", ""),
+        )
+
+    @staticmethod
+    def _reply_candidate(r: YouTubeSubComment, parent_likes: int | None = None) -> dict[str, Any]:
+        candidate: dict[str, Any] = {
+            "video_id": r.video_id,
+            "comment_id": r.comment_id,
+            "parent_id": r.parent_comment_id,
+            "author": r.author,
+            "text": r.text,
+            "parent_author": r.parent_author,
+            "parent_text": r.parent_text,
+            "is_reply": True,
+            "like_count": r.like_count,
+            "permalink": r.permalink,
+        }
+        if parent_likes is not None:
+            candidate["parent_likes"] = parent_likes
+        return candidate
+
+    async def _page_candidates(
+        self,
+        next_url: str,
+        client_version: str,
+        video_id: str,
+        target_mode: str,
+        parent_comments: dict[str, dict[str, Any]],
+        reply_tokens: list[tuple[str, str]],
+        *,
+        wanted: int,
+        taken: set[str],
+    ) -> list[dict[str, Any]]:
+        """Raw targets of one comment page in the mode's order. A target in `taken` is left out and does not count
+        toward `wanted`, which bounds the threads whose replies are read (each one costs a request)."""
         candidates: list[dict[str, Any]] = []
+
+        def fresh(candidate: dict[str, Any]) -> bool:
+            return _external_id(video_id, candidate) not in taken
 
         # 1. Include parent comments if mode is popular_parent or mixed
         if target_mode in ("popular_parent", "mixed"):
             for cid, p_info in parent_comments.items():
                 text = p_info.get("text", "")
-                author = p_info.get("author", "")
-                like_cnt = p_info.get("like_count", 0)
                 if cid and text.strip():
                     candidates.append({
                         "video_id": video_id,
                         "comment_id": cid,
                         "parent_id": None,
-                        "author": author,
+                        "author": p_info.get("author", ""),
                         "text": text.strip(),
                         "parent_author": None,
                         "parent_text": None,
                         "is_reply": False,
-                        "like_count": like_cnt,
+                        "like_count": p_info.get("like_count", 0),
                         "permalink": f"https://www.youtube.com/watch?v={video_id}&lc={cid}",
                     })
 
         # 2. Include replies if mode is sub_comment or mixed
         if target_mode in ("sub_comment", "mixed"):
-            max_reply_threads = max(limit * 2, 10)
-            for parent_id, r_token in reply_tokens[:max_reply_threads]:
-                parent_info = parent_comments.get(parent_id, {})
-                parent_text = parent_info.get("text", "")
-                parent_author = parent_info.get("author", "")
+            for parent_id, r_token in reply_tokens[: max(wanted * 2, 10)]:
+                replies = await self._thread_replies(
+                    next_url, client_version, video_id, parent_id, parent_comments.get(parent_id, {}), r_token
+                )
+                candidates.extend(self._reply_candidate(r) for r in replies)
 
-                r_payload = {
-                    "context": {"client": {"clientName": "WEB", "clientVersion": client_version}},
-                    "continuation": r_token,
-                }
-                try:
-                    r_resp = await self._session.post(
-                        next_url,
-                        json=r_payload,
-                        headers={"Content-Type": "application/json"},
-                    )
-                    if r_resp.status_code == 200:
-                        replies_data = r_resp.json()
-                        parsed_replies = self._parse_replies(
-                            replies_data,
-                            video_id=video_id,
-                            parent_id=parent_id,
-                            parent_text=parent_text,
-                            parent_author=parent_author,
-                        )
-                        for r in parsed_replies:
-                            candidates.append({
-                                "video_id": r.video_id,
-                                "comment_id": r.comment_id,
-                                "parent_id": r.parent_comment_id,
-                                "author": r.author,
-                                "text": r.text,
-                                "parent_author": r.parent_author,
-                                "parent_text": r.parent_text,
-                                "is_reply": True,
-                                "like_count": r.like_count,
-                                "permalink": r.permalink,
-                            })
-                except Exception as exc:
-                    logger.debug("Failed to fetch replies for thread {}: {}", parent_id, exc)
-
-        # 3. Include first reply under popular parent comments if mode is first_reply / first_sub_comment
+        # 3. The most liked reply under each popular parent comment (first_reply / first_sub_comment)
         if target_mode in ("first_reply", "first_sub_comment"):
-            sorted_parents = sorted(
-                parent_comments.items(),
-                key=lambda x: x[1].get("like_count", 0),
-                reverse=True,
-            )
             reply_token_map = dict(reply_tokens)
-            max_threads = max(limit * 3, 15)
-            for parent_id, p_info in sorted_parents[:max_threads]:
-                if len(candidates) >= limit * 2:
+            sorted_parents = sorted(parent_comments.items(), key=lambda x: x[1].get("like_count", 0), reverse=True)
+            found = 0
+            for parent_id, p_info in sorted_parents:
+                if found >= wanted * 2:
                     break
                 r_token = reply_token_map.get(parent_id)
                 if not r_token:
                     continue
-
-                parent_text = p_info.get("text", "")
-                parent_author = p_info.get("author", "")
-                parent_likes = p_info.get("like_count", 0)
-
-                r_payload = {
-                    "context": {"client": {"clientName": "WEB", "clientVersion": client_version}},
-                    "continuation": r_token,
-                }
-                try:
-                    r_resp = await self._session.post(
-                        next_url,
-                        json=r_payload,
-                        headers={"Content-Type": "application/json"},
-                    )
-                    if r_resp.status_code == 200:
-                        replies_data = r_resp.json()
-                        parsed_replies = self._parse_replies(
-                            replies_data,
-                            video_id=video_id,
-                            parent_id=parent_id,
-                            parent_text=parent_text,
-                            parent_author=parent_author,
-                        )
-                        valid_replies = [r for r in parsed_replies if self._passes_filters(r.text)]
-                        # Sort replies by likes descending so the most upvoted / prominent top reply (as seen in YouTube UI) is chosen
-                        valid_replies.sort(key=lambda r: r.like_count, reverse=True)
-                        if valid_replies:
-                            r = valid_replies[0]
-                            candidates.append({
-                                "video_id": r.video_id,
-                                "comment_id": r.comment_id,
-                                "parent_id": r.parent_comment_id,
-                                "author": r.author,
-                                "text": r.text,
-                                "parent_author": r.parent_author,
-                                "parent_text": r.parent_text,
-                                "is_reply": True,
-                                "like_count": r.like_count,
-                                "parent_likes": parent_likes,
-                                "permalink": r.permalink,
-                            })
-                except Exception as exc:
-                    logger.debug("Failed to fetch first reply for thread {}: {}", parent_id, exc)
-
-        if target_mode in ("first_reply", "first_sub_comment"):
+                replies = await self._thread_replies(next_url, client_version, video_id, parent_id, p_info, r_token)
+                valid_replies = [r for r in replies if self._passes_filters(r.text)]
+                # the most upvoted reply, as YouTube shows it on top of the thread
+                valid_replies.sort(key=lambda r: r.like_count, reverse=True)
+                if valid_replies:
+                    candidate = self._reply_candidate(valid_replies[0], p_info.get("like_count", 0))
+                    candidates.append(candidate)
+                    found += fresh(candidate)
             candidates.sort(key=lambda c: (c.get("parent_likes", 0), c["like_count"]), reverse=True)
         else:
             candidates.sort(key=lambda c: c["like_count"], reverse=True)
+        return [candidate for candidate in candidates if fresh(candidate)]
 
-        results: list[CollectedItem] = []
-        seen: set[str] = set()
-
-        for c in candidates:
-            if len(results) >= limit:
-                break
-            cid = c["comment_id"]
-            if cid in seen:
-                continue
-            seen.add(cid)
-
-            if not self._passes_filters(c["text"]):
-                continue
-
-            detection = await asyncio.to_thread(self._detect_language, c["text"])
-            if detection is None:
-                continue
-            language, confidence = detection
-            if language not in self._languages:
-                continue
-            if confidence < self._cfg.minimum_confidence:
-                continue
-
-            if c["is_reply"]:
-                ext_id = f"{video_id}#{c['parent_id']}#{cid}"
-            else:
-                ext_id = f"{video_id}#{cid}"
-
-            results.append(
-                CollectedItem(
-                    endpoint=f"youtube:{video_id}",
-                    external_id=ext_id,
-                    text=c["text"],
-                    language=language,
-                    confidence=confidence,
-                    source_url=c["permalink"],
-                    parent_id=c["parent_id"],
-                    parent_text=c["parent_text"],
-                    parent_author=c["parent_author"],
-                    author=c["author"],
-                    video_id=video_id,
-                    is_reply=c["is_reply"],
-                    like_count=c["like_count"],
-                )
-            )
-
-        logger.debug(
-            "Найдено {} комментариев для видео {} (режим={}, максимум лайков={})",
-            len(results),
-            video_id,
-            target_mode,
-            results[0].like_count if results else 0,
+    async def _candidate_item(self, c: dict[str, Any], video_id: str) -> CollectedItem | None:
+        """A raw target as a CollectedItem, or None when the text filters or the language rule it out."""
+        if not self._passes_filters(c["text"]):
+            return None
+        detection = await asyncio.to_thread(self._detect_language, c["text"])
+        if detection is None:
+            return None
+        language, confidence = detection
+        if language not in self._languages or confidence < self._cfg.minimum_confidence:
+            return None
+        return CollectedItem(
+            endpoint=f"youtube:{video_id}",
+            external_id=_external_id(video_id, c),
+            text=c["text"],
+            language=language,
+            confidence=confidence,
+            source_url=c["permalink"],
+            parent_id=c["parent_id"],
+            parent_text=c["parent_text"],
+            parent_author=c["parent_author"],
+            author=c["author"],
+            video_id=video_id,
+            is_reply=c["is_reply"],
+            like_count=c["like_count"],
         )
-        return results[:limit]
 
     def _passes_filters(self, text: str) -> bool:
         normalized = _WHITESPACE.sub(" ", text).strip()
@@ -1284,6 +1297,7 @@ class YouTubeCollector:
 
 
 __all__ = [
+    "COMMENT_PAGES_MAX",
     "TITLE_KEYWORDS_MAX",
     "YouTubeCollector",
     "YouTubeSubComment",

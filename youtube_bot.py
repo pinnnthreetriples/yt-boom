@@ -1558,6 +1558,16 @@ async def list_sub_comments(video_url: str, config_path: str = "config.yaml", li
         print("-" * 70)
 
 
+async def _handled_targets(db: Any, video_id: str) -> set[str]:
+    """Targets under the video answered before: the collector leaves them out and reads further comment pages.
+    Without the list (a database error) every target is still checked with `has_replied_to` before a reply."""
+    try:
+        return set(await db.handled_refs(video_id))
+    except Exception as exc:
+        logger.debug("Список отвеченных под {} не прочитан: {}", video_id, exc)
+        return set()
+
+
 async def run_reply_bot(
     video_url: str,
     *,
@@ -1687,7 +1697,10 @@ async def run_reply_bot(
         if effective_target_mode in ("popular_parent", "sub_comment", "mixed", "first_reply", "first_sub_comment"):
             logger.info("Сбор комментариев для {} (режим={})", video_url, effective_target_mode)
             try:
-                items = await collector.fetch_popular_comments(video_url, limit=limit * 2 + EXTRA_CANDIDATES, target_mode=effective_target_mode)
+                items = await collector.fetch_popular_comments(
+                    video_url, limit=limit * 2 + EXTRA_CANDIDATES, target_mode=effective_target_mode,
+                    skip=await _handled_targets(db, video_id),
+                )
             except Exception as exc:
                 logger.debug("Сбор популярных комментариев завершился ошибкой, резервный метод: {}", exc)
         else:
@@ -2094,6 +2107,7 @@ async def run_multi_video_pipeline(
                     vid_url,
                     limit=comments_per_video * 2 + EXTRA_CANDIDATES,
                     target_mode=effective_target_mode,
+                    skip=await _handled_targets(db, vid_id),
                 )
             except Exception as exc:
                 logger.error("Ошибка сбора популярных комментариев для {}: {}", vid_id, exc)

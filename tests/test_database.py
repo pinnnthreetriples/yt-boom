@@ -77,6 +77,21 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(validated.status, "validated")
         self.assertTrue(await self.db.has_replied_to(source_ref))
 
+    async def test_handled_refs_lists_the_answered_targets_of_one_video(self):
+        node = await self.db.upsert_test_node("yt", "https://www.youtube.com")
+        answered = await self.db.reserve_payload(node_id=node.id, source_ref="vid_A-1#p#r1", language="ru")
+        await self.db.mark_payload_submitted(answered.id, "remote")
+        await self.db.reserve_payload(node_id=node.id, source_ref="vid_A-1#p#r2", language="ru")  # being answered
+        failed = await self.db.reserve_payload(node_id=node.id, source_ref="vid_A-1#p#r3", language="ru")
+        await self.db.mark_payload_failed(failed.id, "browser crashed")  # free again
+        await self.db.mark_reply_unavailable(node_id=node.id, source_ref="vid_A-1#p#r4", reason="no button")
+        await self.db.reserve_payload(node_id=node.id, source_ref="vidXA-1#p#r5", language="ru")  # «_» is no wildcard
+        await self.db.reserve_payload(node_id=node.id, source_ref="other#p#r6", language="ru")
+        self.assertEqual(
+            await self.db.handled_refs("vid_A-1"), {"vid_A-1#p#r1", "vid_A-1#p#r2", "vid_A-1#p#r4"}
+        )
+        self.assertEqual(await self.db.handled_refs("nothing"), set())
+
     async def test_reserve_payload_and_update_text(self):
         node = await self.db.upsert_test_node("yt", "https://www.youtube.com")
         source_ref = "vid999#p1#sub_atomic"

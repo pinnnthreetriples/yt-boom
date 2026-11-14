@@ -488,6 +488,17 @@ class MultiAccountOrchestrator:
         except Exception as exc:
             logger.debug("Не удалось записать ошибку аккаунта {}: {}", acc.name, exc)
 
+    async def _handled_targets(self, video_id: str) -> set[str]:
+        """Targets under `video_id` that must not be answered: replied to before (or without a Reply button) and
+        those claimed in this run. A failing database only means the collector gets no list: each target is still
+        checked with `has_replied_to` before a reply."""
+        claimed = {ref for ref in self._claimed if ref.startswith(f"{video_id}#")}
+        try:
+            return claimed | await self._db.handled_refs(video_id)
+        except Exception as exc:
+            logger.debug("ИНФО | Список отвеченных под {} не прочитан: {}", video_id, exc)
+            return claimed
+
     async def _process_video(
         self,
         video: VideoPoolItem,
@@ -523,10 +534,14 @@ class MultiAccountOrchestrator:
             target_mode = getattr(self._cfg.collector, "target_mode", "first_reply")
             items = []
             try:
+                # the targets answered before (and those other accounts took in this run) are left out by the
+                # collector itself, so it reads further comment pages instead of returning them again
+                skip = await self._handled_targets(video.video_id)
                 items = await self._collector.fetch_popular_comments(
                     video.video_url,
-                    limit=needed * 4,
+                    limit=needed * 2,  # spare targets for the ones without a Reply button
                     target_mode=target_mode,
+                    skip=skip,
                 )
             except Exception as exc:
                 logger.warning(

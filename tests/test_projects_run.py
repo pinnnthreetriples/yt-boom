@@ -66,7 +66,7 @@ class FakeCollector:
     async def video_title(self, video_id):
         return self.titles.get(video_id, "")
 
-    async def fetch_popular_comments(self, video_url, limit=4, target_mode="first_reply"):
+    async def fetch_popular_comments(self, video_url, limit=4, target_mode="first_reply", skip=()):
         return comments(video_url.split("v=")[-1])
 
     async def close(self):

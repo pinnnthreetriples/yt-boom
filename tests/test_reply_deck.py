@@ -446,7 +446,7 @@ class TestDeckInOrchestrator(unittest.IsolatedAsyncioTestCase):
 
         collector = MagicMock()
 
-        async def fetch(video_url, limit=4, target_mode="first_reply"):
+        async def fetch(video_url, limit=4, target_mode="first_reply", skip=()):
             if not video_url.endswith(vid):  # videos left in the pool by earlier runs have nothing to answer
                 return []
             return [
@@ -594,7 +594,7 @@ class TestDeckInOrchestrator(unittest.IsolatedAsyncioTestCase):
         orchestrator._deck.draw = draws
         await self.db.add_video_to_pool("https://www.youtube.com/watch?v=vid_par00002", comments_target=1)
 
-        async def fetch(video_url, limit=4, target_mode="first_reply"):
+        async def fetch(video_url, limit=4, target_mode="first_reply", skip=()):
             vid = video_url.split("v=")[-1]
             return [CollectedItem(endpoint=f"youtube:{vid}", external_id=f"{vid}#root#c", text="Cool video",
                                   language="en", confidence=0.95, source_url=video_url, author="viewer",

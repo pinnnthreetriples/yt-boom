@@ -315,6 +315,7 @@ class TestYouTubeBotCLI(unittest.IsolatedAsyncioTestCase):
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 limit=2 + EXTRA_CANDIDATES,  # two per reply wanted, plus spares for targets without a Reply button
                 target_mode="sub_comment",
+                skip=set(),  # nothing under this video was answered before
             )
             mock_gen.assert_called_once()
             mock_run.assert_called_once()
