@@ -1,5 +1,5 @@
 """Tab «Запуск»: start (dry / live) of the projects «в запуске», one row per project once there are several, threads,
-how accounts share videos, browser window, today's counters, journal."""
+how accounts share videos, browser window, visibility check, the observer account, today's counters, journal."""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +11,7 @@ from modules.ui import shell
 from modules.ui.app import AppContext
 from modules.ui.icons import icon
 from modules.ui.shell import Cell, Confirm, GoTab, Hotkey, Menu, Notice, Row, Run, Screen, Step, Tab, View, fit
+from modules.ui.tab_observer import observer_row
 from modules.ui.tab_projects import daily_text, plan_text
 
 _SPLIT = [("each", "каждый — весь список"), ("share", "делят список")]
@@ -48,7 +49,7 @@ def per_video_text(project: Any, account_mode: str) -> str:
 
 
 def _active_count(ctx: AppContext) -> int:
-    rows = ctx.query("SELECT COUNT(*) FROM accounts WHERE is_active = 1")
+    rows = ctx.query("SELECT COUNT(*) FROM accounts WHERE is_active = 1 AND role <> 'observer'")
     return int(rows[0][0]) if rows else 0
 
 
@@ -60,14 +61,14 @@ def _posting_count(ctx: AppContext, project_ids: list[int]) -> int:
     marks = ",".join("?" for _ in project_ids)
     rows = ctx.query(
         "SELECT COUNT(DISTINCT a.id) FROM accounts a JOIN project_accounts pa ON pa.account_id = a.id"
-        f" WHERE pa.project_id IN ({marks}) AND a.is_active = 1 AND COALESCE(a.auth_status, '') <> 'failed'",
+        f" WHERE pa.project_id IN ({marks}) AND a.role <> 'observer' AND a.is_active = 1 AND COALESCE(a.auth_status, '') <> 'failed'",
         tuple(project_ids),
     )
     return int(rows[0][0]) if rows else 0
 
 
 def _without_project(ctx: AppContext) -> int:
-    rows = ctx.query("SELECT COUNT(*) FROM accounts WHERE id NOT IN (SELECT account_id FROM project_accounts)")
+    rows = ctx.query("SELECT COUNT(*) FROM accounts WHERE role <> 'observer' AND id NOT IN (SELECT account_id FROM project_accounts)")
     return int(rows[0][0]) if rows else 0
 
 
@@ -184,7 +185,7 @@ def build_tab(ctx: AppContext) -> Tab:
     def setup_rows(projects: list[Any]) -> list[Row]:
         """What is missing before a launch makes sense (by the projects «в запуске»), each row leads to its tab."""
         missing: list[Row] = []
-        has_accounts = bool(ctx.query("SELECT 1 FROM accounts LIMIT 1"))
+        has_accounts = bool(ctx.query("SELECT 1 FROM accounts WHERE role <> 'observer' LIMIT 1"))
         if not has_accounts:
             missing.append(setup_row("setup-accounts", "tab_accounts", "добавить аккаунт", "Нужен хотя бы один аккаунт",
                                      "Аккаунты"))
@@ -335,6 +336,7 @@ def build_tab(ctx: AppContext) -> Tab:
             hint=check_hint, values=["включена", "выключена"], value_index=0 if check_on else 1,
             on_value=lambda i: ctx.update({"limits.visibility_check_enabled": i == 0}),
         ))
+        rows.append(observer_row(ctx))
 
         total = ctx.query("SELECT COUNT(*) FROM activity_log")
         rows.append(Row(

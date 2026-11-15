@@ -34,7 +34,7 @@ from database import (
 )
 from modules.collector import CollectorError
 from modules.cookie_robot import CookieRobot, CookieRobotResult
-from modules.comment_visibility import VisibilityWatcher, make_visibility_checker
+from modules.comment_visibility import VisibilityWatcher, make_visibility_checker, visibility_enabled
 from modules.account_parser import looks_like_credentials, parse_account_line
 from modules.account_menu_logic import format_profile_summary, profile_pending_fields
 from modules.account_warmer import AccountWarmer, WarmUpResult
@@ -593,7 +593,9 @@ EXTRA_CANDIDATES = 4
 async def _intro_warm_up(db: Database, cfg: AppConfig, account: AccountRecord) -> None:
     """A minute of organic browsing right after sign-in; an account past quarantine and ageing needs none."""
     fresh = await db.get_account(account.id)
-    if fresh is None or AccountLifecycleEngine.calculate_stage(fresh)[0] not in ("quarantine", "aging"):
+    if fresh is None or fresh.is_observer:  # the observer only watches: it needs no warm-up
+        return
+    if AccountLifecycleEngine.calculate_stage(fresh)[0] not in ("quarantine", "aging"):
         return
     res = await AccountWarmer(cfg.browser).warm_up(fresh, duration_seconds=INTRO_WARM_UP_SECONDS, db=db)
     if not res.success:
@@ -605,7 +607,7 @@ async def _find_account(db: Database, identifier: str) -> AccountRecord | None:
     if account is not None:
         return account
     wanted = identifier.strip().lower()
-    return next((a for a in await db.list_accounts() if a.email and a.email.lower() == wanted), None)
+    return next((a for a in await db.list_accounts(include_observer=True) if a.email and a.email.lower() == wanted), None)
 
 
 async def auth_account_cli(
@@ -657,7 +659,9 @@ async def register_account_lines(
     """
     result = AccountImportResult()
     # a renamed account keeps its e-mail, so a repeated line is recognised by the e-mail too, not only by the name
-    known_emails = {a.email.lower() for a in await db.list_accounts() if a.email} if skip_existing else set()
+    known_emails = (
+        {a.email.lower() for a in await db.list_accounts(include_observer=True) if a.email} if skip_existing else set()
+    )
     for number, raw in enumerate(lines, start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -831,6 +835,7 @@ def warm_candidates(accounts: Iterable[AccountRecord], names: Iterable[str] | No
         a
         for a in accounts
         if (wanted is None or a.name in wanted)
+        and not a.is_observer  # the observer only watches: no warm-up sessions for it
         and a.auth_status == "authenticated"
         and AccountLifecycleEngine.calculate_stage(a)[0] in ("quarantine", "aging")
     ]
@@ -913,6 +918,8 @@ async def run_cookie_robot(
             account = await db.get_account(name)
             if account is None:
                 results.append(CookieRobotResult(name, False, (), (), 0.0, "account not found"))
+            elif account.is_observer:  # the observer only watches: no cookie walk for it
+                results.append(CookieRobotResult(name, False, (), (), 0.0, "observer account: skipped"))
             else:
                 if worked:
                     await asyncio.sleep(_pause_between_accounts(account))
@@ -1050,6 +1057,40 @@ async def reset_restricted_cli(identifier: str, config_path: str = "config.yaml"
     return await _account_setting_cli(identifier, config_path, change)
 
 
+async def set_observer_cli(identifier: str, config_path: str = "config.yaml") -> bool:
+    """`--set-observer <name_or_email>`: that account becomes the observer (checks visibility, never posts)."""
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        account = await _find_account(db, identifier)
+        if account is None:
+            print(f"[ERROR] Account {identifier!r} not found. Add it with --add-account email:password:totp", file=sys.stderr)
+            return False
+        account = await db.set_observer(account.name)
+        print(f"[OK] {account.name!r} is the observer now (it never posts). Sign it in: --auth-account {account.name}")
+        return True
+
+
+async def observer_status_cli(config_path: str = "config.yaml") -> bool:
+    """`--observer-status`: the observer account, its proxy and login, and the visibility check counters."""
+    from modules.observer_session import observer_signed_in
+
+    cfg = load_config(config_path)
+    async with _open_db(cfg) as db:
+        observer = await db.get_observer_account()
+        if observer is None:
+            print("[INFO] No observer account: visibility is checked anonymously. Set one with --set-observer <name>.")
+            return False
+        delay = cfg.limits.visibility_check_delay_seconds
+        enabled = observer.is_active and visibility_enabled(cfg)
+        print(f"Observer:  {observer.name} ({mask_email(observer.email)}, {observer.engine})")
+        print(f"Checks:    {'enabled' if enabled else 'disabled'} (delay {delay:.0f}s)")
+        print(f"Proxy:     {mask_proxy_url(observer.proxy_url) or 'direct (no proxy)'}")
+        print(f"Signed in: {'yes' if await observer_signed_in(observer) else 'no (run --auth-account)'}")
+        counts = await db.comment_check_counts()
+        print(f"Replies:   seen {counts.get('seen', 0)} / not found {counts.get('missing', 0)} / unchecked {counts.get('unknown', 0)}")
+        return True
+
+
 async def print_accounts_table(config_path: str = "config.yaml") -> None:
     """Pretty-print a table of all accounts with stats from DB."""
     cfg = load_config(config_path)
@@ -1057,7 +1098,7 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
     await db.connect()
     await db.init_schema()
     try:
-        accounts = await db.list_accounts()
+        accounts = await db.list_accounts(include_observer=True)
         if not accounts and hasattr(cfg.browser, "accounts"):
             for acc in cfg.browser.accounts:
                 await db.upsert_account(
@@ -1066,7 +1107,7 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
                     proxy_url=acc.proxy_url,
                     is_active=acc.is_active,
                 )
-            accounts = await db.list_accounts()
+            accounts = await db.list_accounts(include_observer=True)
 
         print("\n" + "=" * 80)
         print("                        YOUTUBE ACCOUNTS OVERVIEW")
@@ -1091,7 +1132,7 @@ async def print_accounts_table(config_path: str = "config.yaml") -> None:
                     proxy_display = proxy_display[:27] + "..."  # the masked form: never cut credentials open
                 row = (
                     f"{acc.id:<4} | "
-                    f"{acc.name:<16} | "
+                    f"{(acc.name + ' [obs]') if acc.is_observer else acc.name:<16} | "
                     f"{status:<8} | "
                     f"{acc.auth_status:<13} | "
                     f"{geo_display:<12} | "
@@ -1636,6 +1677,9 @@ async def run_reply_bot(
 
     if account_name:
         acc_record = await db.get_account(account_name)
+        if acc_record is not None and acc_record.is_observer:
+            await db.close()
+            raise ValueError(f"{account_name!r} is the observer account: it only checks visibility and never posts")
         if acc_record is None:
             cfg_acc = next((a for a in getattr(cfg.browser, "accounts", []) if a.name == account_name), None)
             if cfg_acc:
@@ -1664,7 +1708,7 @@ async def run_reply_bot(
         return
     await log_proxy_routes(db, [owner.name] if owner is not None else [])
     collector = YouTubeCollector(cfg.collector, search_proxy)
-    visibility = VisibilityWatcher(make_visibility_checker(cfg, collector), db)
+    visibility = VisibilityWatcher(make_visibility_checker(cfg, collector, db), db)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
@@ -2005,6 +2049,9 @@ async def run_multi_video_pipeline(
 
     if account_name:
         acc_record = await db.get_account(account_name)
+        if acc_record is not None and acc_record.is_observer:
+            await db.close()
+            raise ValueError(f"{account_name!r} is the observer account: it only checks visibility and never posts")
         if acc_record is None:
             cfg_acc = next((a for a in getattr(cfg.browser, "accounts", []) if a.name == account_name), None)
             if cfg_acc:
@@ -2033,7 +2080,7 @@ async def run_multi_video_pipeline(
         return
     await log_proxy_routes(db, [owner.name] if owner is not None else [])
     collector = YouTubeCollector(cfg.collector, search_proxy)
-    visibility = VisibilityWatcher(make_visibility_checker(cfg, collector), db)
+    visibility = VisibilityWatcher(make_visibility_checker(cfg, collector, db), db)
 
     runner_kwargs: dict[str, Any] = {
         "simulator": simulator,
@@ -2494,6 +2541,8 @@ def main() -> None:
     parser.add_argument("--set-active", nargs=2, default=None, metavar=("NAME", "on|off"), help="Put the account in work (on) or switch it off (off): runs skip it and it is not warmed up")
     parser.add_argument("--reset-restricted", type=str, default=None, metavar="NAME", help="Lift the circuit breaker of a restricted account (3 errors in a row)")
     parser.add_argument("--list-accounts", action="store_true", help="List all registered accounts with stats and projects from DB")
+    parser.add_argument("--set-observer", type=str, default=None, metavar="NAME_OR_EMAIL", help="Make the account the observer: it only checks that worker replies are visible and never posts")
+    parser.add_argument("--observer-status", action="store_true", help="Show the observer account, its proxy, login and the visibility check counters")
     parser.add_argument("--list-projects", action="store_true", help="List the projects in launch order: in the launch, accounts, topics, links, replies, daily limit")
     parser.add_argument("--project-add", type=str, default=None, metavar="NAME", help="Create a project (AI replies, no topics, no accounts)")
     parser.add_argument("--project-accounts", nargs=2, default=None, metavar=("NAME", "ACC1,ACC2"), help="Add accounts (names or emails, comma-separated) to a project")
@@ -2558,6 +2607,13 @@ def main() -> None:
 
     if args.list_accounts:
         asyncio.run(print_accounts_table(args.config))
+        return
+
+    if args.set_observer:
+        sys.exit(0 if asyncio.run(set_observer_cli(args.set_observer, args.config)) else 1)
+
+    if args.observer_status:
+        asyncio.run(observer_status_cli(args.config))
         return
 
     if args.list_projects:
@@ -2677,6 +2733,8 @@ def main() -> None:
         or args.auth_account is not None
         or args.import_accounts_file is not None
         or args.list_accounts
+        or args.set_observer is not None
+        or args.observer_status
         or args.project is not None
     )
 

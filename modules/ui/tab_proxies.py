@@ -129,7 +129,7 @@ def tab_warn(ctx: AppContext) -> bool:
     """Active accounts without a proxy, a proxy that failed its check, or the search on the own IP."""
     from database import SEARCH_PROXY_KEY
 
-    if ctx.query("SELECT 1 FROM accounts WHERE is_active = 1 AND proxy_id IS NULL LIMIT 1"):
+    if ctx.query("SELECT 1 FROM accounts WHERE is_active = 1 AND role <> 'observer' AND proxy_id IS NULL LIMIT 1"):
         return True
     if ctx.query("SELECT 1 FROM proxies WHERE last_ok = 0 LIMIT 1"):
         return True

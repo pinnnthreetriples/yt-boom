@@ -193,6 +193,19 @@ CREATE TABLE IF NOT EXISTS proxies (
 );
 
 -- Small key/value settings (`search_proxy_id`, migration flags).
+-- One row per visibility check of a posted reply: seen 1 / 0 / NULL (could not be checked), by whom it was looked at.
+CREATE TABLE IF NOT EXISTS comment_checks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    comment_id    TEXT    NOT NULL,
+    video_id      TEXT    NOT NULL,
+    account_name  TEXT    NOT NULL,
+    seen          INTEGER CHECK (seen IN (0, 1)),
+    checked_at    TEXT    NOT NULL,
+    checked_by    TEXT    NOT NULL CHECK (checked_by IN ('observer', 'anonymous'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_comment_checks_comment ON comment_checks(comment_id);
+
 CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -323,6 +336,11 @@ _PROXY_SELECT = """
     SELECT proxies.*, (SELECT COUNT(*) FROM accounts WHERE accounts.proxy_id = proxies.id) AS accounts_count
     FROM proxies
 """
+# `accounts.role`: 'worker' posts replies; 'observer' only checks that they are visible (never picked for posting,
+# warm-up, a project, share routing or the cookie robot).
+ROLE_WORKER = "worker"
+ROLE_OBSERVER = "observer"
+_ACCOUNT_ROLE_COLUMNS: tuple[tuple[str, str], ...] = (("role", "TEXT NOT NULL DEFAULT 'worker'"),)
 SEARCH_PROXY_KEY = "search_proxy_id"
 PROXY_SCHEMES = ("http", "https", "socks5", "socks4")
 
@@ -510,6 +528,11 @@ class AccountRecord(BaseModel):
     profile_applied: str | None = None
     profile_applied_at: str | None = None
     profile_name_changes: str | None = None
+    role: str = ROLE_WORKER
+
+    @property
+    def is_observer(self) -> bool:
+        return self.role == ROLE_OBSERVER
 
 
 class AccountCreate(BaseModel):
@@ -1157,8 +1180,8 @@ class Database:
                 self.seeded_now = True
             project_id = await self._fallback_project_id(conn)
             members = await conn.execute(
-                "INSERT OR IGNORE INTO project_accounts (project_id, account_id, added_at) SELECT ?, id, ? FROM accounts",
-                (project_id, now),
+                "INSERT OR IGNORE INTO project_accounts (project_id, account_id, added_at) SELECT ?, id, ? FROM accounts WHERE role <> ?",
+                (project_id, now, ROLE_OBSERVER),
             )
             await conn.execute(
                 "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1203,7 +1226,11 @@ class Database:
         existing = {str(row[1]) for row in await cursor.fetchall()}
         await cursor.close()
         for column, ddl in (
-            *_ACCOUNT_AUTH_COLUMNS, *_ACCOUNT_LIFECYCLE_COLUMNS, *_ACCOUNT_PROFILE_COLUMNS, *_ACCOUNT_PROXY_COLUMNS
+            *_ACCOUNT_AUTH_COLUMNS,
+            *_ACCOUNT_LIFECYCLE_COLUMNS,
+            *_ACCOUNT_PROFILE_COLUMNS,
+            *_ACCOUNT_PROXY_COLUMNS,
+            *_ACCOUNT_ROLE_COLUMNS,
         ):
             if column not in existing:
                 try:
@@ -1918,6 +1945,7 @@ class Database:
             )
             video_pool = await group("SELECT status, COUNT(*) FROM video_pool GROUP BY status")
 
+        visibility = await self.comment_check_counts()
         return {
             "db_path": str(self._path),
             "nodes": nodes,
@@ -1926,6 +1954,7 @@ class Database:
             "activity": activity,
             "accounts": accounts,
             "video_pool": video_pool,
+            "visibility": visibility,
             "active_slots": sum(
                 int(row[0]) for row in await self._fetch_all("SELECT COALESCE(SUM(active_slots), 0) FROM test_nodes")
             ),
@@ -2400,6 +2429,7 @@ class Database:
         geo_country: str | None | _Unset = UNSET,
         expected_country: str | None | _Unset = UNSET,
         locale: str | None | _Unset = UNSET,
+        role: str | _Unset = UNSET,
     ) -> AccountRecord:
         """Create or update an account by name.
 
@@ -2410,7 +2440,10 @@ class Database:
         `auth_status` to `pending`. `password` and `totp_secret` are stored encrypted (Windows DPAPI).
         `expected_country` (ISO alpha-2, upper-cased here) and `locale` (e.g. `pl-PL`) keep the stored value when not
         passed; an explicit None clears them. Callers validate them (`modules.geo_guard`).
+        `role` ('worker' / 'observer') keeps the stored value when not passed; a new account is a worker.
         """
+        if not isinstance(role, _Unset) and role not in (ROLE_WORKER, ROLE_OBSERVER):
+            raise ValueError(f"unknown account role: {role!r}")
         name = name.strip()
         if not name:
             raise ValueError("account name must not be empty")
@@ -2439,8 +2472,8 @@ class Database:
                     """
                     INSERT INTO accounts (name, session_path, proxy_url, proxy_id, is_active, total_replies, created_at,
                                           email, password, totp_secret, recovery_email, geo_country,
-                                          expected_country, locale)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          expected_country, locale, role)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         name,
@@ -2456,6 +2489,7 @@ class Database:
                         None if isinstance(geo_country, _Unset) else geo_country,
                         None if isinstance(expected_country, _Unset) else expected_country,
                         None if isinstance(locale, _Unset) else locale,
+                        ROLE_WORKER if isinstance(role, _Unset) else role,
                     ),
                 )
             else:
@@ -2467,6 +2501,7 @@ class Database:
                 new_country = current.geo_country if isinstance(geo_country, _Unset) else geo_country
                 new_expected = current.expected_country if isinstance(expected_country, _Unset) else expected_country
                 new_locale = current.locale if isinstance(locale, _Unset) else locale
+                new_role = current.role if isinstance(role, _Unset) else role
                 proxy_changed = False
                 if not isinstance(proxy_url, _Unset):
                     proxy_changed = await self._set_account_proxy(conn, row, new_proxy_id, reset_auth=False)
@@ -2486,6 +2521,7 @@ class Database:
                         geo_country = ?,
                         expected_country = ?,
                         locale = ?,
+                        role = ?,
                         auth_status = CASE WHEN ? THEN 'pending' ELSE auth_status END
                     WHERE id = ?
                     """,
@@ -2499,6 +2535,7 @@ class Database:
                         new_country,
                         new_expected,
                         new_locale,
+                        new_role,
                         1 if credentials_changed else 0,
                         row["id"],
                     ),
@@ -2655,16 +2692,90 @@ class Database:
         return self._account_from_row(row) if row else None
 
     async def list_active_accounts(self) -> list[AccountRecord]:
-        rows = await self._fetch_all(_ACCOUNT_SELECT + " WHERE accounts.is_active = 1 ORDER BY accounts.id ASC")
+        """Active accounts that may post; the observer is never one of them."""
+        rows = await self._fetch_all(
+            _ACCOUNT_SELECT + " WHERE accounts.is_active = 1 AND accounts.role <> ? ORDER BY accounts.id ASC",
+            (ROLE_OBSERVER,),
+        )
         return [self._account_from_row(row) for row in rows]
 
-    async def list_accounts(self, is_active: bool | None = None) -> list[AccountRecord]:
-        if is_active is None:
-            rows = await self._fetch_all(_ACCOUNT_SELECT + " ORDER BY accounts.id ASC")
-        else:
-            val = 1 if is_active else 0
-            rows = await self._fetch_all(_ACCOUNT_SELECT + " WHERE accounts.is_active = ? ORDER BY accounts.id ASC", (val,))
+    async def list_accounts(self, is_active: bool | None = None, include_observer: bool = False) -> list[AccountRecord]:
+        """All accounts; the observer is left out unless `include_observer` (it is not a posting account)."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if is_active is not None:
+            clauses.append("accounts.is_active = ?")
+            params.append(1 if is_active else 0)
+        if not include_observer:
+            clauses.append("accounts.role <> ?")
+            params.append(ROLE_OBSERVER)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = await self._fetch_all(_ACCOUNT_SELECT + where + " ORDER BY accounts.id ASC", tuple(params))
         return [self._account_from_row(row) for row in rows]
+
+    async def get_observer_account(self) -> AccountRecord | None:
+        row = await self._fetch_one(
+            _ACCOUNT_SELECT + " WHERE accounts.role = ? ORDER BY accounts.id ASC LIMIT 1", (ROLE_OBSERVER,)
+        )
+        return self._account_from_row(row) if row else None
+
+    async def set_observer(self, name: str) -> AccountRecord:
+        """Make the account `name` the one observer; a previous observer goes back to being a worker.
+
+        The observer leaves every project (it never posts); its membership is not restored when it is replaced.
+        """
+        async with self._transaction() as conn:
+            row = await (await conn.execute("SELECT id FROM accounts WHERE name = ?", (name,))).fetchone()
+            if row is None:
+                raise RecordNotFoundError(f"account {name!r} not found")
+            await conn.execute("UPDATE accounts SET role = ? WHERE role = ?", (ROLE_WORKER, ROLE_OBSERVER))
+            await conn.execute("UPDATE accounts SET role = ? WHERE id = ?", (ROLE_OBSERVER, row["id"]))
+            await conn.execute("DELETE FROM project_accounts WHERE account_id = ?", (row["id"],))
+        account = await self.get_account(name)
+        if account is None:
+            raise RecordNotFoundError(f"account {name!r} disappeared")
+        return account
+
+    # ----------------------------------------------------------- comment checks
+
+    async def record_comment_check(
+        self, comment_id: str, video_id: str, account_name: str, seen: bool | None, checked_by: str
+    ) -> None:
+        """Store one visibility check. `seen` None = could not be checked (not an error of the account)."""
+        if checked_by not in ("observer", "anonymous"):
+            raise ValueError(f"unknown checker: {checked_by!r}")
+        async with self._transaction() as conn:
+            await conn.execute(
+                "INSERT INTO comment_checks (comment_id, video_id, account_name, seen, checked_at, checked_by) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    comment_id,
+                    video_id,
+                    account_name,
+                    None if seen is None else int(seen),
+                    datetime.now(timezone.utc).isoformat(),
+                    checked_by,
+                ),
+            )
+
+    async def list_comment_checks(self, limit: int = 50, comment_id: str | None = None) -> list[dict[str, Any]]:
+        """Newest checks first; `seen` comes back as True / False / None."""
+        if comment_id:
+            rows = await self._fetch_all(
+                "SELECT * FROM comment_checks WHERE comment_id = ? ORDER BY id DESC LIMIT ?", (comment_id, limit)
+            )
+        else:
+            rows = await self._fetch_all("SELECT * FROM comment_checks ORDER BY id DESC LIMIT ?", (limit,))
+        return [{**dict(row), "seen": None if row["seen"] is None else bool(row["seen"])} for row in rows]
+
+    async def comment_check_counts(self) -> dict[str, int]:
+        """{'seen': n, 'missing': n, 'unknown': n} over the latest check of every comment."""
+        rows = await self._fetch_all(
+            "SELECT seen, COUNT(*) FROM comment_checks "
+            "WHERE id IN (SELECT MAX(id) FROM comment_checks GROUP BY comment_id) GROUP BY seen"
+        )
+        words = {1: "seen", 0: "missing", None: "unknown"}
+        return {words[row[0]]: int(row[1]) for row in rows}
 
     async def set_account_auth_status(self, account_id: int, status: str) -> None:
         async with self._transaction() as conn:
@@ -3109,8 +3220,11 @@ class Database:
             if await self._scalar(conn, "SELECT 1 FROM projects WHERE id = ?", (project_id,)) is None:
                 raise RecordNotFoundError(f"project id={project_id} not found")
             for account_id in dict.fromkeys(int(a) for a in account_ids):
-                if await self._scalar(conn, "SELECT 1 FROM accounts WHERE id = ?", (account_id,)) is None:
+                role = await self._scalar(conn, "SELECT role FROM accounts WHERE id = ?", (account_id,))
+                if role is None:
                     raise RecordNotFoundError(f"account id={account_id} not found")
+                if role == ROLE_OBSERVER:  # the observer never posts: it is in no project
+                    continue
                 cursor = await conn.execute(
                     "INSERT OR IGNORE INTO project_accounts (project_id, account_id, added_at) VALUES (?, ?, ?)",
                     (project_id, account_id, now),
@@ -3134,6 +3248,7 @@ class Database:
         query = (
             _ACCOUNT_SELECT
             + " JOIN project_accounts pa ON pa.account_id = accounts.id WHERE pa.project_id = ?"
+            + f" AND accounts.role <> '{ROLE_OBSERVER}'"
             + (" AND accounts.is_active = 1" if active_only else "")
             + " ORDER BY accounts.id ASC"
         )

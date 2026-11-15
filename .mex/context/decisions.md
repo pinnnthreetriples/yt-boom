@@ -88,7 +88,7 @@ relations:
 **Date:** 2026-10-28
 **Status:** Active
 **Decision:** Eliminate all textual button matching (e.g. `button:has-text("Reply")`, `button:has-text("Ответить")`) as primary selectors, relying on immutable structural component IDs and attributes.
-**Reasoning:** When testing Google accounts configured in non-major or regional languages (e.g. Kyrgyz `ky`, where "Reply" is rendered as `Жооп` and "Create Channel" is rendered as `Канал түзүү`), text-based locators catastrophically fail to resolve. Structural identifiers like `#reply-button-end`, `ytd-channel-creation-dialog-renderer`, and `[linked-comment-badge]` remain identical across all language locales worldwide.
+**Reasoning:** When testing Google accounts configured in non-major or regional languages (e.g. Kyrgyz `ky`, where "Reply" is rendered as `Жооп` and "Create Channel" is rendered as `Канал түзүү`), text-based locators catastrophically fail to resolve. Structural identifiers like `#reply-button-end`, `ytd-channel-creation-dialog-renderer`, and `ytd-comment-view-model[linked]` (the opened `lc=` comment; `[linked-comment-badge]` stopped matching by 2026-11-15) remain identical across all language locales worldwide.
 **Alternatives considered:** Multi-lingual dictionary lookup maps for 100+ YouTube languages (rejected — extremely brittle and prone to UI copy changes).
 **Consequences:** The bot operates deterministically in any language (English, Russian, Kyrgyz, Turkish, Spanish, etc.).
 

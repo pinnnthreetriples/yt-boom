@@ -56,6 +56,7 @@ _ICONS: dict[str, tuple[str, str]] = {
     # visibility check of a published reply: seen by anonymous visitors / not confirmed
     "seen": ("🟢", "●"),
     "unseen": ("🟡", "!"),
+    "observer": ("🔭", "◉"),
     # target and replies
     "topic": ("🔍", "?"),
     "links": ("🔗", "&"),

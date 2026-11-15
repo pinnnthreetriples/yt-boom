@@ -141,7 +141,7 @@ def status_cells(ctx: AppContext) -> list[Cell]:
         return [Cell("config.yaml не читается", "err")]
     if ctx.schema_error:
         return [Cell("база не обновилась", "err")]
-    accounts = ctx.query("SELECT is_active, proxy_id FROM accounts")
+    accounts = ctx.query("SELECT is_active, proxy_id FROM accounts WHERE role <> 'observer'")
     if not accounts:
         return [Cell("нет аккаунтов", "warn")]
     if not _logged_in_names(cfg):

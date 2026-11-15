@@ -22,6 +22,7 @@ from database import (
 from modules.account_warmer import AccountWarmer
 from modules.comment_visibility import (
     CommentVisibilityChecker,
+    close_checker,
     make_visibility_checker,
     visibility_wait_limit,
     watch_and_record,
@@ -168,7 +169,7 @@ class MultiAccountOrchestrator:
         self._warmup_slot = asyncio.Semaphore(1)  # one warm-up browser at a time
         # An injected runner_factory means no real YouTube behind the runners (tests): nothing to look for then.
         self._visibility = visibility_checker or (
-            make_visibility_checker(self._cfg, self._collector) if runner_factory is None else None
+            make_visibility_checker(self._cfg, self._collector, self._db) if runner_factory is None else None
         )
         self._visibility_tasks: set[asyncio.Task[Any]] = set()
 
@@ -280,6 +281,8 @@ class MultiAccountOrchestrator:
 
         Accounts without credentials (`default`, manual `--login`) keep working whatever their status says.
         """
+        if acc.is_observer:  # belt and braces: the account lists already leave it out
+            return False
         if acc.auth_status == "failed":
             return False
         saved_session = "heartbeat_state.bin" if acc.engine == "chrome" else "cookies.sqlite"  # Chrome's cookie DB is encrypted
@@ -402,12 +405,14 @@ class MultiAccountOrchestrator:
         except asyncio.TimeoutError:
             logger.warning("[ВИДИМОСТЬ] Проверка не уложилась в {:.0f}с и отменена", limit)
             await self._cancel_visibility_checks()
+        await close_checker(self._visibility)  # the observer's HTTP session (a plain checker holds nothing)
 
     async def _cancel_visibility_checks(self) -> None:
         tasks = list(self._visibility_tasks)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await close_checker(self._visibility)
 
     def _gate_account(self, acc: AccountRecord) -> None:
         """Stop `acc` for this run: its remaining videos stay in the pool for the next one."""

@@ -829,7 +829,7 @@ def add_preview(lines: list[str], known: set[str]) -> list[list[Cell]]:
 def add_field(ctx: AppContext) -> Step:
     from modules.lifecycle_engine import MODE_LABELS
 
-    known = {a.email.lower() for a in ctx.db(lambda db: db.list_accounts()) if a.email}
+    known = {a.email.lower() for a in ctx.db(lambda db: db.list_accounts(include_observer=True)) if a.email}
 
     def submit(text: str) -> Step:
         from modules.account_menu_logic import clean_pasted_lines, count_account_lines

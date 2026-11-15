@@ -888,10 +888,10 @@ class YouTubeRunner:
             ])
 
         generic = [
-            # 2. Reply button inside highlighted sub-comment (&lc= permalink)
-            "ytd-comment-view-model[linked-comment-badge] #reply-button-end :is(button, a)",
-            "ytd-comment-view-model:has(#linked-comment-badge) #reply-button-end :is(button, a)",
-            "ytd-comment-renderer[linked-comment-badge] #reply-button-end :is(button, a)",
+            # 2. Reply button inside highlighted sub-comment (&lc= permalink). Live 2026-11-15: the opened comment
+            # carries the `linked` attribute; `div#linked-comment-badge` sits in every view-model, so never key on it.
+            "ytd-comment-view-model[linked] #reply-button-end :is(button, a)",
+            "ytd-comment-renderer[linked] #reply-button-end :is(button, a)",
             ".badge-shape-wiz--highlighted >> xpath=ancestor::ytd-comment-view-model >> #reply-button-end :is(button, a)",
             # 3. Reply button inside expanded replies container (#replies #expander)
             "#replies #expander ytd-comment-view-model #reply-button-end :is(button, a)",

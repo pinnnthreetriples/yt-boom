@@ -25,6 +25,7 @@ An automated Python 3.11+ web testing and telemetry pipeline driving persistent 
 - List accounts: `python youtube_bot.py --list-accounts`
 - Run / search & reply: `python youtube_bot.py --dry-run` runs the projects «в запуске» one after another, `--project NAME` only that one; `python youtube_bot.py --search "<topic>" --dry-run` without `--project` is the old global search (all active accounts, filters / `--max-videos` / `--comments-per-video` default to `collector.*`, `--max-views 0` / `--max-age-hours 0` turn a limit off, `--account NAME` = only that account); with `--project` the topic replaces the project's topics for this run only
 - Projects: `python youtube_bot.py --list-projects`, `--project-add NAME`, `--project-accounts NAME acc1,acc2`, `--project-remove-account NAME acc`; `--videos-file FILE` loads into `--project` (default «Основной»)
+- Observer account (checks reply visibility, never posts): tab «Запуск» → «Наблюдатель»; `python youtube_bot.py --set-observer <name>`, `--observer-status`
 - Check database status: `python youtube_bot.py --status`
 - MEX memory check: `mex doctor` and `mex check`
 

@@ -420,8 +420,10 @@ def _logged_in_names(cfg: Any) -> list[str]:
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
         try:
             try:
-                rows = conn.execute("SELECT name, session_path, engine FROM accounts ORDER BY id").fetchall()
-            except sqlite3.OperationalError:  # a database from before the engine column
+                rows = conn.execute(
+                    "SELECT name, session_path, engine FROM accounts WHERE role <> 'observer' ORDER BY id"
+                ).fetchall()
+            except sqlite3.OperationalError:  # a database from before the engine / role columns
                 rows = [(*row, "camoufox") for row in conn.execute("SELECT name, session_path FROM accounts ORDER BY id")]
         finally:
             conn.close()

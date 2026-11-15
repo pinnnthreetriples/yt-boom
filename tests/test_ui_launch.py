@@ -184,7 +184,8 @@ class LaunchCase(unittest.TestCase):
         c = self.controller()
         c.press("down")
         c.press("down")
-        c.press("down")  # start, window, «Проверка видимости», journal
+        c.press("down")
+        c.press("down")  # start, window, «Проверка видимости», «Наблюдатель», journal
         c.press("enter")
         out = self.screen(c)
         self.assertIn("журнал", out)
