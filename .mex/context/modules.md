@@ -53,7 +53,7 @@ The `modules/` directory contains the core implementation layer of the YouTube c
 id: mx_01M69V83D1FY43YN45W86J7DN9
 type: fact
 status: promoted
-revision: 2
+revision: 3
 metadata:
   aliases:
     - reply button selector
@@ -73,8 +73,8 @@ provenance:
 grounds_to:
   - file: modules/youtube_runner.py
     node: class:85ef316144e0d4344be7913a9cee5599
-    fingerprint: mh2:64:8B0ACCC6AJLGjAAjMu0ANhf9AJ2IhwCJo2MAGsYCAILzvAANINUAZ2LrAEL38AA6Ly4BCbx_AGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgEiNqQAAFmgABAKDQCBl2sAcycWADZV3gBf6R4AoWVhAHY6tgAZISIAK97AAQwfWAAGsfkAKe9tAAonowAY3IcBJs3fAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QAy5ckAanIyAU1lUgDq91IACsL3ACEF6AB1baAAK2e3ABB75wD607UABo7jAIoZCgB-ffsAECwLAV1jqwAtEfoAPyvlAAA
-    bodyHash: 4add449f78da828b3cb9405beb660d06c31a6d764a966463648a29e2cc8aae79
+    fingerprint: mh2:64:qCsACCC6AJLGjAAjMu0AEP2QAJ2IhwCJo2MAGsYCAILzvAACLoYAZ2LrAEL38AA6Ly4Ak8mHAGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgDSWlUAAFmgABAKDQCBl2sAcycWADZV3gBf6R4APwnjAHY6tgAVlAMAKEOAAQwfWAAGsfkAKe9tAAonowATjUcAjZxYAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AQ9eOADim4QADeqQAanIyAU1lUgDawogAGNgkACEF6AAHvq4AK2e3ABB75wCbMpAABo7jAIMGqwBMnEIAECwLAV1jqwAtEfoAPyvlAAA
+    bodyHash: 909bc63eaa53705e630bd79c87718aa0aa2f9c3415625a484e44ade17d54a4da
 -->
 ## Dynamic Reply Button Structural Selector
 
@@ -84,7 +84,7 @@ YouTube renders a standard button tag inside #reply-button-end for accounts with
 id: mx_01M69V83EEQ4MW6R1704RH4P3T
 type: fact
 status: promoted
-revision: 2
+revision: 3
 metadata:
   aliases:
     - first reply modal
@@ -104,8 +104,8 @@ provenance:
 grounds_to:
   - file: modules/youtube_runner.py
     node: class:85ef316144e0d4344be7913a9cee5599
-    fingerprint: mh2:64:8B0ACCC6AJLGjAAjMu0ANhf9AJ2IhwCJo2MAGsYCAILzvAANINUAZ2LrAEL38AA6Ly4BCbx_AGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgEiNqQAAFmgABAKDQCBl2sAcycWADZV3gBf6R4AoWVhAHY6tgAZISIAK97AAQwfWAAGsfkAKe9tAAonowAY3IcBJs3fAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QAy5ckAanIyAU1lUgDq91IACsL3ACEF6AB1baAAK2e3ABB75wD607UABo7jAIoZCgB-ffsAECwLAV1jqwAtEfoAPyvlAAA
-    bodyHash: 4add449f78da828b3cb9405beb660d06c31a6d764a966463648a29e2cc8aae79
+    fingerprint: mh2:64:qCsACCC6AJLGjAAjMu0AEP2QAJ2IhwCJo2MAGsYCAILzvAACLoYAZ2LrAEL38AA6Ly4Ak8mHAGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgDSWlUAAFmgABAKDQCBl2sAcycWADZV3gBf6R4APwnjAHY6tgAVlAMAKEOAAQwfWAAGsfkAKe9tAAonowATjUcAjZxYAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AQ9eOADim4QADeqQAanIyAU1lUgDawogAGNgkACEF6AAHvq4AK2e3ABB75wCbMpAABo7jAIMGqwBMnEIAECwLAV1jqwAtEfoAPyvlAAA
+    bodyHash: 909bc63eaa53705e630bd79c87718aa0aa2f9c3415625a484e44ade17d54a4da
 -->
 ## In-Situ Channel Creation Dialog Confirmation
 
@@ -115,7 +115,7 @@ When an account without a channel triggers a reply, YouTube displays an in-situ 
 id: mx_01M69V83EVJS28SR4738FTRSWZ
 type: fact
 status: promoted
-revision: 2
+revision: 3
 metadata:
   aliases:
     - gecko multi-process
@@ -135,8 +135,8 @@ provenance:
 grounds_to:
   - file: modules/youtube_runner.py
     node: class:85ef316144e0d4344be7913a9cee5599
-    fingerprint: mh2:64:8B0ACCC6AJLGjAAjMu0ANhf9AJ2IhwCJo2MAGsYCAILzvAANINUAZ2LrAEL38AA6Ly4BCbx_AGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgEiNqQAAFmgABAKDQCBl2sAcycWADZV3gBf6R4AoWVhAHY6tgAZISIAK97AAQwfWAAGsfkAKe9tAAonowAY3IcBJs3fAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AS7HsADim4QAy5ckAanIyAU1lUgDq91IACsL3ACEF6AB1baAAK2e3ABB75wD607UABo7jAIoZCgB-ffsAECwLAV1jqwAtEfoAPyvlAAA
-    bodyHash: 4add449f78da828b3cb9405beb660d06c31a6d764a966463648a29e2cc8aae79
+    fingerprint: mh2:64:qCsACCC6AJLGjAAjMu0AEP2QAJ2IhwCJo2MAGsYCAILzvAACLoYAZ2LrAEL38AA6Ly4Ak8mHAGUTMgAnEbwAC1V2ACz60gBzStIAm1_-ABe5FgDSWlUAAFmgABAKDQCBl2sAcycWADZV3gBf6R4APwnjAHY6tgAVlAMAKEOAAQwfWAAGsfkAKe9tAAonowATjUcAjZxYAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwBViK0AQ9eOADim4QADeqQAanIyAU1lUgDawogAGNgkACEF6AAHvq4AK2e3ABB75wCbMpAABo7jAIMGqwBMnEIAECwLAV1jqwAtEfoAPyvlAAA
+    bodyHash: 909bc63eaa53705e630bd79c87718aa0aa2f9c3415625a484e44ade17d54a4da
 -->
 ## Gecko Multi-Process and Background Performance Preferences
 
@@ -146,7 +146,7 @@ Camoufox browser launch options in _launch_options explicitly set dom.min_backgr
 id: mx_01M69V83F787NRQF2BY9CP7PFJ
 type: fact
 status: promoted
-revision: 2
+revision: 3
 metadata:
   aliases:
     - aria-live false error
@@ -166,8 +166,8 @@ provenance:
 grounds_to:
   - file: modules/google_authenticator.py
     node: class:c0c2d2ee349a3dee74942def60291483
-    fingerprint: mh2:64:5RsAiTAnAJLGjAAjMu0ANhf9AJ2IhwAvuhQAGsYCAILzvAACLoYAU7PCAF6OnACr5c4ABd5_AI6e6QAnEbwAicbSAYxy0QAcio0Bu5WOABe5FgCDROgAAFmgABAKDQCV-t8Bi3h5ADZV3gBf6R4AoWVhABMbaAAZISIApav2AQwfWAAoDkcAKe9tAD2wZQATjUcBnxoTAAz3cwACj6QAV0JzAPZ2egB73HoADJzBABNTjwBViK0ANKY-AIPpDgD9iq8AanIyAD5FVADNt_sAGNgkALsctAAHvq4AK2e3ABB75wAN8k0AGeHYAIoZCgELVL8AECwLAGgbXgAJHdYAHRaTAAA
-    bodyHash: a2bbbcbad5126a0b9e2f8d4e6c563776c537af6a1e4d9cabf0f44b93b3f4707e
+    fingerprint: mh2:64:1CIAiTAnAI3zKQAjMu0ANhf9AJ2IhwAvuhQALxSOAILzvAACLoYAU7PCAAX8NwCr5c4AgnIsAI6e6QAnEbwAicbSACz60gAcio0ARNe8ACDD7gCDROgAAFmgABAKDQCV-t8AcycWADZV3gBf6R4AoWVhABMbaAAZISIAK97AAQwfWAAoDkcAKe9tAA2ThQATjUcAFbWSAAz3cwACj6QAV0JzAD0_ugB73HoADJzBABNTjwBViK0ANKY-AIPpDgAP3KsAanIyAD5FVADNt_sAGNgkALsctAAHvq4AAbfHALyhcgAN8k0AGeHYADNBbAClF9cAECwLAGgbXgAJHdYAHRaTAAA
+    bodyHash: c20d5543b8858e184254f73ff0054c9dea74afe335b35558c9cbb797dcea311a
 -->
 ## Material 3 Informative Banner Filtering
 
@@ -177,7 +177,7 @@ _visible_error_text checks aria-live=assertive and role=alert elements while fil
 id: mx_01M69V83FJG4PY67ZHZJJT34H9
 type: fact
 status: promoted
-revision: 2
+revision: 3
 metadata:
   aliases:
     - google passkey prompt
@@ -197,8 +197,8 @@ provenance:
 grounds_to:
   - file: modules/google_authenticator.py
     node: class:c0c2d2ee349a3dee74942def60291483
-    fingerprint: mh2:64:5RsAiTAnAJLGjAAjMu0ANhf9AJ2IhwAvuhQAGsYCAILzvAACLoYAU7PCAF6OnACr5c4ABd5_AI6e6QAnEbwAicbSAYxy0QAcio0Bu5WOABe5FgCDROgAAFmgABAKDQCV-t8Bi3h5ADZV3gBf6R4AoWVhABMbaAAZISIApav2AQwfWAAoDkcAKe9tAD2wZQATjUcBnxoTAAz3cwACj6QAV0JzAPZ2egB73HoADJzBABNTjwBViK0ANKY-AIPpDgD9iq8AanIyAD5FVADNt_sAGNgkALsctAAHvq4AK2e3ABB75wAN8k0AGeHYAIoZCgELVL8AECwLAGgbXgAJHdYAHRaTAAA
-    bodyHash: a2bbbcbad5126a0b9e2f8d4e6c563776c537af6a1e4d9cabf0f44b93b3f4707e
+    fingerprint: mh2:64:1CIAiTAnAI3zKQAjMu0ANhf9AJ2IhwAvuhQALxSOAILzvAACLoYAU7PCAAX8NwCr5c4AgnIsAI6e6QAnEbwAicbSACz60gAcio0ARNe8ACDD7gCDROgAAFmgABAKDQCV-t8AcycWADZV3gBf6R4AoWVhABMbaAAZISIAK97AAQwfWAAoDkcAKe9tAA2ThQATjUcAFbWSAAz3cwACj6QAV0JzAD0_ugB73HoADJzBABNTjwBViK0ANKY-AIPpDgAP3KsAanIyAD5FVADNt_sAGNgkALsctAAHvq4AAbfHALyhcgAN8k0AGeHYADNBbAClF9cAECwLAGgbXgAJHdYAHRaTAAA
+    bodyHash: c20d5543b8858e184254f73ff0054c9dea74afe335b35558c9cbb797dcea311a
 -->
 ## Google Sign-in Security Speedbump Interstitial Dismissal
 
@@ -239,7 +239,7 @@ generate_fresh_totp checks remaining time in the current 30-second RFC 6238 wind
 id: mx_01M69V83G98FV8QFYQ5BZE6WZD
 type: fact
 status: promoted
-revision: 2
+revision: 3
 metadata:
   aliases:
     - session fingerprint reuse
@@ -259,8 +259,8 @@ provenance:
 grounds_to:
   - file: modules/fingerprint_manager.py
     node: function:395aae1edefb6a66fa1262fbd0678998
-    fingerprint: mh2:64:4AEBETRmA1BViQPBgCIAYcNMADitfwHL0vAAZUJaAQMmtQD7tsIDC6s3ARFMcAAIJ50ChJDOApdzOgBJZz0Bpv1yALJDigEWGqoCO9WzAVCoDQCmqrMB6BhkABuabACV-t8B2FU8A1kiEwLwxawA_X64ATWQzQFmOe4AK97ABQI_eABDbkcCj9O4AFsP2AFioVwClhKsAAz3cwNlL5kAV0JzAcS_ugQ6czoADJzBBjc6wABViK0AS7HsAP2N5gKCzWUBKHU_AV4XVQDq91IBpc_cALsctAB7AUYA_vFbASlVdwM68x0AG33ZAMpWpQMGFEgBCgpqAXsehAFfY3kAHRaTAghmdW5jdGlvbgZtZXRob2QOAD_MefwjYjq5gXgNwiu1zTgAUjv8APXEa7XKQE3l5aMfyQC9E-jCKizVslyenTCrSePwATavbYzSkO1o5nuZg545sPQBN3v7YlSNqOgTk4c1v2gjxQFHtbXncurKuZB4EHv07dueAU_npnhytWH50_LWKG9uhB4BXSt0bN8zOrTVzulccMoZLQFiIo_en1e4B-jiVOsSmFOMAZjQxHqw4qfrZe6Rf3AMHJAB45gY6LJikwJWN3Z6hRzatwHqqU0ej5fW-ytqx3ByJ4fzAfnvR87WP8dNwIAET5_maDUB-t0XXX7HzXlA4EO600xEtA
-    bodyHash: 31b0556c265976798c91866abe9060cb872167237769caeaa5d6871f71c28136
+    fingerprint: mh2:64:7wEBETRmA1BViQPBgCIAYcNMADitfwHL0vAAZUJaAQMmtQD7tsIDC6s3ARFMcAAIJ50ChJDOApdzOgBJZz0Bpv1yALJDigEWGqoCO9WzAVCoDQCmqrMB6BhkABuabACV-t8B2FU8A1kiEwLwxawA_X64ATWQzQFmOe4AK97ABQI_eABDbkcCj9O4AFsP2AFioVwClhKsAAz3cwNlL5kAV0JzAcS_ugQ6czoADJzBBjc6wABViK0AS7HsAP2N5gKCzWUBKHU_AV4XVQDq91IBpc_cALsctAB7AUYA_vFbASlVdwM68x0AG33ZAMpWpQMGFEgBCgpqAXsehAFfY3kAHRaTAghmdW5jdGlvbgZtZXRob2QQAD_MefwjYjq5gXgNwiu1zTgAUjv8APXEa7XKQE3l5aMfyQBqW_oUOIr_Un79tYl1R05dAL0T6MIqLNWyXJ6dMKtJ4_ABNq9tjNKQ7Wjme5mDnjmw9AE3e_tiVI2o6BOThzW_aCPFAUe1tedy6sq5kHgQe_Tt254BT-emeHK1YfnT8tYob26EHgFdK3Rs3zM6tNXO6VxwyhktAWIij96fV7gH6OJU6xKYU4wBmNDEerDip-tl7pF_cAwckAHjmBjosmKTAlY3dnqFHNq3AeqpTR6Pl9b7K2rHcHInh_MB7ZdiNHf4GTKqO2L-aq1x3QH570fO1j_HTcCABE-f5mg1AfrdF11-x815QOBDutNMRLQ
+    bodyHash: 44aeb095db8f144aad6aca91fcd6fb0c4774a18bbfb6001dc7bc7a52e19040e8
 -->
 ## Persistent Hardware Fingerprint Pinning
 
@@ -332,7 +332,7 @@ parse_account_line splits colon-separated account strings into email, password, 
 id: mx_01M69V83HGBPRPMNPJY0A2P93M
 type: fact
 status: promoted
-revision: 2
+revision: 3
 metadata:
   aliases:
     - bezier mouse movement
@@ -352,8 +352,8 @@ provenance:
 grounds_to:
   - file: modules/interaction_simulator.py
     node: class:44282ff915cd75804344cb644948bd70
-    fingerprint: mh2:64:xxQAiTAnAJLGjAAjMu0ANhf9AKWZnwCTUcMAGsYCAIOsugAGBCYAU7PCARFMcACr5c4ACJr0ARWM9wAnEbwAC1V2AYxy0QAh0FsBFGhLACDD7gBkzbUAAFmgABAKDQCV-t8AcycWAI8CgABlYmEAoWVhALXd3QAVlAMA8GJxAnBCUwBDbkcAKe9tAD2wZQATjUcBJs3fAAz3cwACj6QAV0JzAD0_ugB73HoADJzBABNTjwAMECUAdqjpACkmIwEiNhEAanIyAN6XYAGkXUkACsL3ACEF6ACMdGUApwA_ALyhcgBFGVwAG33ZAB4bowAWwL8AEGZ6ATlobwAhuxQAsvBNAAA
-    bodyHash: 9ceed63b414402405fd65c32965851140ee685cc80f6c43a06b924f3784634ac
+    fingerprint: mh2:64:tSUAiTAnAJLGjAAjMu0AJTZMAJ2IhwCTUcMAGsYCAILzvAACLoYAU7PCAGrXJgAj37oACJr0AQO9CgAnEbwACN8kAYxy0QAh0FsBFGhLABe5FgBkzbUAAFmgABAKDQCBl2sAcycWAEISzwBf6R4AoWVhALXd3QAVlAMAK97AAghzggBDbkcAKe9tAD2wZQATjUcAcq_kAAz3cwACj6QAV0JzADkx3gBYL7kADJzBABNTjwAMECUAQ9eOACkmIwBpffIAanIyAEBXKABelfYACsL3ALsctAB00JsAAbfHALyhcgBFGVwABo7jAB4bowAWwL8AECwLAGGUCQAhuxQAsvBNAAA
+    bodyHash: 5597465655148f7ace6504b7058185037845ea61b997c609f44d71f02fd8f526
 -->
 ## Humanized Bezier Curve Mouse Movement and Typing Simulation
 
@@ -394,7 +394,7 @@ normalize_text transforms AI-generated reply payloads by replacing em/en-dashes 
 id: mx_01M69V83JBDF0G7P1FQ3N7GYYT
 type: fact
 status: promoted
-revision: 2
+revision: 3
 metadata:
   aliases:
     - multi account concurrency
@@ -414,8 +414,8 @@ provenance:
 grounds_to:
   - file: modules/multi_account_orchestrator.py
     node: class:9f36d77b1dd835ea96e34e5417aa8189
-    fingerprint: mh2:64:qx4ACCC6AJLGjAB8NIgANhf9AJ2IhwAjdmUAGsYCAILzvAACLoYAU7PCAInIMAA6Ly4ABd5_AI6e6QBJZz0AicbSADgz6wBmH7wBFGhLABe5FgC4L80AU7KSABAKDQBXiaIAcycWAEISzwBf6R4AoWVhALXd3QAVlAMAK97AAW5k4wBDbkcAKe9tAA2ThQFioVwAFbWSAAz3cwACj6QAV0JzADnwXgBYL7kADJzBABNTjwA6M2gAS7HsADim4QD9iq8AeSW1AGQeYADq91IBEhruALsctAB1baAAK2e3AFkUCwAaD6UAG33ZADNBbAClF9cAH2ByAHex5gAtEfoAhMkDAAA
-    bodyHash: a75fc99182321442bf4b9a472bc85f200bd3b8ba2b3aec25f8143d1c50b6f6b3
+    fingerprint: mh2:64:ij0ACCC6AJLGjAB4a9QAC4SdAAfdMwEQ_kUABPAMAILzvAACLoYAU7PCAAX8NwA6Ly4ABd5_AHzbsABJZz0AicbSADgz6wAlcZoARNe8ABe5FgC8IL4AU7KSABAKDQBXiaIAcycWADZV3gDLTecAJqg4ALue2QAVlAMAK97AAQwfWABDbkcAKe9tAAonowAY3IcAFbWSAAz3cwACj6QAV0JzADkx3gBYL7kADJzBABNTjwA6M2gAS7HsADim4QD0FQIAanIyAGQeYACzmAwBEhruALsctAB1baAAK2e3ABB75wAaD6UAGeHYADNBbAClF9cADINHAHex5gAtEfoAhMkDAAA
+    bodyHash: 871a5fab1a1afdf4cf825bc480ae26242a5a2bf4f1ef3b7b15c2d4cb9d7e281e
 -->
 ## Multi-Account Parallel Execution Modes
 
@@ -425,7 +425,7 @@ MultiAccountOrchestrator manages parallel execution across active Google account
 id: mx_01M69V83JTY6Z0M6ZMKNHGT9YS
 type: fact
 status: promoted
-revision: 1
+revision: 2
 metadata:
   aliases:
     - video pool deduplication
@@ -445,8 +445,8 @@ provenance:
 grounds_to:
   - file: modules/pool_manager.py
     node: class:bcf4c7c4c38abf7417306c8787b1a962
-    fingerprint: mh2:64:7gICQK18AJLGjAB4a9QANhf9A3eZWwHL0vAFDbohA3gb4ADCLh4A82y_AAX8NwCr5c4ChJDOARtj7wC7d3kAicbSAuGmtwYeIVsFt8jXACDD7gEiNqQBmO9_ABuabACV-t8EXVuZArhziwWWbicAoWVhAxh28QAZISIAK97AAYlpqwBDbkcEP-OaAAonowAY3IcBnxoTANEtOwE3jLwBukRqAcS_ugB73HoADJzBAaXjkQBViK0AjL7PAZCCQgLKD1gHJb7bAU1lUgDq91IBpc_cBPz-ngcbNVIApwA_BC9MDgM68x0DIZJuAq0_oQClF9cAH2ByAcm9CQAxnL0AsvBNAAA
-    bodyHash: 222f57cbdb8c357d95b41cb5dc20563528513e58f3d4c1c1e4ee2109657aa40e
+    fingerprint: mh2:64:pgMCQK18AJLGjAB4a9QANhf9A3eZWwHL0vAAZUJaAM4iSgDCLh4A82y_AAX8NwCr5c4ChJDOARtj7wBJZz0AicbSAYxy0QYeIVsFt8jXACDD7gEiNqQBmO9_ABuabACV-t8EXVuZArhziwWWbicAoWVhAxh28QAZISIAK97AAYlpqwBDbkcEP-OaAAonowAY3IcDm9PpANEtOwACj6QBukRqAcS_ugB73HoADJzBAaXjkQBViK0AjL7PAZCCQgLKD1gFMkYvAU1lUgDq91IBpc_cBPz-ngcbNVIBgi1cASlVdwM68x0BbzVhAq0_oQClF9cAH2ByAcm9CQAxnL0AsvBNAAA
+    bodyHash: 8667e92fbe9724f4f2d9a316970cf3190cccf45535ee16eddaa51593a9c73fd3
 -->
 ## Video Pool Target Queue Tracking
 

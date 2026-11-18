@@ -16,6 +16,23 @@ edges:
     condition: when the account needs the YouTube warm-up (after sign-in), not the pre-sign-in cookies
 grounds_to: []
 last_updated: 2026-11-05
+mex:
+  id: mx_01M7P0J6KKMHS8RE2TP2NJWXQP
+  type: pattern
+  status: promoted
+  revision: 4
+  title: cookie-robot
+  relations:
+    - type: related_to
+      target: mx_01M69V83DQFH77W8JJ4KS4EWP9
+      note: when reviewing the cookie robot implementation details
+    - type: related_to
+      target: mx_01M69VC00B4PVK7X08CM18XG49
+      note: when the sign-in itself fails or asks for a captcha
+    - type: related_to
+      target: mx_01M69X1XBKX43KY14D8945W9XH
+      note: when the account needs the YouTube warm-up (after sign-in), not the
+        pre-sign-in cookies
 ---
 
 # Pattern: Cookie Robot (pre-sign-in profile warming)

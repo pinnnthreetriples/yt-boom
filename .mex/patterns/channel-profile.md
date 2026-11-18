@@ -14,6 +14,19 @@ edges:
     condition: when the account is not signed in yet
 grounds_to: []
 last_updated: 2026-11-03
+mex:
+  id: mx_01M7P0J6FMHJFEKMGNXJ0GJYB9
+  type: pattern
+  status: promoted
+  revision: 3
+  title: channel-profile
+  relations:
+    - type: related_to
+      target: mx_01M69V83DQFH77W8JJ4KS4EWP9
+      note: when reviewing account_menu_logic or profile_manager implementation details
+    - type: related_to
+      target: mx_01M69VC00B4PVK7X08CM18XG49
+      note: when the account is not signed in yet
 ---
 
 # Pattern: Channel Profile (nickname, description, avatar)

@@ -14,7 +14,7 @@ edges:
   - target: context/modules.md
     condition: when looking up specific module interfaces
 grounds_to: []
-last_updated: 2026-10-31
+last_updated: 2026-11-18
 mex:
   id: mx_01M69TVZY58165JDM14J2ZVZZM
   type: convention
@@ -68,6 +68,12 @@ mex:
   # Decrypt on read
   plain_pass = reveal_secret(row["password"])
   ```
+- **Network requests ignore the environment**: every curl_cffi session that checks a proxy, looks up the machine's own IP or calls YouTube is created with `trust_env=False` (otherwise `NO_PROXY` / `HTTP_PROXY` / the Windows system proxy can bypass or replace the proxy). An echo-service answer is accepted only through `geo_guard.parse_echo_ip` (a real IP address), never by length.
+  ```python
+  async with AsyncSession(proxy=curl_proxy_url(proxy), timeout=timeout, trust_env=False) as session:
+      resp = await session.get(url, allow_redirects=False)
+      ip = parse_echo_ip(resp.text)  # None for an error page / redirect / bad JSON
+  ```
 - **TOTP Window Rollover Guard**:
   ```python
   # Always ensure fresh TOTP window to avoid submitting expired tokens
@@ -79,5 +85,6 @@ Before presenting or committing code:
 - [ ] All database queries are parameterized and run via `database.Database` methods.
 - [ ] Account secrets (`password`, `totp_secret`) are wrapped in `protect_secret()` before writing to disk/database.
 - [ ] YouTube DOM interactions target structural IDs (`#reply-button-end :is(button, a)`) without locale dependencies.
+- [ ] curl_cffi sessions use `trust_env=False`; proxy checks are tested against loopback servers (`tests/test_proxy_check_live.py`), not by mocking `_fetch_ip`.
 - [ ] Browser launches use pinned fingerprints (`modules.fingerprint_manager`) and persistent contexts.
 - [ ] All automated tests pass: `python run_tests.py` returns 100% OK across all test cases.
