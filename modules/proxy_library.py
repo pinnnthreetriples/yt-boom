@@ -18,7 +18,7 @@ import yaml
 from loguru import logger
 
 from config import AccountSettings, ProxyUnavailableError, load_config, mask_proxy_url
-from database import SEARCH_PROXY_KEY, AccountRecord, Database, ProxyRecord
+from database import SEARCH_PROXY_KEY, AccountRecord, Database, ProxyRecord, proxy_country_label
 from modules.projects import open_database
 
 CONFIG_MIGRATION_KEY = "config_proxies_migrated_at"
@@ -54,7 +54,7 @@ class ConfigMigrationReport:
 
 
 def _proxy_text(record: ProxyRecord) -> str:
-    country = record.country or record.last_exit_country
+    country = proxy_country_label(record)
     label = f" «{record.label}»" if record.label else ""
     return f"через прокси{label} {record.address}" + (f" ({country})" if country else "")
 

@@ -29,6 +29,10 @@ HOST_IP_TIMEOUT = 20.0
 # httpbin hides X-Forwarded-For / Via / X-Real-Ip from its answer by default (checked against the live service).
 HEADER_ECHO_URL = "http://httpbin.org/headers?show_env=1"
 HEADER_ECHO_TIMEOUT = 15.0
+# Exit IP echo services, asked in order. libcurl with trust_env=False: neither HTTP(S)_PROXY / ALL_PROXY / NO_PROXY
+# nor the Windows system proxy can redirect or bypass the request; a redirect (captive portal) is not an answer.
+IP_ECHO_URLS = ("https://api.ipify.org?format=json", "https://icanhazip.com")
+IP_ECHO_TIMEOUT = 8.0  # per request: both services stay under EXIT_LOOKUP_TIMEOUT / HOST_IP_TIMEOUT
 SESSION_GEO_FILE = "session_geo.json"
 # Headers through which a proxy may hand the client's real address to the site.
 _LEAK_HEADERS = (
@@ -207,19 +211,69 @@ def _geo_from_record(ip: str, record: Any, paths: dict[str, Any]) -> ExitGeo:
     )
 
 
+def normalize_ip(value: str | None) -> str | None:
+    """Canonical text of an IP address (`::FFFF:1.2.3.4` -> `1.2.3.4`, `2001:DB8:0::1` -> `2001:db8::1`), else None."""
+    address = _normalize_ip(value or "")
+    return str(address) if address is not None else None
+
+
+def parse_echo_ip(text: str | None) -> str | None:
+    """The IP an echo service answered (`1.2.3.4`, `{"ip": "1.2.3.4"}`), canonical; None for anything that is not
+    exactly one IP address (an error page, `Access denied`, `{"ip": "invalid"}`)."""
+    body = (text or "").strip()
+    if body.startswith("{"):
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return None
+        body = str(data.get("ip") or "").strip() if isinstance(data, dict) else ""
+    if not body or len(body) > 64:
+        return None
+    try:
+        address = ipaddress.ip_address(body)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return str(address.ipv4_mapped)
+    return str(address)
+
+
+def _fetch_public_ip(proxy_url: str | None, timeout: float = IP_ECHO_TIMEOUT) -> str:
+    """Blocking: the exit IP through `proxy_url` (None = direct), asked of IP_ECHO_URLS in order with libcurl:
+    `trust_env=False` (no env / Windows system proxy, no NO_PROXY bypass), no redirects, strict TLS. Raises when no
+    service answers with a valid IP; the error never carries the proxy string."""
+    from curl_cffi import requests as curl_requests
+
+    from modules.session_heartbeat import curl_proxy_url
+
+    proxy = curl_proxy_url(proxy_url) if proxy_url else None
+    failure = "no answer"
+    with curl_requests.Session(trust_env=False) as session:
+        for url in IP_ECHO_URLS:
+            try:
+                response = session.get(url, proxy=proxy, allow_redirects=False, timeout=timeout)
+            except Exception as exc:  # the message may carry the proxy URL: only the type is kept
+                failure = type(exc).__name__
+                continue
+            if response.status_code != 200:
+                failure = f"status {response.status_code}"
+                continue
+            ip = parse_echo_ip(response.text)
+            if ip:
+                return ip
+            failure = "not an IP"
+    raise RuntimeError(f"exit IP lookup failed: {failure}")
+
+
 def _lookup_exit_geo(proxy_url: str | None) -> ExitGeo | None:
-    """Blocking: exit IP through the proxy (Camoufox's own `public_ip`, socks5h so DNS stays on the proxy), then country,
-    time zone and coordinates from the GeoIP database Camoufox uses for `geoip=True` (its configured `paths`).
+    """Blocking: exit IP through the proxy (libcurl, socks5h so DNS stays on the proxy, environment and system proxies
+    ignored), then country, time zone and coordinates from the GeoIP database Camoufox uses for `geoip=True` (its
+    configured `paths`).
 
     The database is not downloaded here. When it is missing or unreadable the IP is still returned (geo fields None):
     the proxy provably answers. A failing IP lookup raises.
     """
-    from camoufox.ip import public_ip
-
-    from modules.session_heartbeat import curl_proxy_url
-
-    lookup = getattr(public_ip, "__wrapped__", public_ip)  # Camoufox caches an IP per proxy forever; the TTL here is ours
-    return _geo_for_ip(lookup(curl_proxy_url(proxy_url)))
+    return _geo_for_ip(_fetch_public_ip(proxy_url))
 
 
 def _geo_for_ip(ip: str) -> ExitGeo:
@@ -332,10 +386,9 @@ def geoip_database_status() -> tuple[bool, str]:
 
 
 def _lookup_host_ip() -> str:
-    """Blocking: the machine's real public IP, a DIRECT request (no proxy) by Camoufox's own `public_ip`."""
-    from camoufox.ip import public_ip
-
-    return getattr(public_ip, "__wrapped__", public_ip)(None)
+    """Blocking: the machine's real public IP, a DIRECT request: libcurl with trust_env=False, so neither the
+    environment (HTTP(S)_PROXY, ALL_PROXY) nor the Windows system proxy / a VPN proxy answers in its place."""
+    return _fetch_public_ip(None)
 
 
 async def resolve_host_ip(timeout: float = HOST_IP_TIMEOUT) -> str | None:
@@ -346,8 +399,9 @@ async def resolve_host_ip(timeout: float = HOST_IP_TIMEOUT) -> str | None:
     if _HOST_IP_CACHE and _now() - _HOST_IP_CACHE[0][0] < HOST_IP_TTL:
         return _HOST_IP_CACHE[0][1]
     try:
-        ip = await asyncio.wait_for(asyncio.to_thread(_lookup_host_ip), timeout)
-        ipaddress.ip_address(ip)
+        ip = normalize_ip(await asyncio.wait_for(asyncio.to_thread(_lookup_host_ip), timeout))
+        if ip is None:
+            raise ValueError("not an IP")
     except Exception as exc:
         logger.debug("Реальный IP хоста определить не удалось: {}", type(exc).__name__)
         return None
@@ -355,11 +409,31 @@ async def resolve_host_ip(timeout: float = HOST_IP_TIMEOUT) -> str | None:
     return ip
 
 
-def _same_ip(first: str, second: str) -> bool:
+def _normalize_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address in `value` (`1.2.3.4`, `1.2.3.4:80`, `[2001:db8::1]:443`, `2001:db8::`, `::ffff:1.2.3.4`),
+    IPv4-mapped IPv6 unwrapped to IPv4; None when it is not one. Colons are never stripped off an IPv6 address."""
+    text = (value or "").strip().strip('"').strip()
+    if text.startswith("["):
+        end = text.find("]")
+        if end < 0:
+            return None
+        text = text[1:end]
+    else:
+        host, sep, port = text.rpartition(":")
+        if sep and port.isdigit() and host.count(":") == 0 and host:  # only IPv4 carries a bare `:port`
+            text = host
     try:
-        return ipaddress.ip_address(first.strip()) == ipaddress.ip_address(second.strip())
+        address = ipaddress.ip_address(text.split("%", 1)[0])
     except ValueError:
-        return False
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
+def _same_ip(first: str, second: str) -> bool:
+    a, b = _normalize_ip(first or ""), _normalize_ip(second or "")
+    return a is not None and a == b
 
 
 def _fetch_echo_headers(proxy_url: str) -> dict[str, str]:
@@ -369,20 +443,32 @@ def _fetch_echo_headers(proxy_url: str) -> dict[str, str]:
     from modules.session_heartbeat import curl_proxy_url
 
     proxy = curl_proxy_url(proxy_url)
-    response = curl_requests.get(HEADER_ECHO_URL, proxies={"http": proxy, "https": proxy}, timeout=HEADER_ECHO_TIMEOUT)
+    with curl_requests.Session(trust_env=False) as session:  # no env / system proxy, a redirect is no answer
+        response = session.get(HEADER_ECHO_URL, proxy=proxy, allow_redirects=False, timeout=HEADER_ECHO_TIMEOUT)
     if response.status_code != 200:
         raise RuntimeError(f"status {response.status_code}")
-    headers = response.json()["headers"]
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("not JSON") from None
+    headers = data.get("headers") if isinstance(data, dict) else None
+    if not isinstance(headers, dict):
+        raise RuntimeError("no headers")
     return {str(name).lower(): str(value) for name, value in headers.items()}
 
 
 def _mentions_ip(header_value: str, ip: str) -> bool:
-    """Whether the header value (`1.2.3.4, 5.6.7.8`, `for="[2001:db8::1]:80";proto=http`, `1.1 gw (1.2.3.4)`) names `ip`."""
-    for token in re.findall(r"[0-9A-Fa-f:.]{2,}", header_value):
-        token = token.strip(":.")
-        if _same_ip(token, ip):
+    """Whether the header value (`1.2.3.4, 5.6.7.8`, `for="[2001:db8::1]:80";proto=http`, `1.1 gw (1.2.3.4)`) names `ip`.
+
+    Whole tokens are compared as parsed addresses (`1.2.3.40` never matches `1.2.3.4`, `::ffff:1.2.3.4` does)."""
+    wanted = _normalize_ip(ip or "")
+    if wanted is None:
+        return False
+    for token in re.findall(r"\[[0-9A-Fa-f:.%]+\](?::\d+)?|[0-9A-Fa-f:.]{2,}", header_value or ""):
+        if _normalize_ip(token) == wanted:
             return True
-        if token.count(":") == 1 and _same_ip(token.split(":")[0], ip):  # IPv4 with a port
+        trimmed = token.rstrip(".")  # a sentence end, never a colon: `2001:db8::` keeps its `::`
+        if trimmed != token and _normalize_ip(trimmed) == wanted:
             return True
     return False
 
@@ -532,6 +618,8 @@ __all__ = [
     "ensure_network_ready",
     "geoip_database_status",
     "normalize_country",
+    "normalize_ip",
+    "parse_echo_ip",
     "normalize_locale",
     "read_session_geo",
     "remember_exit_country",

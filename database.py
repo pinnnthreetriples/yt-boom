@@ -559,6 +559,21 @@ class AccountCreate(BaseModel):
     consecutive_errors: int = 0
 
 
+def proxy_country(record: Any) -> str | None:
+    """The country a proxy really exits from: the last check's GeoIP result wins over the seller's word (`country`,
+    shown only while nothing has been checked)."""
+    return getattr(record, "last_exit_country", None) or getattr(record, "country", None)
+
+
+def proxy_country_label(record: Any) -> str | None:
+    """`RU`, or `RU≠US` when the checked exit country differs from the one the seller named (`country`)."""
+    actual = proxy_country(record)
+    claimed = getattr(record, "country", None)
+    if actual and claimed and actual.upper() != claimed.upper():
+        return f"{actual}≠{claimed}"
+    return actual
+
+
 class ProxyRecord(BaseModel):
     """A proxy of the library. `password` is decrypted (None when absent or unreadable: `password_unavailable`).
 
@@ -591,6 +606,14 @@ class ProxyRecord(BaseModel):
     @property
     def address(self) -> str:
         return f"[{self.host}]:{self.port}" if ":" in self.host else f"{self.host}:{self.port}"
+
+    @property
+    def effective_country(self) -> str | None:
+        return proxy_country(self)
+
+    @property
+    def country_label(self) -> str | None:
+        return proxy_country_label(self)
 
     @property
     def url(self) -> str | None:

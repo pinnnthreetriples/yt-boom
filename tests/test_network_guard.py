@@ -225,7 +225,7 @@ class TestHostIp(_Case):
 
     def test_lookup_is_direct(self):
         public_ip = MagicMock(return_value=HOST_IP)
-        with patch("camoufox.ip.public_ip", public_ip):
+        with patch("modules.geo_guard._fetch_public_ip", public_ip):
             self.assertEqual(geo_guard._lookup_host_ip(), HOST_IP)
         public_ip.assert_called_once_with(None)
 
@@ -294,12 +294,12 @@ class TestLookupExitGeo(unittest.TestCase):
         reader.__enter__.return_value.get.return_value = record
         fake_db = MagicMock()
         fake_db.exists.return_value = db_exists
-        with patch("camoufox.ip.public_ip", public_ip), \
+        with patch("modules.geo_guard._fetch_public_ip", public_ip), \
              patch("camoufox.geolocation.load_geoip_config", return_value={"paths": paths}), \
              patch("camoufox.geolocation.get_mmdb_path", return_value=fake_db), \
              patch("maxminddb.open_database", return_value=reader):
             geo = geo_guard._lookup_exit_geo(proxy)
-        public_ip.assert_called_once_with("socks5h://u:p@1.2.3.4:1080")
+        public_ip.assert_called_once_with(proxy)  # socks5h is applied inside, by curl_proxy_url
         return geo
 
     def test_reads_country_zone_and_coordinates_by_the_camoufox_config_paths(self):
@@ -319,14 +319,14 @@ class TestLookupExitGeo(unittest.TestCase):
         public_ip = MagicMock(return_value=PROXY_IP)
         fake_db = MagicMock()
         fake_db.exists.return_value = True
-        with patch("camoufox.ip.public_ip", public_ip), \
+        with patch("modules.geo_guard._fetch_public_ip", public_ip), \
              patch("camoufox.geolocation.load_geoip_config", return_value={"paths": AIO_PATHS}), \
              patch("camoufox.geolocation.get_mmdb_path", return_value=fake_db), \
              patch("maxminddb.open_database", side_effect=ValueError("corrupt")):
             self.assertEqual(geo_guard._lookup_exit_geo(None), ExitGeo(PROXY_IP, None, None, None, None))
 
     def test_failing_ip_lookup_raises(self):
-        with patch("camoufox.ip.public_ip", MagicMock(side_effect=RuntimeError("proxy down"))), \
+        with patch("modules.geo_guard._fetch_public_ip", MagicMock(side_effect=RuntimeError("proxy down"))), \
              patch("camoufox.geolocation.load_geoip_config", return_value={"paths": AIO_PATHS}):
             with self.assertRaises(RuntimeError):
                 geo_guard._lookup_exit_geo(None)

@@ -57,12 +57,18 @@ def load_state(config_path: Path) -> ProxyState:
 
 
 def country_of(record: Any) -> str | None:
-    return record.country or record.last_exit_country
+    """The checked exit country first, the seller's one only while nothing is checked (`database.proxy_country`)."""
+    from database import proxy_country
+
+    return proxy_country(record)
 
 
 def proxy_name(record: Any) -> str:
-    """«[PL] 45.130.253.31:8000» without colors, for values and messages."""
-    return f"[{country_of(record) or '??'}] {record.address}"
+    """«[PL] 45.130.253.31:8000» («[RU≠US] …» when the check found another country than the seller named), without
+    colors, for values and messages."""
+    from database import proxy_country_label
+
+    return f"[{proxy_country_label(record) or '??'}] {record.address}"
 
 
 def type_name(scheme: str | None) -> str:
@@ -74,6 +80,12 @@ def short_error(text: str | None) -> str:
     low = (text or "").lower()
     if "407" in low or "логин" in low:
         return "логин/пароль"
+    if "не скрывает ваш ip" in low or "ваш настоящий ip" in low:
+        return "светит ваш IP"
+    if "отказал в доступе" in low:
+        return "доступ запрещён"
+    if "вместо ip" in low:
+        return "не тот ответ"
     if "не ответил за" in low:
         return "таймаут"
     if "недоступен" in low:
@@ -155,8 +167,12 @@ async def _record(db: Any, proxy_id: int, result: Any) -> Any:
 def result_line(name: str, result: Any) -> tuple[str, str]:
     """(«ok»|«err», «[PL] 1.2.3.4:80 · HTTP · 210 мс · внешний IP 5.6.7.8» | «1.2.3.4:80 — причина»)."""
     if result.ok:
-        return "ok", (f"{name} · {type_name(result.scheme)} · {result.latency_ms} мс · внешний IP {result.exit_ip}"
-                      + ("" if result.exit_country else " · страна не определена"))
+        warning = getattr(result, "leak_warning", None)
+        return ("warn" if warning else "ok"), (
+            f"{name} · {type_name(result.scheme)} · {result.latency_ms} мс · внешний IP {result.exit_ip}"
+            + ("" if result.exit_country else " · страна не определена")
+            + (f" · ⚠ {warning}" if warning else "")
+        )
     return "err", f"{name} — {result.message}"
 
 
@@ -169,9 +185,10 @@ def check_all(config_path: Path, state: ProxyState) -> Notice:
     tui.status_line("info", f"Проверяем {len(records)} прокси и прямое соединение…")
 
     async def job(db: Any) -> tuple[list[Any], Any]:
-        results, direct = await asyncio.gather(
-            pc.check_proxies(records, on_done=_progress) if records else asyncio.sleep(0, []), pc.check_direct()
-        )
+        direct = await pc.check_direct()  # first: every proxy is compared with this IP (it must not be ours)
+        results = await pc.check_proxies(
+            records, on_done=_progress, host_ip=direct.exit_ip if direct.ok else None
+        ) if records else []
         for record, result in zip(records, results):
             await _record(db, record.id, result)
         return results, direct

@@ -477,6 +477,13 @@ class FakeCurlError(Exception):
 
 
 class TestProxyCheck(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # The route check (own IP, forwarding headers) needs the network: here the machine's IP is unknown, so it is
+        # skipped with a warning; tests/test_proxy_check_live.py covers it against loopback servers.
+        patcher = patch("modules.geo_guard.resolve_host_ip", AsyncMock(return_value=None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_classify(self):
         cases = [
             (FakeCurlError("curl: (56) CONNECT tunnel failed, response 407", 56), "auth"),
@@ -524,7 +531,7 @@ class TestProxyCheck(unittest.IsolatedAsyncioTestCase):
     async def test_many_at_once_keeps_order_and_limit(self):
         running, peak = 0, 0
 
-        async def fake_check(item, timeout):
+        async def fake_check(item, timeout, **_route):
             nonlocal running, peak
             running += 1
             peak = max(peak, running)

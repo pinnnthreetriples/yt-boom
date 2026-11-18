@@ -22,9 +22,14 @@ from urllib.parse import unquote
 from config import ProxyParts
 from modules.geo_guard import normalize_country
 
-_SCHEME_WORDS = {"http": "http", "https": "https", "socks5": "socks5", "socks5h": "socks5", "socks": "socks5"}
+_SCHEME_WORDS = {
+    "http": "http", "https": "https", "socks5": "socks5", "socks5h": "socks5", "socks": "socks5",
+    "socks4": "socks4", "socks4a": "socks4",
+}
 _HOST_RE = re.compile(r"^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)$")
 _HOST_PORT_RE = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[^:@\s\[\]]+):(\d{1,5})$")
+_LEAD_RE = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[^:@\s\[\]]+):(\d{1,5})(?=[:@]|$)")
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _COUNTRY_WORDS = 3  # "United States of America" is the longest name met in practice after splitting
 
 
@@ -89,6 +94,44 @@ def _split_host_port(text: str) -> tuple[str, int] | None:
     return _host_port(match.group(1), match.group(2))
 
 
+def _try_host_port(text: str) -> tuple[str, int] | None:
+    try:
+        return _split_host_port(text)
+    except ProxyPasteError:
+        return None
+
+
+def _host_rank(host: str) -> int:
+    """How much `host` looks like an address: 2 IPv4/IPv6, 1 localhost or a name with a dot, 0 any other word
+    (which may as well be a login)."""
+    if ":" in host or _IPV4_RE.match(host):
+        return 2
+    return 1 if host == "localhost" or "." in host else 0
+
+
+def _at_form(text: str):
+    """Which side of an `@` holds the address. ("creds_first", hp, creds) = `login:pass@host:port` (the password
+    may hold `@`), ("host_first", hp, creds) = `host:port@login:pass`, ("colon", None, None) = `host:port:login:pass`
+    whose password holds `@`; None = unclear. The side that looks more like an address (IP > name with a dot or
+    localhost > any word) wins, so a numeric password does not turn `1.2.3.4:8080@user:1234` inside out."""
+    left, _, right = text.rpartition("@")
+    tail = _try_host_port(right)
+    lead = _LEAD_RE.match(text)
+    lead_hp = _try_host_port(lead.group(0).rstrip("@:")) if lead else None
+    tail_rank = _host_rank(tail[0]) if tail else -1
+    lead_rank = _host_rank(lead_hp[0]) if lead_hp else -1
+    if tail and tail_rank >= 1 and tail_rank >= lead_rank:
+        return "creds_first", tail, left
+    if lead_hp and lead_rank >= 1:
+        rest = text[lead.end():]
+        return ("host_first", lead_hp, rest[1:]) if rest.startswith("@") else ("colon", None, None)
+    if tail:
+        return "creds_first", tail, left
+    first_left, _, first_right = text.partition("@")
+    hp = _try_host_port(first_left)
+    return ("host_first", hp, first_right) if hp else None
+
+
 def _split_credentials(text: str) -> tuple[str | None, str | None]:
     """`login:pass` (the password may contain `:`); a lone word is a login without password."""
     login, sep, password = text.partition(":")
@@ -101,14 +144,9 @@ def _colon_form(text: str) -> tuple[str, int, str | None, str | None, str | None
     """`host:port[:login:pass][:country]`, `login:pass@host:port`, `host:port@login:pass`. Returns host, port,
     login, password and a country found as the last colon field."""
     if "@" in text:
-        left, _, right = text.rpartition("@")
-        hp = _split_host_port(right)
-        if hp is not None:  # login:pass@host:port (the password may contain '@')
-            return (*hp, *_split_credentials(left), None)
-        left, _, right = text.partition("@")
-        hp = _split_host_port(left)
-        if hp is not None:  # host:port@login:pass
-            return (*hp, *_split_credentials(right), None)
+        form = _at_form(text)
+        if form is not None and form[0] != "colon":
+            return (*form[1], *_split_credentials(form[2]), None)
     if text.startswith("["):
         end = text.find("]")
         if end < 0:
@@ -140,17 +178,28 @@ def _url_form(scheme: str, rest: str) -> tuple[str, int, str | None, str | None,
     """After `scheme://`: `[login:pass@]host:port` (percent-encoding decoded) or the seller's `host:port:login:pass`."""
     rest = rest.rstrip("/")
     if "@" in rest:
-        creds, _, address = rest.rpartition("@")
-        hp = _split_host_port(address)
-        if hp is not None:
-            login, password = _split_credentials(creds)
-            return (*hp, unquote(login) if login else None, unquote(password) if password else None, None)
+        form = _at_form(rest)
+        if form is not None and form[0] == "creds_first":
+            login, password = _split_credentials(form[2])
+            return (*form[1], unquote(login) if login else None, unquote(password) if password else None, None)
     return _colon_form(rest)
+
+
+def _country_floor(tokens: list[str]) -> int:
+    """How many leading tokens a trailing country must leave. `host port login pass` is all fields (a 2-letter
+    password like `id` is not a country): there a country needs `host port login pass CC` or `host port CC`.
+    `host:port login pass` likewise keeps its password."""
+    count = len(tokens)
+    if count >= 2 and tokens[1].isdigit() and _HOST_RE.match(tokens[0]):
+        return 4 if count >= 5 else 2 if count == 3 else count
+    if count == 3 and ":" not in tokens[1]:
+        return count
+    return 1
 
 
 def _take_country(tokens: list[str]) -> tuple[list[str], str | None]:
     """A trailing country written as separate words (`PL`, `Poland`, `United States`)."""
-    for size in range(min(_COUNTRY_WORDS, len(tokens) - 1), 0, -1):
+    for size in range(min(_COUNTRY_WORDS, len(tokens) - _country_floor(tokens)), 0, -1):
         code = normalize_country(" ".join(tokens[-size:]))
         if code:
             return tokens[:-size], code
@@ -184,6 +233,9 @@ def parse_proxy_line(line: str) -> ProxyDraft:
             host, port, login, password, line_country = _colon_form(text)
         country = country or line_country
     elif len(tokens) == 2:  # host:port login:pass
+        if tokens[1].isdigit() and _HOST_RE.match(tokens[0]):  # host port
+            host, port = _host_port(tokens[0], tokens[1])
+            return ProxyDraft(scheme, host, port, None, None, country)
         hp = _split_host_port(tokens[0])
         if hp is None:
             raise ProxyPasteError("не удалось разобрать строку: ожидается адрес:порт и логин:пароль")
@@ -208,7 +260,7 @@ def parse_proxy_paste(text: str) -> list[PasteLine]:
     results: list[PasteLine] = []
     seen: dict[tuple[str, int, str], int] = {}
     for number, raw in enumerate((text or "").splitlines(), 1):
-        line = raw.strip().lstrip("﻿")
+        line = raw.lstrip("﻿").strip()
         if not line or line.startswith("#"):
             continue
         try:

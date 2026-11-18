@@ -93,17 +93,17 @@ class TestResolveExitCountry(unittest.IsolatedAsyncioTestCase):
         reader.__enter__.return_value.get.return_value = {"country": {"iso_code": "pl"}}
         fake_db = MagicMock()
         fake_db.exists.return_value = True
-        with patch("camoufox.ip.public_ip", public_ip), \
+        with patch("modules.geo_guard._fetch_public_ip", public_ip), \
              patch("camoufox.geolocation.load_geoip_config", return_value={"paths": {"iso_code": "country.iso_code"}}), \
              patch("camoufox.geolocation.get_mmdb_path", return_value=fake_db), \
              patch("maxminddb.open_database", return_value=reader):
             self.assertEqual(geo_guard._lookup_exit_country("socks5://u:p@1.2.3.4:1080"), "PL")
-        public_ip.assert_called_once_with("socks5h://u:p@1.2.3.4:1080")
+        public_ip.assert_called_once_with("socks5://u:p@1.2.3.4:1080")  # socks5h is applied inside
 
     def test_lookup_without_geoip_database_is_unknown(self):
         fake_db = MagicMock()
         fake_db.exists.return_value = False
-        with patch("camoufox.ip.public_ip", MagicMock(return_value="203.0.113.5")), \
+        with patch("modules.geo_guard._fetch_public_ip", MagicMock(return_value="203.0.113.5")), \
              patch("camoufox.geolocation.load_geoip_config", return_value={"paths": {"iso_code": "country.iso_code"}}), \
              patch("camoufox.geolocation.get_mmdb_path", return_value=fake_db):
             self.assertIsNone(geo_guard._lookup_exit_country(None))

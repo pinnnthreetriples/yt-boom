@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import yaml
 
@@ -38,6 +38,7 @@ class ProxyTabCase(unittest.TestCase):
             ("secret_store._blob_call", lambda name, data: bytes(b ^ 0x5A for b in data)),
             ("modules.proxy_check.check_proxy", self.fake_check),
             ("modules.proxy_check.check_direct", self.fake_direct),
+            ("modules.geo_guard.resolve_host_ip", AsyncMock(return_value="85.1.2.3")),  # no real network in tests
             ("modules.wizard.check_youtube_session", lambda path: (Path(path).name in self.logged_in, "")),
             ("modules.ui.tab_proxies._geo_warning", lambda: None),
             ("sys.stdout", io.StringIO()),
@@ -64,7 +65,7 @@ class ProxyTabCase(unittest.TestCase):
         self.ctx = AppContext(self.config_path)
         self.addCleanup(tab_proxies._PENDING.clear)
 
-    async def fake_check(self, item, timeout=10.0):
+    async def fake_check(self, item, timeout=10.0, **_route):  # host_ip / resolve_host: the route is not checked here
         parts = _as_parts(item)
         result = self.checks.get(parts.host, TIMEOUT)
         return replace(result, browser_warning=browser_proxy_warning(result.scheme, parts.login)) if result.ok else result

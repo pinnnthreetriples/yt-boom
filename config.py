@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import ipaddress
 import re
 import string
 from dataclasses import dataclass
@@ -238,10 +239,14 @@ class TargetSettings(BaseModel):
 
 
 _PROXY_HOST = r"(?:\[[0-9A-Fa-f:.]+\]|[^:/@\s\[\]]+)"  # host name, IPv4 or an IPv6 address in brackets
-_RAW_PROXY_RE = re.compile(rf"^({_PROXY_HOST}):(\d{{1,5}}):([^:@\s]+):(\S+)$")  # host:port:user:pass
-_AUTH_PROXY_RE = re.compile(rf"^([^:/@\s]+):([^/\s]*)@({_PROXY_HOST}):(\d{{1,5}})$")  # user:pass@host:port
 _BARE_PROXY_RE = re.compile(rf"^({_PROXY_HOST}):(\d{{1,5}})$")  # host:port
+_RAW_HEAD_RE = re.compile(rf"^({_PROXY_HOST}):(\d{{1,5}}):(.+)$")  # host:port:<user:pass as typed>
+_SCHEME_PREFIX_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")  # a scheme only at the very start of the text
+_FQDN_RE = re.compile(r"^(?=.{1,253}$)(?:[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\.)+[A-Za-z0-9-]{1,63}$")
+# Proxy types a browser or libcurl can use; anything else (ftp://, socks://, ...) is rejected.
+ALLOWED_PROXY_SCHEMES = frozenset({"http", "https", "socks4", "socks4a", "socks5", "socks5h"})
 _PROXY_ERROR = "proxy must include host and port (host:port, host:port:user:pass, user:pass@host:port or scheme://...)"
+_SCHEME_ERROR = "proxy type must be one of http, https, socks4, socks4a, socks5, socks5h"
 
 
 def _proxy_dict(scheme: str, host: str, port: str | int, user: str | None = None, password: str | None = None) -> dict[str, str]:
@@ -256,41 +261,106 @@ def _proxy_dict(scheme: str, host: str, port: str | int, user: str | None = None
     return proxy
 
 
-def parse_proxy(proxy_url: str | None) -> dict[str, str] | None:
-    """Playwright proxy dict from `scheme://[user:pass@]host:port`, `host:port`, `user:pass@host:port` or `host:port:user:pass`.
+def _is_strong_host(host: str) -> bool:
+    """IPv4, bracketed IPv6, `localhost` or a dotted DNS name: something that cannot be a bare login."""
+    if host.startswith("[") and host.endswith("]"):
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError:
+            return False
+        return True
+    try:
+        ipaddress.IPv4Address(host)
+        return True
+    except ValueError:
+        pass
+    if re.fullmatch(r"[\d.]+", host):  # digits and dots that are not an IPv4 address (1.2.3, 999.1.1.1)
+        return False
+    return host.lower() == "localhost" or bool(_FQDN_RE.match(host))
 
-    Credentials of the non-URL forms are taken literally (no percent-decoding). IPv6 hosts go in brackets.
+
+def _host_port(text: str) -> tuple[str, str] | None:
+    bare = _BARE_PROXY_RE.match(text)
+    return (bare.group(1), bare.group(2)) if bare else None
+
+
+def _strong_host_port(text: str) -> tuple[str, str] | None:
+    pair = _host_port(text)
+    return pair if pair and _is_strong_host(pair[0]) else None
+
+
+def _split_credentials(text: str) -> tuple[str | None, str | None]:
+    user, sep, password = text.partition(":")
+    return (user or None), (password if sep and password else None)
+
+
+def _parse_url_proxy(scheme: str, rest: str) -> dict[str, str]:
+    """`scheme://[user[:pass]@]host:port[/]`: the authority is split at its LAST `@`, so `@ : / ? # %` in a
+    (percent-encoded or not) password never move the host. Anything after host:port but a single `/` is refused."""
+    scheme = scheme.lower()
+    if scheme not in ALLOWED_PROXY_SCHEMES:
+        raise ValueError(_SCHEME_ERROR)
+    userinfo, at, address = rest.rpartition("@")
+    address = address[:-1] if address.endswith("/") else address
+    pair = _host_port(address)
+    if pair is None:
+        raise ValueError(_PROXY_ERROR)
+    user = password = None
+    if at:
+        user, password = _split_credentials(userinfo)
+        user = unquote(user) if user else None
+        password = unquote(password) if password else None
+    return _proxy_dict(scheme, pair[0], pair[1], user, password)
+
+
+def parse_proxy(proxy_url: str | None) -> dict[str, str] | None:
+    """Playwright proxy dict from `scheme://[user:pass@]host:port`, `host:port`, `user:pass@host:port`,
+    `host:port@user:pass` or `host:port:user:pass`.
+
+    Credentials of the non-URL forms are taken literally (no percent-decoding); a password may hold `@ : / ? #`.
+    A host that is an IP / dotted name wins over a login that looks like a host (`1.2.3.4:8080@user:1234`).
+    Only http/https/socks4/socks4a/socks5/socks5h are accepted. IPv6 hosts go in brackets.
     The error message never contains the proxy string: it may hold a password.
     """
     if not proxy_url:
         return None
     text = proxy_url.strip()
-    raw = _RAW_PROXY_RE.match(text)
-    if raw:
-        host, port, user, password = raw.groups()
-        return _proxy_dict("http", host, port, user, password)
-    auth = _AUTH_PROXY_RE.match(text)
-    if auth:
-        user, password, host, port = auth.groups()
-        return _proxy_dict("http", host, port, user, password)
-    bare = _BARE_PROXY_RE.match(text)
-    if bare:
-        return _proxy_dict("http", bare.group(1), bare.group(2))
-    try:
-        parsed = urlparse(text)
-        hostname, port_number = parsed.hostname, parsed.port
-    except ValueError:
-        raise ValueError(_PROXY_ERROR) from None
-    if not hostname or not port_number:
+    if not text:
         raise ValueError(_PROXY_ERROR)
-    host = f"[{hostname}]" if ":" in hostname else hostname
-    return _proxy_dict(
-        parsed.scheme or "http",
-        host,
-        port_number,
-        unquote(parsed.username) if parsed.username else None,
-        unquote(parsed.password) if parsed.password else None,
-    )
+    scheme = _SCHEME_PREFIX_RE.match(text)
+    if scheme:  # credentials of a URL may hold spaces; the host:port part cannot (`_host_port`)
+        return _parse_url_proxy(scheme.group(1), text[scheme.end():])
+    if any(ch.isspace() for ch in text):
+        raise ValueError(_PROXY_ERROR)
+    head = _RAW_HEAD_RE.match(text)
+    if head and _is_strong_host(head.group(1)):  # host:port:user:pass, a real host first: the rest is login:password
+        user, sep, password = head.group(3).partition(":")
+        if sep and user and "@" not in user:
+            return _proxy_dict("http", head.group(1), head.group(2), user, password or None)
+    if "@" in text:
+        left, _, right = text.rpartition("@")
+        right_pair = _host_port(right)
+        first, _, rest = text.partition("@")
+        left_pair = _strong_host_port(first)
+        if right_pair and (_is_strong_host(right_pair[0]) or left_pair is None):  # user:pass@host:port
+            user, password = _split_credentials(left)
+            if not user or "/" in user:
+                raise ValueError(_PROXY_ERROR)
+            return _proxy_dict("http", right_pair[0], right_pair[1], user, password)
+        if left_pair:  # host:port@user:pass
+            user, password = _split_credentials(rest)
+            if not user:
+                raise ValueError(_PROXY_ERROR)
+            return _proxy_dict("http", left_pair[0], left_pair[1], user, password)
+        raise ValueError(_PROXY_ERROR)
+    pair = _host_port(text)
+    if pair:
+        return _proxy_dict("http", pair[0], pair[1])
+    if head:  # host:port:user:pass with a one-word host (`proxy:8080:u:p`)
+        user, sep, password = head.group(3).partition(":")
+        if sep and user:
+            return _proxy_dict("http", head.group(1), head.group(2), user, password or None)
+    raise ValueError(_PROXY_ERROR)
 
 
 def mask_proxy_url(proxy_url: str | None) -> str:
@@ -336,8 +406,8 @@ def compose_proxy_url(scheme: str | None, host: str, port: int, login: str | Non
     host = host.strip().strip("[]")
     address = f"[{host}]" if ":" in host else host
     credentials = ""
-    if login:
-        credentials = quote(login, safe="") + (f":{quote(password, safe='')}" if password else "") + "@"
+    if login or password:  # a password without a login (`:password@`) is kept, never dropped
+        credentials = quote(login or "", safe="") + (f":{quote(password, safe='')}" if password else "") + "@"
     return f"{scheme or 'http'}://{credentials}{address}:{int(port)}"
 
 
@@ -350,10 +420,10 @@ def split_proxy(proxy_url: str) -> ProxyParts:
     assert parsed is not None
     scheme, _, address = parsed["server"].partition("://")
     host, _, port = address.rpartition(":")
-    if scheme == "socks5h":  # Playwright knows only socks5; DNS on the proxy is curl_proxy_url's job
-        scheme = "socks5"
+    # Playwright knows only socks5 / socks4; DNS on the proxy is curl_proxy_url's job
+    scheme = {"socks5h": "socks5", "socks4a": "socks4"}.get(scheme, scheme)
     return ProxyParts(
-        scheme.lower() if "://" in text else None,
+        scheme.lower() if _SCHEME_PREFIX_RE.match(text) else None,
         host.strip("[]").lower(),
         int(port),
         parsed.get("username") or None,

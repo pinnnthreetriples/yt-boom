@@ -532,7 +532,10 @@ def _add_work(ctx: AppContext, drafts: list[ProxyDraft], errors: int) -> Notice:
     socks = sum(1 for _, res in saved if res.browser_warning)
     if socks:
         text += f" · SOCKS5 с паролем ({socks}) — только для поиска"
-    return Notice("ok" if saved and not failing and not errors else "warn", text)
+    leaky = sum(1 for _, res in saved if res.leak_warning)
+    if leaky:
+        text += f" · с предупреждением о скрытии IP ({leaky}) — подробности в проверке прокси"
+    return Notice("ok" if saved and not failing and not errors and not leaky else "warn", text)
 
 
 def _save(ctx: AppContext, items: list[tuple[ProxyDraft, Any]]) -> list[tuple[Any, Any]]:

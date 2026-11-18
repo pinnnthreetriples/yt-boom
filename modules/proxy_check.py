@@ -3,6 +3,9 @@
 `check_proxy(proxy)` asks an IP echo service through the proxy and returns `ProxyCheckResult`: ok, the type that
 worked (an unknown type is tried as HTTP, then SOCKS5), exit IP, exit country (Camoufox's GeoIP database, as
 `modules.geo_guard.resolve_exit_country`), latency and, on failure, the kind of error with a Russian message.
+A proxy passes only when the answer is a real IP address, that IP is not the machine's own and a proxied echo
+request does not carry the machine's IP in a forwarding header. Every request ignores the environment and the
+Windows system proxy (`trust_env=False`): NO_PROXY can never send a check around a dead proxy.
 `check_proxies` checks many at once (bounded), `check_direct` reports the machine's own IP ("с вашего IP"),
 `check_and_record` stores the result in the library. A password never reaches a message or a log line: only our own
 texts and the libcurl error number are shown.
@@ -11,27 +14,38 @@ texts and the libcurl error number are shown.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Literal, Sequence
 
 from loguru import logger
 
 from config import ProxyParts, compose_proxy_url, split_proxy
-from modules.geo_guard import country_for_ip, remember_exit_country
+from modules import geo_guard
+from modules.geo_guard import country_for_ip, parse_echo_ip, remember_exit_country
 
-ProxyErrorKind = Literal["auth", "unreachable", "timeout", "other"]
+ProxyErrorKind = Literal[
+    "auth", "forbidden", "unreachable", "timeout", "protocol", "upstream", "bad_response", "host_ip_leak",
+    "header_leak", "other",
+]
 
 CHECK_TIMEOUT = 10.0
 CHECK_CONCURRENCY = 8
 IP_ECHO_URLS = ("https://api.ipify.org?format=json", "https://icanhazip.com")
 
-# libcurl error numbers (CURLcode) that tell the kind of failure apart
-_UNREACHABLE_CODES = {5, 6, 7}  # could not resolve proxy / host, could not connect
+# libcurl error numbers (CURLcode) that tell the kind of failure apart. 6 (could not resolve HOST) is the echo
+# service's name, not the proxy's: another echo service may still answer.
+_UNREACHABLE_CODES = {5}  # could not resolve the proxy
+_UPSTREAM_CODES = {6}
+_CONNECT_RESPONSE_RE = re.compile(r"connect tunnel failed, response (\d{3})")
 _TIMEOUT_CODES = {28}
 _AUTH_MARKERS = ("407", "proxy authentication required", "user was rejected", "authentication failed",
                  "no authentication method was acceptable")
-_UNREACHABLE_MARKERS = ("connection refused", "failed to connect", "could not resolve proxy", "couldn't connect")
+_UNREACHABLE_MARKERS = ("connection refused", "failed to connect", "could not resolve proxy", "couldn't connect",
+                        "no route to host", "network is unreachable")
+# Kinds after which another echo service cannot help: the proxy itself refused or nothing listens there.
+_PROXY_REFUSED = ("auth", "forbidden", "unreachable", "protocol")
 _TIMEOUT_MARKERS = ("timed out", "timeout")
 
 _TYPE_NAMES = {"http": "HTTP", "https": "HTTPS", "socks5": "SOCKS5", "socks4": "SOCKS4"}
@@ -40,9 +54,13 @@ _TYPE_NAMES = {"http": "HTTP", "https": "HTTPS", "socks5": "SOCKS5", "socks4": "
 @dataclass(frozen=True)
 class ProxyCheckResult:
     """`scheme`: the type that worked (or that answered with a login error); None when nothing answered.
-    `error_kind`: None on success, else auth (wrong login/password, 407) / unreachable / timeout / other.
+    `error_kind`: None on success, else auth (wrong login/password) / forbidden (CONNECT 401/403: IP not
+    whitelisted) / unreachable / timeout / protocol (the proxy did not speak this type) / upstream (the echo service
+    failed behind the proxy) / bad_response (an answer that is not an IP) / host_ip_leak (exits from the machine's
+    own IP) / header_leak (forwards the machine's IP in a header) / other.
     `message`: Russian, ready to show. `browser_warning`: set when the browser cannot use this proxy (see
-    `browser_proxy_warning`) even though the check passed."""
+    `browser_proxy_warning`) even though the check passed. `leak_warning`: the check passed but something about
+    hiding the machine's IP is worth knowing (proxy headers seen, or the comparison could not be made)."""
 
     ok: bool
     scheme: str | None
@@ -52,6 +70,7 @@ class ProxyCheckResult:
     error_kind: ProxyErrorKind | None
     message: str
     browser_warning: str | None = None
+    leak_warning: str | None = None
 
 
 class _FetchError(Exception):
@@ -86,8 +105,22 @@ def classify_curl_error(exc: BaseException) -> tuple[ProxyErrorKind, int | None]
     text = str(exc).lower()
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or code in _TIMEOUT_CODES:
         return "timeout", code
+    connect = _CONNECT_RESPONSE_RE.search(text)
+    if connect:  # the proxy answered the HTTP CONNECT itself: it is reachable, its status says why it refused
+        status = int(connect.group(1))
+        if status == 407:
+            return "auth", code
+        if status in (401, 403):
+            return "forbidden", code
+        if status in (400, 405, 501):
+            return "protocol", code  # e.g. a SOCKS server that got an HTTP CONNECT: SOCKS5 is worth a try
+        if status in (502, 503, 504):
+            return "upstream", code
+        return "other", code
     if any(marker in text for marker in _AUTH_MARKERS) or (code == 97 and "auth" in text):
         return "auth", code
+    if code in _UPSTREAM_CODES or "could not resolve host" in text:
+        return "upstream", code
     if code in _UNREACHABLE_CODES or any(marker in text for marker in _UNREACHABLE_MARKERS):
         return "unreachable", code
     if any(marker in text for marker in _TIMEOUT_MARKERS):
@@ -114,43 +147,59 @@ async def _fetch_ip(proxy_url: str | None, timeout: float) -> tuple[str, int]:
     from modules.session_heartbeat import curl_proxy_url
 
     last: _FetchError | None = None
-    async with AsyncSession(proxy=curl_proxy_url(proxy_url), timeout=timeout) as session:
+    # trust_env=False: HTTP(S)_PROXY / ALL_PROXY / NO_PROXY and the system proxy must neither replace the proxy under
+    # test nor let a request go around it (a dead proxy would then "work" with the machine's own IP).
+    async with AsyncSession(proxy=curl_proxy_url(proxy_url), timeout=timeout, trust_env=False) as session:
         for url in IP_ECHO_URLS:
             started = time.monotonic()
             try:
-                resp = await session.get(url)
+                resp = await session.get(url, allow_redirects=False)  # a redirect is a captive portal, not an IP
             except Exception as exc:
                 kind, code = classify_curl_error(exc)
                 logger.debug("Проверка прокси: {} (curl {}) на {}", kind, code, url.split("/")[2])
-                if kind in ("auth", "unreachable"):
+                if kind in _PROXY_REFUSED:
                     raise _FetchError(kind, code) from None  # the proxy itself refused: another service won't help
                 last = _FetchError(kind, code)
                 continue
             if resp.status_code == 407:
                 raise _FetchError("auth", None)
             if resp.status_code != 200:
-                last = _FetchError("other", None)
+                last = _FetchError("bad_response" if 300 <= resp.status_code < 400 else "upstream", None)
                 continue
-            text = resp.text.strip()
-            ip = text
-            if text.startswith("{"):
-                try:
-                    ip = str(resp.json().get("ip") or "")
-                except ValueError:
-                    ip = ""
-            if ip and len(ip) <= 45:
+            ip = parse_echo_ip(resp.text)
+            if ip:
                 return ip, int((time.monotonic() - started) * 1000)
-            last = _FetchError("other", None)
+            last = _FetchError("bad_response", None)  # an error page or a login form, not an IP address
     raise last or _FetchError("other", None)
 
 
-def _failure_message(kind: ProxyErrorKind, code: int | None, timeout: float, scheme_known: bool) -> str:
+HOST_IP_LEAK_MESSAGE = "Прокси не скрывает ваш IP: сайты видят ваш настоящий адрес, а не адрес прокси"
+HEADER_LEAK_MESSAGE = (
+    "Прокси передаёт ваш настоящий IP в заголовках (X-Forwarded-For / Via / Forwarded): сайты его видят"
+)
+
+
+def _failure_message(kind: ProxyErrorKind, code: int | None, timeout: float, scheme_known: bool,
+                     scheme: str | None = None) -> str:
     if kind == "auth":
-        return "Прокси отклонил логин или пароль (ошибка 407): проверьте их у продавца"
+        status = " (ошибка 407)" if (scheme or "http") in ("http", "https") else ""
+        return f"Прокси отклонил логин или пароль{status}: проверьте их у продавца"
+    if kind == "forbidden":
+        return ("Прокси отказал в доступе (ошибка 401/403): обычно ваш IP не добавлен в белый список у продавца "
+                "или доступ закончился")
     if kind == "unreachable":
         return "Прокси-сервер недоступен: неверный адрес или порт, либо сервер выключен"
     if kind == "timeout":
         return f"Прокси не ответил за {timeout:.0f} с: сервер перегружен или недоступен"
+    if kind == "bad_response":
+        return ("Прокси вернул вместо IP-адреса другой ответ (страницу ошибки или перенаправление): "
+                "через него не выйти в интернет")
+    if kind == "upstream":
+        return "Прокси принял подключение, но сайт за ним не ответил: прокси не выпускает в интернет или перегружен"
+    if kind == "host_ip_leak":
+        return HOST_IP_LEAK_MESSAGE
+    if kind == "header_leak":
+        return HEADER_LEAK_MESSAGE
     suffix = f" (код curl {code})" if code else ""
     if not scheme_known:
         return f"Прокси не ответил ни как HTTP, ни как SOCKS5{suffix}: проверьте адрес, порт и тип у продавца"
@@ -162,8 +211,8 @@ async def _try(parts: ProxyParts, scheme: str, timeout: float) -> ProxyCheckResu
     try:
         ip, latency = await asyncio.wait_for(_fetch_ip(url, timeout), timeout * len(IP_ECHO_URLS) + 5)
     except _FetchError as exc:
-        return ProxyCheckResult(False, scheme if exc.kind == "auth" else None, None, None, None, exc.kind,
-                                _failure_message(exc.kind, exc.code, timeout, True))
+        return ProxyCheckResult(False, scheme if exc.kind in ("auth", "forbidden") else None, None, None, None,
+                                exc.kind, _failure_message(exc.kind, exc.code, timeout, True, scheme))
     except asyncio.TimeoutError:
         return ProxyCheckResult(False, None, None, None, None, "timeout", _failure_message("timeout", None, timeout, True))
     country = await country_for_ip(ip)
@@ -173,18 +222,59 @@ async def _try(parts: ProxyParts, scheme: str, timeout: float) -> ProxyCheckResu
     return ProxyCheckResult(True, scheme, ip, country, latency, None, message, browser_proxy_warning(scheme, parts.login))
 
 
-async def check_proxy(proxy: Any, timeout: float = CHECK_TIMEOUT) -> ProxyCheckResult:
+async def _verify_route(proxy_url: str, exit_ip: str, host_ip: str | None) -> tuple[ProxyErrorKind | None, str | None]:
+    """(error kind or None, warning or None): does the proxy hide the machine's IP? `host_ip` None = unknown."""
+    if host_ip is None:
+        return None, "Ваш IP определить не удалось: проверка «скрывает ли прокси ваш IP» пропущена"
+    if geo_guard._same_ip(exit_ip, host_ip):
+        return "host_ip_leak", None
+    try:
+        headers = await asyncio.wait_for(
+            asyncio.to_thread(geo_guard._fetch_echo_headers, proxy_url), geo_guard.HEADER_ECHO_TIMEOUT + 5
+        )
+    except Exception as exc:  # the message may carry the proxy URL: only the type is logged
+        logger.debug("Проверка заголовков прокси не удалась: {}", type(exc).__name__)
+        return None, "Проверить заголовки прокси не удалось (эхо-сервис не ответил): утечка IP в заголовках не исключена"
+    names = geo_guard._LEAK_HEADERS
+    if any(geo_guard._mentions_ip(headers.get(name, ""), host_ip) for name in names):
+        return "header_leak", None
+    seen = [name for name in names if headers.get(name, "").strip()]
+    if seen:
+        return None, f"Прокси добавляет заголовки {', '.join(seen)}: сайты могут понять, что это прокси"
+    return None, None
+
+
+async def _with_route_check(result: ProxyCheckResult, parts: ProxyParts, host_ip: str | None) -> ProxyCheckResult:
+    if not result.ok or result.exit_ip is None:
+        return result
+    url = compose_proxy_url(result.scheme, parts.host, parts.port, parts.login, parts.password)
+    kind, warning = await _verify_route(url, result.exit_ip, host_ip)
+    if kind is not None:
+        return ProxyCheckResult(False, result.scheme, result.exit_ip, result.exit_country, result.latency_ms, kind,
+                                _failure_message(kind, None, CHECK_TIMEOUT, True, result.scheme), result.browser_warning)
+    return replace(result, leak_warning=warning) if warning else result
+
+
+async def check_proxy(proxy: Any, timeout: float = CHECK_TIMEOUT, *, host_ip: str | None = None,
+                      resolve_host: bool = True) -> ProxyCheckResult:
     """Check one proxy (ProxyParts / ProxyDraft / ProxyRecord / address string). With an unknown type: HTTP first,
-    then SOCKS5; a login error on HTTP settles the type (the server spoke HTTP). Never raises for network failures;
-    ValueError for an address string that is not a proxy."""
+    then SOCKS5; a login error on HTTP settles the type (the server spoke HTTP). A proxy that answered is then
+    compared with the machine's own IP (`host_ip`, looked up when None and `resolve_host`) and its forwarding
+    headers. Never raises for network failures; ValueError for an address string that is not a proxy."""
     parts = _as_parts(proxy)
+    if host_ip is None and resolve_host:
+        host_ip = await geo_guard.resolve_host_ip()
     if parts.scheme:
-        return await _try(parts, parts.scheme, timeout)
+        return await _with_route_check(await _try(parts, parts.scheme, timeout), parts, host_ip)
     first = await _try(parts, "http", timeout)
-    if first.ok or first.error_kind in ("auth", "unreachable"):
+    if first.ok:
+        return await _with_route_check(first, parts, host_ip)
+    if first.error_kind in ("auth", "forbidden", "unreachable"):
         return first  # unreachable: nothing listens there, SOCKS5 would only wait for the same timeout
     second = await _try(parts, "socks5", timeout)
-    if second.ok or second.error_kind == "auth":
+    if second.ok:
+        return await _with_route_check(second, parts, host_ip)
+    if second.error_kind in ("auth", "forbidden"):
         return second
     kind = first.error_kind or "other"
     return ProxyCheckResult(False, None, None, None, None, kind, _failure_message(kind, None, timeout, False))
@@ -195,16 +285,25 @@ async def check_proxies(
     concurrency: int = CHECK_CONCURRENCY,
     timeout: float = CHECK_TIMEOUT,
     on_done: Callable[[int, int], None] | None = None,
+    host_ip: str | None = None,
 ) -> list[ProxyCheckResult]:
-    """`check_proxy` for each, at most `concurrency` at a time; results in the input order.
-    `on_done(finished, total)` is called after every finished check (a progress line)."""
+    """`check_proxy` for each, at most `concurrency` at a time; results in the input order. The machine's own IP is
+    looked up once for the whole batch when `host_ip` is not given. A broken item becomes a failed result, it never
+    stops the batch. `on_done(finished, total)` is called after every finished check (a progress line)."""
     gate = asyncio.Semaphore(max(1, concurrency))
     finished = 0
+    if host_ip is None and proxies:
+        host_ip = await geo_guard.resolve_host_ip()
 
     async def one(item: Any) -> ProxyCheckResult:
         nonlocal finished
         async with gate:
-            result = await check_proxy(item, timeout)
+            try:
+                result = await check_proxy(item, timeout, host_ip=host_ip, resolve_host=False)
+            except Exception as exc:  # a malformed address or record: report it, keep checking the others
+                logger.debug("Проверка прокси не выполнена: {}", type(exc).__name__)
+                result = ProxyCheckResult(False, None, None, None, None, "other",
+                                          "Прокси не проверен: адрес записан с ошибкой")
         finished += 1
         if on_done is not None:
             on_done(finished, len(proxies))
@@ -227,7 +326,8 @@ async def check_direct(timeout: float = CHECK_TIMEOUT) -> ProxyCheckResult:
     )
 
 
-async def check_and_record(db: Any, proxy_id: int, timeout: float = CHECK_TIMEOUT) -> tuple[Any, ProxyCheckResult]:
+async def check_and_record(db: Any, proxy_id: int, timeout: float = CHECK_TIMEOUT, *,
+                           host_ip: str | None = None) -> tuple[Any, ProxyCheckResult]:
     """Check a library proxy and store the result (`Database.record_proxy_check`); returns (updated record, result).
     RecordNotFoundError for an unknown id; a password that cannot be decrypted is reported, not checked."""
     from database import RecordNotFoundError
@@ -241,7 +341,7 @@ async def check_and_record(db: Any, proxy_id: int, timeout: float = CHECK_TIMEOU
             "Пароль прокси не расшифровывается на этом компьютере: введите прокси заново",
         )
     else:
-        result = await check_proxy(record, timeout)
+        result = await check_proxy(record, timeout, host_ip=host_ip)
     updated = await db.record_proxy_check(
         proxy_id, result.ok, scheme=result.scheme, exit_ip=result.exit_ip, exit_country=result.exit_country,
         latency_ms=result.latency_ms, error=None if result.ok else result.message,
@@ -259,6 +359,8 @@ def check_proxy_url_sync(proxy_url: str | None, timeout: float = CHECK_TIMEOUT) 
 __all__ = [
     "CHECK_CONCURRENCY",
     "CHECK_TIMEOUT",
+    "HEADER_LEAK_MESSAGE",
+    "HOST_IP_LEAK_MESSAGE",
     "ProxyCheckResult",
     "ProxyErrorKind",
     "browser_proxy_warning",

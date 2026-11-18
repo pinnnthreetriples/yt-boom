@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from database import proxy_country_label
 from modules.ui.app import AppContext
 from modules.ui.icons import engine_icon, engine_title, icon, other_engine, quota
 from modules.ui.shell import Cell, Confirm, Field, Hotkey, Menu, Notice, Row, Run, Screen, Step, Tab, View, fit
@@ -106,7 +107,7 @@ def proxy_cell(acc: Any, record: Any) -> tuple[str, str, str]:
         return f"{icon('no_login')} не читается", "err", "Прокси не расшифровывается — вставьте его заново"
     if record is None:
         return f"{icon('own_ip')} свой IP", "warn", "Свой IP — без прокси"
-    country = record.country or record.last_exit_country or "??"
+    country = proxy_country_label(record) or "??"
     return f"{country} {record.host}", "", f"Прокси {country} {record.address}"
 
 
@@ -574,7 +575,7 @@ def proxy_menu(ctx: AppContext, account_id: int, accounts: list[int] | None = No
     rows: list[Row] = []
     for record in ctx.db(lambda db: db.list_proxies()):
         state = "unchecked" if record.last_ok is None else ("online" if record.last_ok else "offline")
-        country = record.country or record.last_exit_country or "??"
+        country = proxy_country_label(record) or "??"
 
         def assign(record: Any = record) -> Step:
             if record.password_unavailable:
@@ -605,7 +606,7 @@ def proxy_menu(ctx: AppContext, account_id: int, accounts: list[int] | None = No
 
 def _assign(ctx: AppContext, record: Any, targets: list[int]) -> Notice:
     ctx.db(lambda db: db.assign_proxy(record.id, targets))
-    country = record.country or record.last_exit_country or "??"
+    country = proxy_country_label(record) or "??"
     return Notice("ok", f"{country} {record.address} → {len(targets)} акк.")
 
 

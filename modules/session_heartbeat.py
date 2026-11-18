@@ -41,10 +41,11 @@ def curl_proxy_url(proxy: str | None) -> str | None:
         return None
     scheme, _, address = parsed["server"].partition("://")
     credentials = ""
-    if parsed.get("username"):
-        credentials = quote(parsed["username"], safe="")
-        if parsed.get("password"):
-            credentials += f":{quote(parsed['password'], safe='')}"
+    user, password = parsed.get("username"), parsed.get("password")
+    if user or password:  # a password without a login (`:password@`) is kept, never dropped
+        credentials = quote(user or "", safe="")
+        if password:
+            credentials += f":{quote(password, safe='')}"
         credentials += "@"
     return f"{'socks5h' if scheme == 'socks5' else scheme}://{credentials}{address}"
 
