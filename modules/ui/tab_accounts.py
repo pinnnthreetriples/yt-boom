@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from database import proxy_country_label
+from database import proxy_country, proxy_country_label
 from modules.ui.app import AppContext
 from modules.ui.icons import engine_icon, engine_title, icon, other_engine, quota
 from modules.ui.shell import Cell, Confirm, Field, Hotkey, Menu, Notice, Row, Run, Screen, Step, Tab, View, fit
@@ -163,12 +163,16 @@ def account_row(ctx: AppContext, acc: Any, logged: bool, record: Any, projects: 
     state_icon, _, _ = account_state(acc, logged)
     stage_icon, _, _ = stage_info(acc)
     pie, _ = quota_info(acc)
+    from modules.ui.flags import flag
+
     proxy, proxy_style, _ = proxy_cell(acc, record)
+    country = proxy_country(record) if record is not None and not getattr(acc, "proxy_unavailable", False) else None
+    mini_flag = flag(country)
     cells = [
         Cell(icon(state_icon), "", 3),
         Cell(acc.name, "dim" if not acc.is_active else ("warn" if not projects else ""), 17),
         Cell(engine_icon(acc.engine), "", 3),
-        Cell(proxy, proxy_style, 21, grow=True),
+        Cell(proxy, proxy_style, 21, grow=True, prefix=mini_flag + ((("", " "),) if mini_flag else ())),
         Cell(icon(stage_icon), "", 3),
         Cell(pie, "accent", 2),
         Cell(icon("warmup") if acc.auto_warmup else "", "", 3),
@@ -565,11 +569,17 @@ def manual_login(ctx: AppContext, name: str) -> Step:
 # --------------------------------------------------------------------------- proxy of an account
 
 
-def proxy_menu(ctx: AppContext, account_id: int, accounts: list[int] | None = None) -> Step:
-    """Pick a library proxy, no proxy, or paste a new one; `accounts` (bulk) gets the same choice."""
+def proxy_menu(ctx: AppContext, account_id: int, accounts: list[int] | None = None,
+               then: Callable[[Notice | None], Step] | None = None) -> Step:
+    """Pick a library proxy, no proxy, or paste a new one; `accounts` (bulk) gets the same choice. Every proxy row
+    shows how many accounts already use it. `then` (adding accounts): the outcome goes on to the next question
+    instead of closing the menu."""
     from modules.proxy_screen import browser_warning
+    from modules.ui import icons
+    from modules.ui.flags import FLAG_COLUMNS, flag_prefix
 
     targets = accounts or [account_id]
+    after: Callable[[Notice | None], Step] = then or (lambda notice: notice)
     acc = _fresh(ctx, account_id)
     current = acc.proxy_id if acc and not accounts else -1
     rows: list[Row] = []
@@ -580,27 +590,32 @@ def proxy_menu(ctx: AppContext, account_id: int, accounts: list[int] | None = No
         def assign(record: Any = record) -> Step:
             if record.password_unavailable:
                 return Notice("err", "Пароль этого прокси не расшифрован — вставьте его заново во вкладке «Прокси»")
-            do = lambda: _assign(ctx, record, targets)
+            do = lambda: after(_assign(ctx, record, targets))
             if warning := browser_warning(record):
                 return Confirm([Cell(warning, "warn")], ["Отмена", "Всё равно назначить"], lambda i: do() if i == 1 else None)
             return do()
 
+        users = record.accounts_count
         rows.append(Row(
             f"p{record.id}",
-            [Cell(icon(state), "", 3), Cell(f"{country} {record.address}", "", 26, grow=True), Cell("● сейчас" if record.id == current else "", "dim")],
+            [Cell(icon(state), "", 3),
+             Cell(f"{country} {record.address}", "", 26 + FLAG_COLUMNS * icons.EMOJI, grow=True,
+                  prefix=flag_prefix(proxy_country(record))),
+             Cell(f"{icon('people')}{users}", "" if users else "dim", 5),
+             Cell("● сейчас" if record.id == current else "", "dim")],
             hint=f"{country} {record.address} · аккаунтов {record.accounts_count}" + (" · ищет видео" if record.is_search else ""),
             enter=assign,
         ))
 
-    def direct() -> Notice:
+    def direct() -> Step:
         names = ctx.db(lambda db: db.clear_account_proxy(targets))
-        return Notice("warn", f"Без прокси — пишут с вашего IP: {len(names) or len(targets)} акк.")
+        return after(Notice("warn", f"Без прокси — пишут с вашего IP: {len(names) or len(targets)} акк."))
 
     rows.append(Row("p-none", [Cell(icon("own_ip"), "", 3), Cell("без прокси · свой IP", "warn", 26, grow=True),
                                Cell("● сейчас" if current is None else "", "dim")],
                     hint="Свой IP — без прокси", enter=direct))
     rows.append(Row("p-new", [Cell(icon("add"), "", 3), Cell("вставить новый", "accent")],
-                    hint="Строка прокси: ip:port:логин:пароль", enter=lambda: new_proxy_field(ctx, targets)))
+                    hint="Строка прокси: ip:port:логин:пароль", enter=lambda: new_proxy_field(ctx, targets, then)))
     return Menu(rows)
 
 
@@ -610,7 +625,7 @@ def _assign(ctx: AppContext, record: Any, targets: list[int]) -> Notice:
     return Notice("ok", f"{country} {record.address} → {len(targets)} акк.")
 
 
-def new_proxy_field(ctx: AppContext, targets: list[int]) -> Step:
+def new_proxy_field(ctx: AppContext, targets: list[int], then: Callable[[Notice | None], Step] | None = None) -> Step:
     from modules.proxy_paste import parse_proxy_paste
 
     def preview(lines: list[str]) -> list[list[Cell]]:
@@ -626,7 +641,8 @@ def new_proxy_field(ctx: AppContext, targets: list[int]) -> Step:
         drafts = [item.draft for item in parse_proxy_paste(text) if item.draft]
         if not drafts:
             return Notice("warn", "Прокси не распознан")
-        return Run(lambda: _check_save_assign(ctx, drafts[0], targets), f"{icon('check')} Проверка прокси")
+        after = then or (lambda notice: notice)
+        return Run(lambda: after(_check_save_assign(ctx, drafts[0], targets)), f"{icon('check')} Проверка прокси")
 
     return Field("строка прокси: ip:port:логин:пароль", submit, secret=False, preview=preview)
 
@@ -902,9 +918,27 @@ def register(ctx: AppContext, lines: list[str], mode: str, total: int, engine: s
             return sign_in_question()
         return Run(cookie_robot_work(ctx, names, then=sign_in_question), f"{icon('cookie')} Куки-робот · {len(names)} акк.")
 
-    # a fresh profile has no cookies at all, which is what makes Google ask for a captcha at the sign-in
-    note = direct_ip_note(ctx, names)
-    return Confirm([Cell(f"Нагулять профиль перед входом (куки-робот)?{note}", "warn" if note else "")], ["Нет", "Да"], cookies_pick)
+    def cookies_question(proxy_notice: Notice | None = None) -> Step:
+        # a fresh profile has no cookies at all, which is what makes Google ask for a captcha at the sign-in
+        note = direct_ip_note(ctx, names)  # read after the proxy step: it may have just given them a proxy
+        done = f"{proxy_notice.text} · " if proxy_notice is not None else ""
+        style = "err" if proxy_notice is not None and proxy_notice.kind == "err" else ("warn" if note else "")
+        return Confirm([Cell(fit(f"{done}Нагулять профиль перед входом (куки-робот)?{note}", 110), style)],
+                       ["Нет", "Да"], cookies_pick)
+
+    # the proxy comes before the cookie robot and the sign-in: both already go out through it
+    without = [a for a in result.added if not getattr(a, "proxy_url", None) and getattr(a, "proxy_id", None) is None]
+    if not without:
+        return cookies_question()
+    ids = [a.id for a in without]
+
+    def proxy_pick(i: int) -> Step:
+        if i == 1:
+            return proxy_menu(ctx, ids[0], ids, then=cookies_question)
+        return cookies_question(Notice("warn", f"Без прокси — с вашего IP: {len(ids)} акк."))
+
+    return Confirm([Cell(fit(f"Прокси для новых аккаунтов ({len(ids)})? · {text}", 110), "ok")],
+                   ["Позже", "Выбрать прокси"], proxy_pick, selected=1)
 
 
 def warm_selected(ctx: AppContext, names: list[str]) -> Notice:

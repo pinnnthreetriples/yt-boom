@@ -32,6 +32,8 @@ class Cell:
     style: str = ""
     width: int = 0  # columns the cell takes; 0 = its own width
     grow: bool = False  # a wide window adds its extra columns to this cell (a long text column)
+    # Fragments drawn before `text` with their own raw prompt_toolkit styles (a mini flag: `modules.ui.flags`)
+    prefix: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -162,13 +164,15 @@ def cells_frags(cells: list[Cell], extra_style: str = "") -> list[Frag]:
     frags: list[Frag] = []
     for i, cell in enumerate(cells):
         text = cell.text
+        before = sum(width(part) for _, part in cell.prefix)
         if cell.width:
-            cols = cell.width + (max(0, WIDTH - BASE_WIDTH) if cell.grow else 0)
+            cols = cell.width + (max(0, WIDTH - BASE_WIDTH) if cell.grow else 0) - before
             text = fit(text, cols - 1)  # a cut text never touches the next column
-            text += " " * (cols - width(text))
+            text += " " * max(0, cols - width(text))
         elif i < len(cells) - 1:
             text += " "
         style = " ".join(f"class:{s}" for s in f"{cell.style} {extra_style}".split())
+        frags.extend(cell.prefix)
         frags.append((style, text))
     return frags
 

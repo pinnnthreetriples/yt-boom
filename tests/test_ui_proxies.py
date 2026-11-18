@@ -167,15 +167,16 @@ class TestList(ProxyTabCase):
 
 
 class TestAdd(ProxyTabCase):
-    def test_paste_preview_reads_every_line_and_hides_the_password(self):
+    def test_paste_preview_reads_every_line_and_shows_what_was_typed(self):
         c = self.shell()
         c.press("+")
         text = self.press(c, "paste:45.130.253.31:8000:user77:secret99:PL\nnot a proxy\n")
         self.assertIn("45.130.253.31:8000", text)
         self.assertIn("user77", text)
-        self.assertIn("••••", text)
+        self.assertIn("••••", text)  # the preview row under the field still masks the password
         self.assertIn("Строка 2", text)
-        self.assertNotIn("secret99", frags_text(render(c)).replace("•", ""))
+        # the typed line itself is shown as typed: the user wants to see the address they enter
+        self.assertIn("45.130.253.31:8000:user77:secret99:PL", frags_text(render(c)))
 
     def test_add_checks_saves_and_offers_the_accounts_without_a_proxy(self):
         self.accounts("vonji", "kiri")

@@ -251,6 +251,7 @@ class TestAddAndBulk(AccountsTabCase):
         c.press("enter")
         self.assertIn("Браузер для входа", self.screen(c))
         c.press("enter")  # Camoufox, the one under the cursor
+        self.skip_proxy(c)
         self.assertIn("куки-робот", self.screen(c))
         c.press("enter")  # «Нет»
         self.assertIn("Войти и прогреть", self.screen(c))
@@ -259,7 +260,14 @@ class TestAddAndBulk(AccountsTabCase):
         self.assertEqual(self.account("new1@x.com").lifecycle_mode, "mature")
         self.assertIsNone(c.pending_run)
 
-    def add_one(self) -> Controller:
+    def skip_proxy(self, c: Controller) -> None:
+        """The proxy step after adding accounts: «Позже» (they stay on the own IP for now)."""
+        self.assertIn("Прокси для новых аккаунтов", self.screen(c))
+        c.press("left")
+        c.press("enter")
+
+    def add_one(self, proxy: bool = False) -> Controller:
+        """Add one account up to the proxy step (`proxy=True`) or past it, «Позже», to the cookie-robot question."""
         c = self.shell()
         c.press("+")
         c.press("paste:new1@x.com pass111\n")
@@ -267,7 +275,9 @@ class TestAddAndBulk(AccountsTabCase):
         c.press("right")
         c.press("enter")
         c.press("enter")  # the browser question: Camoufox
-        self.assertIn("Нагулять профиль перед входом", self.screen(c))
+        if not proxy:
+            self.skip_proxy(c)
+            self.assertIn("Нагулять профиль перед входом", self.screen(c))
         return c
 
     def pick_browser(self, presses: list[str], default: str | None = None) -> Controller:
@@ -297,6 +307,7 @@ class TestAddAndBulk(AccountsTabCase):
         self.assertIn("▸ C Google Chrome", self.screen(c))
         c.press("enter")
         self.assertEqual(self.account("new1@x.com").engine, "chrome")
+        self.skip_proxy(c)
         c.press("enter")  # cookie robot: «Нет»
         c.press("enter")  # sign in: «Позже»
         self.assertIn("Добавлено 1 из 1 · Google Chrome", self.screen(c))
@@ -357,6 +368,42 @@ class TestAddAndBulk(AccountsTabCase):
             step = c.pending_run.work()
         self.assertIn("0 из 4 сайтов", step.question[0].text)
         self.assertIn("Войти и прогреть", step.question[0].text)
+
+    def test_proxy_step_assigns_a_library_proxy_then_asks_about_cookies(self):
+        self.db(lambda db: db.add_proxy_url("http://u:p@1.2.3.4:8080", country="PL"))
+        c = self.add_one(proxy=True)
+        self.assertIn("Прокси для новых аккаунтов (1)", self.screen(c))
+        c.press("enter")  # «Выбрать прокси» is under the cursor
+        screen = self.screen(c)
+        self.assertIn("PL 1.2.3.4:8080", screen)
+        self.assertIn(f"{icons.icon('people')}0", screen)  # nobody uses it yet
+        c.press("enter")
+        self.assertIsNotNone(self.account("new1@x.com").proxy_id)
+        screen = self.screen(c)
+        self.assertIn("→ 1 акк.", screen)  # the outcome rides in the next question
+        self.assertIn("Нагулять профиль перед входом", screen)
+        self.assertNotIn("с вашего IP", screen)  # it has a proxy now: no own-IP warning
+
+    def test_proxy_step_is_skipped_when_the_line_brings_a_proxy(self):
+        c = self.shell()
+        c.press("+")
+        c.press("paste:new2@x.com:pass111:http://1.2.3.4:8080\n")
+        c.press("enter")
+        c.press("enter")  # the mode
+        c.press("enter")  # the browser
+        self.assertIsNotNone(self.account("new2@x.com").proxy_id)
+        self.assertNotIn("Прокси для новых аккаунтов", self.screen(c))
+        self.assertIn("Нагулять профиль перед входом", self.screen(c))
+
+    def test_proxy_picker_shows_how_many_accounts_use_each_proxy(self):
+        from modules.ui.tab_accounts import proxy_menu
+
+        first, second, third = self.add("a1"), self.add("a2"), self.add("a3")
+        record, _ = self.db(lambda db: db.add_proxy_url("http://u:p@1.2.3.4:8080", country="PL"))
+        self.db(lambda db: db.assign_proxy(record.id, [first, second]))
+        menu = proxy_menu(self.ctx, third)
+        row = next(r for r in menu.rows if r.id == f"p{record.id}")
+        self.assertIn(f"{icons.icon('people')}2", [cell.text for cell in row.cells])
 
     def test_accounts_without_a_proxy_get_a_warning(self):
         c = self.add_one()  # a new account has no proxy: the cookies would carry the home IP

@@ -69,11 +69,14 @@ def _names(items: list[str], limit: int = 3) -> str:
 def _proxy_cells(record: Any, users: int | None = None) -> list[Cell]:
     from modules.proxy_screen import country_of
 
+    from modules.ui.flags import flag_prefix
+
     name, style, _ = _conn(record)
     users = record.accounts_count if users is None else users
+    country = country_of(record)
     return [
         Cell(icon(name), style, 3),
-        Cell(country_of(record) or "??", "accent" if country_of(record) else "dim", 3),
+        Cell(country or "??", "accent" if country else "dim", 3, prefix=flag_prefix(country)),
         Cell(record.address, "", 24, grow=True),
         Cell(icon("search") if record.is_search else "", "", 3),
         Cell(f"{icon('people')}{users}", "" if users else "dim"),
@@ -215,7 +218,7 @@ def proxy_menu(ctx: AppContext, proxy_id: int) -> Menu | Notice:
         Row("m-check", [Cell(icon("check"), "", 3), Cell("проверить")], hint="Связь, внешний IP и страна",
             enter=lambda: Run(lambda: _check_one(ctx, proxy_id), f"{icon('check')} Проверка {record.address}")),
         Row("m-edit", [Cell(icon("edited"), "", 3), Cell("изменить строку")], hint="Новый пароль, порт, логин",
-            enter=lambda: Field("новая строка этого прокси", lambda line: _edit_submit(ctx, proxy_id, line), secret=True,
+            enter=lambda: Field("новая строка этого прокси", lambda line: _edit_submit(ctx, proxy_id, line),
                                 preview=lambda lines: _preview(lines, set()))),
         Row("m-search", [Cell(icon("search"), "", 3), Cell("не искать через него" if record.is_search else "искать видео через него")],
             hint="Поиск пойдёт с вашего IP" if record.is_search else "Сделать прокси поиска",
@@ -467,7 +470,7 @@ def add_field(ctx: AppContext) -> Field:
     known = {(p.host.lower(), p.port, p.login or "") for p in load_state(ctx.config_path).proxies}
     return Field(
         "вставьте прокси, по строке: ip:порт:логин:пароль[:страна] или socks5://логин:пароль@хост:порт",
-        lambda text: _add_submit(ctx, text), multiline=True, secret=True, preview=lambda lines: _preview(lines, known),
+        lambda text: _add_submit(ctx, text), multiline=True, preview=lambda lines: _preview(lines, known),
     )
 
 
